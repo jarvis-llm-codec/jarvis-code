@@ -1,0 +1,27 @@
+JARVIS Code release manifest
+Generated: 2026-06-09T04:50:41Z
+Source root: C:\jarvis-code_v1.01
+Source root commit: 244b58fcad1e81179fb04159276a6a2b11e53620
+Pi engine commit: 1ac778804f0d3d72eeb78881e8f36c1a6bd0730f
+GitHub repo: jarvis-llm-codec/jarvis-code
+Branch: main
+
+Included:
+- JARVIS Code public README, install docs, and NOTICE
+- Windows and POSIX installers
+- Windows and POSIX uninstallers
+- Windows wrapper and POSIX launcher
+- JARVIS default skills, repo context, and orange-blue theme resources
+- sidecar runtime source
+- pi internal engine source without Pi public docs/tests/runtime files
+- THIRD_PARTY_LICENSES/PI-LICENSE
+
+Excluded:
+- .git metadata
+- _internal and handoff/planning material
+- data runtime state
+- pi-agent local auth/settings/models/sessions/copied resources
+- pi/node_modules and sidecar/.venv
+- caches, logs, tests, and generated build output
+
+This folder is generated. Update the development checkout, then rebuild.

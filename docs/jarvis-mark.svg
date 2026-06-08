@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 80" width="200" height="80" fill="none" role="img" aria-label="JARVIS Code mark">
+  <defs>
+    <linearGradient id="bridge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff8800"/>
+      <stop offset="1" stop-color="#0088ff"/>
+    </linearGradient>
+  </defs>
+  <circle cx="40" cy="40" r="24" stroke="#ff8800" stroke-width="8"/>
+  <path d="M78 40 q11 -14 22 0 t22 0" stroke="url(#bridge)" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="160" cy="40" r="24" stroke="#0088ff" stroke-width="8"/>
+</svg>

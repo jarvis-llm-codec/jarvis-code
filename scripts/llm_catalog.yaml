@@ -1,0 +1,82 @@
+# JARVIS Code LLM provider manifest.
+#
+# Thin metadata only. Actual model lists are fetched live from each provider's
+# /models endpoint when the selector opens (`/model-setting` inside Pi, or
+# `llmsetting.ps1` outside). No offline model list — if fetch fails, the
+# provider is shown as "unavailable, retry".
+#
+# `recommended` pins float the named model to the top of its role row when
+# fetch returns it. If the pinned model is missing from fetch, no model is
+# marked recommended for that role.
+#
+# Provider entries with `enabled: false` are shown but unselectable, with
+# `note` rendered next to them.
+
+providers:
+  ollama-cloud:
+    label: "Ollama Cloud"
+    auth_env: OLLAMA_API_KEY
+    base_url: "https://ollama.com/v1"
+    api_format: openai-completions
+    models_endpoint: "/models"
+
+  openai-codex:
+    label: "OpenAI (Subscription / OAuth)"
+    auth_kind: oauth
+    base_url: "https://chatgpt.com/backend-api/codex"
+    api_format: openai-codex-responses
+    models_endpoint: "/models"
+    models_static:
+      - gpt-5.5
+      - gpt-5.4
+      - gpt-5.4-mini
+      - gpt-5.3-codex
+      - gpt-5.2-codex
+      - gpt-5.1
+
+  openai:
+    label: "OpenAI (API key)"
+    auth_env: OPENAI_API_KEY
+    base_url: "https://api.openai.com/v1"
+    api_format: openai-completions
+    models_endpoint: "/models"
+
+  anthropic:
+    label: "Claude (Anthropic)"
+    auth_env: ANTHROPIC_API_KEY
+    base_url: "https://api.anthropic.com/v1"
+    api_format: anthropic
+    models_endpoint: "/models"
+
+  google:
+    label: "Gemini (Google)"
+    auth_env: GEMINI_API_KEY
+    base_url: "https://generativelanguage.googleapis.com/v1beta"
+    api_format: google-generative-ai
+    models_endpoint: "/models"
+
+  dashscope:
+    label: "DashScope (Alibaba)"
+    auth_env: DASHSCOPE_CODING_API_KEY
+    base_url: "https://coding-intl.dashscope.aliyuncs.com/v1"
+    api_format: openai-completions
+    # DashScope OpenAI-compat endpoint doesn't expose /v1/models (returns 404).
+    # Use a static curated list from the coding-plan tokens record.
+    models_static:
+      - qwen3.6-plus
+      - qwen3.5-plus
+      - qwen3-max-2026-01-23
+      - qwen3-coder-next
+      - qwen3-coder-plus
+      - glm-5
+      - glm-4.7
+      - kimi-k2.5
+      - minimax-M2.5
+
+recommended:
+  chat:
+    provider: openai-codex
+    model: gpt-5.5
+  encoder:
+    provider: ollama-cloud
+    model: devstral-small-2-24b-cloud

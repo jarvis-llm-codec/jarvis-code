@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node / Pi local artifacts
+pi/node_modules/
+pi/dist/
+pi/packages/*/dist/
+pi/packages/*/dist-chrome/
+pi/packages/*/dist-firefox/
+pi/*.log
+pi/*.tsbuildinfo
+pi/coverage/
+pi/.pi/hf-sessions/
+pi/.pi/hf-sessions-backup/
+
+# JARVIS local runtime data
+.smoke*/
+.jarvis-code/
+workspace/
+raw/
+pi-sidecar/
+_internal/
+# Phase 2: repo-local data root (workspaceMemory + raw-store + config.yaml)
+data/
+
+# Pi-agent runtime state (sessions, local backups, reset snapshots)
+pi-agent/*.json
+pi-agent/prompts/
+pi-agent/sessions/
+pi-agent/skills/
+pi-agent/themes/
+pi-agent/*.bak.*
+pi-agent/sessions.bak.*
+
+# Generated release output
+release/
+dist-release/
+jarvis-code-release*/
+JARVIS-Code-*.zip
+
+# Test scratch & auto-prompt progress
+patch*.py
+scripts/.auto_progress*.json
+pi/tmp-auto-prompts-*/
+
+# Phase C merge backups (kept on disk for human reference; see plans/letter_P_*.md)
+*.bak.phase_c_gap
+
+# Local configuration and editor files
+.env
+*.log
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

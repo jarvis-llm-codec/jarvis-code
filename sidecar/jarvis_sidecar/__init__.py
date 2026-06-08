@@ -1,0 +1,2 @@
+"""JARVIS Code sidecar package."""
+
