@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -18,8 +20,8 @@ DEFAULT_DASHSCOPE_BASE_URL = "https://coding-intl.dashscope.aliyuncs.com/v1"
 DEFAULT_DASHSCOPE_MODEL_CHAT = "qwen3.6-plus"
 DEFAULT_DASHSCOPE_MODEL_ENCODER = "glm-5"
 
-_VALID_ROLES = {"chat", "subagent", "encoder"}
-_CACHE: dict[tuple[str, str | None], ProviderAdapter] = {}
+_VALID_ROLES = {"chat", "subagent", "encoder", "router"}
+_CACHE: dict[tuple[str, str | None, str | None], ProviderAdapter] = {}
 _CACHE_LOCK = Lock()
 
 
@@ -236,6 +238,60 @@ def _build_legacy(role: str, cfg: dict[str, Any]) -> ProviderAdapter:
     )
 
 
+def _provider_default_model(
+    provider_name: str,
+    provider_cfg: dict[str, Any],
+    cfg: dict[str, Any],
+) -> str:
+    configured = provider_cfg.get("default_model") or provider_cfg.get("model")
+    if configured:
+        return str(configured)
+    models = provider_cfg.get("models") or {}
+    primary = (cfg.get("defaults") or {}).get("primary")
+    if primary and primary in models:
+        return str(primary)
+    if len(models) == 1:
+        return str(next(iter(models)))
+    raise ValueError(
+        f"provider {provider_name!r} needs an explicit model in 'provider/model'"
+    )
+
+
+def build_adapter_for_spec(
+    spec: str,
+    *,
+    config_path: str | None = None,
+) -> ProviderAdapter:
+    """Build a provider adapter for ``provider/model`` without a configured role."""
+    clean = (spec or "").strip()
+    if not clean:
+        raise ValueError(
+            "model spec must be a non-empty provider or provider/model string"
+        )
+    cfg = load_config(config_path)
+    providers = cfg.get("providers") or {}
+    if "/" in clean:
+        provider_name, model = clean.split("/", 1)
+        if not provider_name or not model:
+            raise ValueError(f"model spec {spec!r}: expected 'provider/model'")
+    else:
+        provider_name = clean
+        provider_cfg = providers.get(provider_name)
+        if not isinstance(provider_cfg, dict):
+            raise KeyError(f"provider {provider_name!r} not found in providers.yaml")
+        model = _provider_default_model(provider_name, provider_cfg, cfg)
+    role = "__subagent_model_spec__"
+    spec_cfg = dict(cfg)
+    spec_cfg["roles"] = {**(cfg.get("roles") or {}), role: f"{provider_name}/{model}"}
+    agent_sdk = _role_agent_sdk_model(role, spec_cfg)
+    if agent_sdk is not None:
+        from .anthropic_agent_sdk import AnthropicAgentSDKAdapter
+
+        _provider_name, model_name, provider_cfg = agent_sdk
+        return AnthropicAgentSDKAdapter(model=model_name, config=provider_cfg)
+    return _build_legacy(role, spec_cfg)
+
+
 def _role_uses_oauth(role: str, cfg: dict[str, Any]) -> bool:
     role_cfg = (cfg.get("roles") or {}).get(role)
     if isinstance(role_cfg, str) and "/" in role_cfg:
@@ -248,8 +304,141 @@ def _role_uses_oauth(role: str, cfg: dict[str, Any]) -> bool:
     return isinstance(provider_cfg, dict) and bool(provider_cfg.get("oauth_provider"))
 
 
+def _role_agent_sdk_model(
+    role: str, cfg: dict[str, Any]
+) -> tuple[str, str, dict[str, Any]] | None:
+    """If ``roles.{role}`` points at a provider whose ``adapter`` is the Agent SDK
+    delegating adapter, return ``(provider_name, model_name, provider_cfg)``.
+
+    This provider bypasses the ProviderRouter / LiteLLM entirely: the Claude
+    subscription credit pool is only drawn on when usage flows *through the Agent
+    SDK*, and a raw API call would be gray-area + uncredited. (2026-06-15)
+    """
+    role_cfg = (cfg.get("roles") or {}).get(role)
+    if isinstance(role_cfg, str) and "/" in role_cfg:
+        provider_name, model_name = role_cfg.split("/", 1)
+    elif isinstance(role_cfg, dict):
+        provider_name = role_cfg.get("provider")
+        model_name = role_cfg.get("model")
+    else:
+        return None
+    if not provider_name or not model_name:
+        return None
+    provider_cfg = (cfg.get("providers") or {}).get(provider_name)
+    if isinstance(provider_cfg, dict) and provider_cfg.get("adapter") == "anthropic-agent-sdk":
+        return provider_name, model_name, provider_cfg
+    return None
+
+
+def _chat_model_override_cache_token(role: str) -> str | None:
+    if role != "chat":
+        return None
+    return os.environ.get("JARVIS_CHAT_MODEL_OVERRIDE", "").strip() or None
+
+
+def _role_spec_fingerprint(role: str, cfg: dict[str, Any]) -> str:
+    """Fingerprint the *resolved* spec for ``role`` so the adapter cache detects a
+    direct config.yaml swap (model / provider / adapter) even when ProviderRouter
+    registration state is unchanged.
+
+    Folded into the cache key alongside ``_chat_model_override_cache_token`` so a
+    user editing config.yaml directly (without going through /llmsetting/apply,
+    which clear_cache()s) no longer gets a stale adapter — including the wrong-TYPE
+    case where roles.chat swaps between a legacy provider and the
+    anthropic-agent-sdk delegating provider. (2026-06-22 audit fix.)
+
+    Only the bits that change the constructed adapter are hashed: the role's
+    provider/model and that provider's adapter marker + connection fields. The
+    override-isolation cache token stays a separate key element, so this addition
+    does not weaken JARVIS_CHAT_MODEL_OVERRIDE re-keying.
+    """
+    role_cfg = (cfg.get("roles") or {}).get(role)
+    if isinstance(role_cfg, str):
+        provider_name = role_cfg.split("/", 1)[0] if "/" in role_cfg else role_cfg
+    elif isinstance(role_cfg, dict):
+        provider_name = role_cfg.get("provider")
+    else:
+        provider_name = None
+    provider_cfg = (cfg.get("providers") or {}).get(provider_name) if provider_name else None
+    relevant: dict[str, Any] = {"role_cfg": role_cfg}
+    if isinstance(provider_cfg, dict):
+        relevant["provider"] = {
+            k: provider_cfg.get(k)
+            for k in ("adapter", "oauth_provider", "api_base", "base_url", "api_key_env", "models")
+        }
+    payload = json.dumps(relevant, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _spawned_worker_override_is_strict() -> bool:
+    return os.environ.get("JARVIS_SPAWNED") == "1"
+
+
+def _chat_model_override_spec() -> str | None:
+    spec = os.environ.get("JARVIS_CHAT_MODEL_OVERRIDE", "").strip()
+    if not spec:
+        return None
+    if "/" not in spec:
+        message = f"malformed JARVIS_CHAT_MODEL_OVERRIDE={spec!r}; expected provider/model"
+        if _spawned_worker_override_is_strict():
+            raise RuntimeError(message)
+        _log.warning(message)
+        return None
+    return spec
+
+
+def _apply_chat_model_override(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Honor a per-process chat-model override for spawned workers.
+
+    A worker launched with a sidecar-routed chat model (e.g. the Agent SDK) can't
+    run that model through Pi, so jarvis.ps1 passes it as ``JARVIS_CHAT_MODEL_OVERRIDE``
+    and runs Pi on the encoder provider instead. When the override names a provider
+    this sidecar actually has configured, rewrite ``roles.chat`` to it (a per-call
+    copy — never mutating the shared config) so the chat turn lands on the requested
+    model. The Claude Agent SDK worker path may be launched from a config whose
+    providers.yaml does not already contain ``anthropic-agent-sdk``; in that case
+    inject a per-process adapter block so the override still drives chat. Other
+    unconfigured providers are ignored only for non-worker compatibility; spawned
+    workers fail hard so a requested model never silently falls back to persisted
+    ``roles.chat``. (Jun, 2026-06-16: workers on the Claude subscription backend.)
+    """
+    spec = _chat_model_override_spec()
+    if not spec:
+        return cfg
+    provider_name = spec.split("/", 1)[0].strip()
+    providers = cfg.get("providers") or {}
+    if not provider_name:
+        return cfg
+    if provider_name not in providers:
+        if provider_name == "anthropic-agent-sdk":
+            new_cfg = dict(cfg)
+            new_cfg["providers"] = {**providers, provider_name: {"adapter": "anthropic-agent-sdk"}}
+            new_cfg["roles"] = {**(cfg.get("roles") or {}), "chat": spec}
+            logging.getLogger(__name__).info(
+                "JARVIS_CHAT_MODEL_OVERRIDE=%r injected %r provider for spawned worker",
+                spec,
+                provider_name,
+            )
+            return new_cfg
+        if provider_name:
+            message = (
+                f"JARVIS_CHAT_MODEL_OVERRIDE={spec!r} names provider {provider_name!r} "
+                "not in this sidecar's providers config"
+            )
+            if _spawned_worker_override_is_strict():
+                raise RuntimeError(message)
+            logging.getLogger(__name__).warning(
+                "%s; using config roles.chat instead",
+                message,
+            )
+        return cfg
+    new_cfg = dict(cfg)
+    new_cfg["roles"] = {**(cfg.get("roles") or {}), "chat": spec}
+    return new_cfg
+
+
 def get_llm(role: str, *, config_path: str | None = None) -> ProviderAdapter:
-    """Return the cached LLM adapter for ``role`` (chat / subagent / encoder).
+    """Return the cached LLM adapter for ``role`` (chat / subagent / encoder / router).
 
     Routing rules:
       1. If a ProviderRouter is registered by the sidecar, resolve the role through config.yaml
@@ -268,7 +457,30 @@ def get_llm(role: str, *, config_path: str | None = None) -> ProviderAdapter:
     if role not in _VALID_ROLES:
         raise ValueError(f"unknown role: {role}")
 
-    cache_key = (role, config_path)
+    # Load + resolve config BEFORE the cache lookup so a direct config.yaml swap
+    # (model/provider/adapter) re-keys the cache. The same resolved cfg is reused
+    # for adapter construction below — no double load. (2026-06-22 audit fix.)
+    cfg = load_config(config_path)
+    if role == "chat":
+        cfg = _apply_chat_model_override(cfg)
+    elif role == "router":
+        # The router role is the lightweight routing classifier. Its model mirrors
+        # the `encoder` role (the canonical fast/cheap role) so the user configures
+        # only ONE fast model — routing automatically follows whatever encoder they
+        # run, never a model pinned by name that they may lack credentials for. The
+        # standalone roles.router config is honored only as a fallback when no encoder
+        # is configured. (Jun, 2026-06-24: "don't pin a model, follow the encoder.")
+        _roles = cfg.get("roles") or {}
+        _encoder_spec = _roles.get("encoder")
+        if _encoder_spec and _roles.get("router") != _encoder_spec:
+            cfg = dict(cfg)
+            cfg["roles"] = {**_roles, "router": _encoder_spec}
+    cache_key = (
+        role,
+        config_path,
+        _chat_model_override_cache_token(role),
+        _role_spec_fingerprint(role, cfg),
+    )
     current_router = _get_provider_router()
     cached = _CACHE.get(cache_key)
     if cached is not None and _cache_entry_is_valid(cached, current_router):
@@ -282,9 +494,17 @@ def get_llm(role: str, *, config_path: str | None = None) -> ProviderAdapter:
         if cached is not None:
             _CACHE.pop(cache_key, None)
 
-        cfg = load_config(config_path)
         try:
-            if _role_uses_oauth(role, cfg):
+            agent_sdk = _role_agent_sdk_model(role, cfg)
+            if agent_sdk is not None:
+                # Claude subscription credit path: delegate the turn to the Agent
+                # SDK. Bypasses ProviderRouter/LiteLLM (raw API would not draw on
+                # the Agent SDK credit pool). Lazy import keeps the package optional.
+                from .anthropic_agent_sdk import AnthropicAgentSDKAdapter
+
+                _provider_name, model_name, provider_cfg = agent_sdk
+                llm = AnthropicAgentSDKAdapter(model=model_name, config=provider_cfg)
+            elif _role_uses_oauth(role, cfg):
                 # OAuth needs the router's token manager and Codex Responses
                 # adapter. The direct HTTP adapter accepts API keys only.
                 router = current_router
@@ -293,13 +513,16 @@ def get_llm(role: str, *, config_path: str | None = None) -> ProviderAdapter:
                         f"roles.{role} uses OAuth, but ProviderRouter is not initialized"
                     )
                 alias = _resolve_role_alias(role, cfg, router)
+                # Encoder and router are both fast, reasoning-off classification
+                # calls: disable reasoning and cap the codex stream/call timeouts so
+                # neither blocks the turn. (router mirrors the encoder model above.)
                 extra_kwargs = (
                     {
                         "reasoning_effort": "none",
                         "codex_stream_timeout_sec": 25.0,
                         "codex_call_timeout_sec": 90.0,
                     }
-                    if role == "encoder"
+                    if role in ("encoder", "router")
                     else None
                 )
                 llm = LLMRouterAdapter(router, alias, extra_kwargs=extra_kwargs)

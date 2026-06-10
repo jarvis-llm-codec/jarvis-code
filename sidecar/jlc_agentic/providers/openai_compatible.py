@@ -11,6 +11,8 @@ from typing import Any, Callable
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from jlc_agentic.user_agent import with_jarvis_user_agent
+
 _log = logging.getLogger(__name__)
 
 
@@ -212,11 +214,13 @@ class OpenAICompatibleAdapter:
         req = Request(
             url=f"{self.base_url}/chat/completions",
             data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-            },
+            headers=with_jarvis_user_agent(
+                {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                }
+            ),
             method="POST",
         )
 

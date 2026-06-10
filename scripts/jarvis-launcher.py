@@ -9,6 +9,7 @@ agent engine with the JARVIS extensions loaded.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
@@ -19,6 +20,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Iterable
 
@@ -32,14 +34,20 @@ PI_AGENT_DIR = ROOT / "pi-agent"
 DEFAULT_RESOURCES_DIR = ROOT / "jarvis-resources"
 EXTENSION_PATH = PI_ROOT / "packages" / "coding-agent" / "examples" / "extensions" / "jarvis-jlc.ts"
 FACE_EXTENSION_PATH = PI_ROOT / "packages" / "coding-agent" / "examples" / "extensions" / "jarvis-face.ts"
+IMAGE_EXTENSION_PATH = PI_ROOT / "packages" / "coding-agent" / "examples" / "extensions" / "jarvis-image.ts"
 DOCTOR_SCRIPT = ROOT / "scripts" / "jarvis-doctor.py"
 AUTH_SCRIPT = ROOT / "scripts" / "jarvis-auth.py"
+MAX_WINDOW_LABEL_CHARS = 32
 
 AUTH_COMMANDS = {
     "gpt-login",
     "gpt-login-device",
     "gpt-auth-status",
     "gpt-logout",
+    "claude-login",
+    "anthropic-login",
+    "claude-auth-status",
+    "claude-logout",
     "api-key",
     "model-setting",
     "auth-status",
@@ -101,6 +109,65 @@ def truthy(value: str | None) -> bool:
     return value is not None and value.lower() in {"1", "true", "yes", "on"}
 
 
+def sanitize_window_label(value: str | None) -> str | None:
+    text = "".join(ch for ch in str(value or "") if ord(ch) >= 32 and ord(ch) != 127).strip()
+    return text[:MAX_WINDOW_LABEL_CHARS] if text else None
+
+
+def pair_runtime_prefix(pair_id: str | None) -> str:
+    prefix = re.sub(r"[^A-Za-z0-9]", "", str(pair_id or ""))
+    if len(prefix) >= 8:
+        return prefix[:8]
+    return f"{abs(os.getpid()):08x}"[-8:]
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if is_windows():
+        process_query_limited_information = 0x1000
+        still_active = 259
+        handle = ctypes.windll.kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == still_active
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def initialize_pair_id() -> str:
+    pair_id = os.environ.get("JARVIS_PAIR_ID")
+    if not pair_id:
+        pair_id = str(uuid.uuid4())
+        os.environ["JARVIS_PAIR_ID"] = pair_id
+        return pair_id
+
+    runtime_path = DATA_DIR / f"sidecar-runtime-{pair_runtime_prefix(pair_id)}.json"
+    try:
+        runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+        runtime_pair = str(runtime.get("pair_id") or "")
+        runtime_pid = int(runtime.get("pid") or 0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return pair_id
+    if runtime_pair == pair_id and runtime_pid > 0 and runtime_pid != os.getpid() and pid_alive(runtime_pid):
+        pair_id = str(uuid.uuid4())
+        os.environ["JARVIS_PAIR_ID"] = pair_id
+    return pair_id
+
+
 def has_arg(args: list[str], *names: str) -> bool:
     return any(arg in names or any(arg.startswith(f"{name}=") for name in names) for arg in args)
 
@@ -109,7 +176,7 @@ def skip_sidecar(args: list[str]) -> bool:
     return truthy(os.environ.get("JARVIS_WRAPPER_DRY_RUN")) or has_arg(args, "--help", "-h", "--version", "-v")
 
 
-def read_chat_role_from_config(config_path: Path) -> tuple[str, str] | None:
+def read_role_from_config(config_path: Path, role_name: str) -> tuple[str, str] | None:
     if not config_path.exists():
         return None
     try:
@@ -119,7 +186,7 @@ def read_chat_role_from_config(config_path: Path) -> tuple[str, str] | None:
     roles_match = re.search(r"(?ms)^roles:\s*\n((?:[ \t]+[^\n]+\n?)+)", content)
     if not roles_match:
         return None
-    chat_match = re.search(r"(?m)^[ \t]+chat:[ \t]*(\S+)", roles_match.group(1))
+    chat_match = re.search(rf"(?m)^[ \t]+{re.escape(role_name)}:[ \t]*(\S+)", roles_match.group(1))
     if not chat_match:
         return None
     chat = chat_match.group(1).strip("\"'")
@@ -131,6 +198,14 @@ def read_chat_role_from_config(config_path: Path) -> tuple[str, str] | None:
     if not provider or not model:
         return None
     return provider, model
+
+
+def read_chat_role_from_config(config_path: Path) -> tuple[str, str] | None:
+    return read_role_from_config(config_path, "chat")
+
+
+def read_encoder_role_from_config(config_path: Path) -> tuple[str, str] | None:
+    return read_role_from_config(config_path, "encoder")
 
 
 def model_registered_in_pi_models(provider: str, model: str) -> bool:
@@ -161,21 +236,122 @@ def launchable_config_model(provider: str, model: str) -> bool:
     return model_registered_in_pi_models(provider, model)
 
 
-def default_provider_args(args: list[str], config_path: Path) -> list[str]:
-    if has_arg(args, "--provider") or has_arg(args, "--model"):
-        return []
+def sidecar_routed_provider(provider: str) -> bool:
+    return provider == "anthropic-agent-sdk"
+
+
+def sidecar_routed_launch_args(provider: str, model: str, config_path: Path) -> list[str]:
+    os.environ["JARVIS_CHAT_MODEL_OVERRIDE"] = f"{provider}/{model}"
+    encoder = read_encoder_role_from_config(config_path)
+    if encoder and launchable_config_model(encoder[0], encoder[1]):
+        return ["--provider", encoder[0], "--model", encoder[1]]
+    raise RuntimeError(
+        f"Provider {provider}/{model} is sidecar-routed or not Pi-launchable; "
+        "roles.encoder must be a Pi-launchable provider/model before opening the window."
+    )
+
+
+def extract_provider_model_args(args: list[str]) -> tuple[str | None, str | None]:
+    provider: str | None = None
+    model: str | None = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--provider" and i + 1 < len(args):
+            provider = args[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--provider="):
+            provider = arg.split("=", 1)[1]
+            i += 1
+            continue
+        if arg == "--model" and i + 1 < len(args):
+            model = args[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--model="):
+            model = arg.split("=", 1)[1]
+            i += 1
+            continue
+        i += 1
+    if not provider and model and "/" in model:
+        provider, model = model.split("/", 1)
+    return (provider.strip() if provider else None, model.strip() if model else None)
+
+
+def strip_provider_model_args(args: list[str]) -> list[str]:
+    stripped: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in {"--provider", "--model"} and i + 1 < len(args):
+            i += 2
+            continue
+        if arg.startswith("--provider=") or arg.startswith("--model="):
+            i += 1
+            continue
+        stripped.append(arg)
+        i += 1
+    return stripped
+
+
+def resolve_provider_args(args: list[str], config_path: Path) -> tuple[list[str], list[str]]:
+    cli_provider, cli_model = extract_provider_model_args(args)
+    if cli_provider and cli_model:
+        if launchable_config_model(cli_provider, cli_model):
+            os.environ["JARVIS_CHAT_MODEL_OVERRIDE"] = f"{cli_provider}/{cli_model}"
+            return [], args
+        if not sidecar_routed_provider(cli_provider):
+            raise RuntimeError(f"Provider {cli_provider}/{cli_model} is not Pi-launchable.")
+        return sidecar_routed_launch_args(cli_provider, cli_model, config_path), strip_provider_model_args(args)
+    if cli_provider or cli_model:
+        return [], args
 
     provider = os.environ.get("JARVIS_DEFAULT_PROVIDER")
     model = os.environ.get("JARVIS_DEFAULT_MODEL")
-    if not provider or not model:
-        role = read_chat_role_from_config(config_path)
-        if role and launchable_config_model(role[0], role[1]):
-            provider = provider or role[0]
-            model = model or role[1]
+    if provider and model:
+        if launchable_config_model(provider, model):
+            return ["--provider", provider, "--model", model], args
+        if not sidecar_routed_provider(provider):
+            raise RuntimeError(f"Provider {provider}/{model} is not Pi-launchable.")
+        return sidecar_routed_launch_args(provider, model, config_path), args
+    if provider or model:
+        raise RuntimeError("Both JARVIS_DEFAULT_PROVIDER and JARVIS_DEFAULT_MODEL are required when either is set.")
 
+    role = read_chat_role_from_config(config_path)
+    if role and launchable_config_model(role[0], role[1]):
+        provider, model = role
+    elif role and sidecar_routed_provider(role[0]):
+        return sidecar_routed_launch_args(role[0], role[1], config_path), args
+    elif role:
+        return [], args
     if not provider or not model:
-        return []
-    return ["--provider", provider, "--model", model]
+        return [], args
+    return ["--provider", provider, "--model", model], args
+
+
+def load_credentials_env(config_path: Path) -> None:
+    credentials_path = config_path.with_name("credentials.yaml")
+    try:
+        lines = credentials_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    in_env_block = False
+    for line in lines:
+        if re.match(r"^env:\s*$", line):
+            in_env_block = True
+            continue
+        if not in_env_block:
+            continue
+        if re.match(r"^\S", line):
+            break
+        match = re.match(r"^\s+([A-Za-z_][A-Za-z0-9_]*):\s*(\S.*)$", line)
+        if not match:
+            continue
+        name = match.group(1)
+        value = match.group(2).strip().strip("\"'")
+        if value and name not in os.environ:
+            os.environ[name] = value
 
 
 def normalize_args(args: list[str]) -> tuple[list[str], str | None]:
@@ -184,6 +360,18 @@ def normalize_args(args: list[str]) -> tuple[list[str], str | None]:
     i = 0
     while i < len(args):
         arg = args[i]
+        if arg == "--window-label" and i + 1 < len(args):
+            label = sanitize_window_label(args[i + 1])
+            if label:
+                os.environ["JARVIS_WINDOW_LABEL"] = label
+            i += 2
+            continue
+        if arg.startswith("--window-label="):
+            label = sanitize_window_label(arg.split("=", 1)[1])
+            if label:
+                os.environ["JARVIS_WINDOW_LABEL"] = label
+            i += 1
+            continue
         if arg == "--recent-turns" and i + 1 < len(args):
             recent_turns = args[i + 1]
             i += 2
@@ -206,6 +394,14 @@ def normalize_args(args: list[str]) -> tuple[list[str], str | None]:
             normalized.append(f"--auto-prompts={value}")
             i += 1
             continue
+        if arg == "--sidecar-window":
+            os.environ["JARVIS_SHOW_SIDECAR_WINDOW"] = "1"
+            i += 1
+            continue
+        if arg == "--yolo":
+            os.environ["JARVIS_YOLO"] = "1"
+            i += 1
+            continue
         normalized.append(arg)
         i += 1
     return normalized, recent_turns
@@ -216,13 +412,16 @@ def configure_env(args: list[str]) -> Path:
     PI_AGENT_DIR.mkdir(parents=True, exist_ok=True)
     bootstrap_default_resources()
 
-    config_path = Path(os.environ.get("JARVIS_CODE_CONFIG", str(DATA_DIR / "config.yaml")))
+    config_path = Path(os.environ.get("JARVIS_CODE_CONFIG", str(Path.home() / ".jarvis-code" / "config.yaml")))
     port = os.environ.get("JARVIS_SIDECAR_PORT", "8765")
+    pair_id = initialize_pair_id()
+    pair_prefix = pair_runtime_prefix(pair_id)
 
     os.environ["JARVIS_CODE_CONFIG"] = str(config_path)
     os.environ["JARVIS_SIDECAR_PORT"] = port
     os.environ["JARVIS_SIDECAR_URL"] = f"http://127.0.0.1:{port}"
-    os.environ["JARVIS_SIDECAR_RUNTIME"] = str(DATA_DIR / "sidecar-runtime.json")
+    os.environ["JARVIS_SIDECAR_RUNTIME"] = str(DATA_DIR / f"sidecar-runtime-{pair_prefix}.json")
+    os.environ["JARVIS_WRAPPER_PID"] = str(os.getpid())
     os.environ["JARVIS_WRAPPER_LOG"] = str(DATA_DIR / "jarvis-wrapper.log")
     os.environ["JARVIS_DISABLE_COMPACTION"] = "1"
     os.environ["JARVIS_DISABLE_AUTO_COMPACTION"] = "1"
@@ -233,6 +432,7 @@ def configure_env(args: list[str]) -> Path:
     os.environ["PI_SKIP_PACKAGE_UPDATE_CHECK"] = "1"
     os.environ.setdefault("JARVIS_CODE_CODING_AGENT_DIR", str(PI_AGENT_DIR))
     os.environ.setdefault("PI_CODING_AGENT_DIR", os.environ["JARVIS_CODE_CODING_AGENT_DIR"])
+    load_credentials_env(config_path)
 
     normalized, recent_turns = normalize_args(args)
     if recent_turns is not None:
@@ -298,9 +498,20 @@ def sidecar_healthy() -> bool:
     try:
         with urllib.request.urlopen(health_url(), timeout=2) as response:
             data = json.loads(response.read().decode("utf-8"))
-        return data.get("ok") is True and data.get("service") == "jarvis-jlc-sidecar"
     except (OSError, urllib.error.URLError, json.JSONDecodeError):
         return False
+    if not (data.get("ok") is True and data.get("service") == "jarvis-jlc-sidecar"):
+        return False
+    # Mirror jarvis.ps1 Test-Sidecar: a healthy sidecar serving a DIFFERENT pair
+    # is the parent's, not ours. Without this gate a spawned worker inherits the
+    # parent's port, sees the parent sidecar as healthy, and skips starting its
+    # own — so no runtime file for the worker's pair ever appears and the spawn
+    # waiter times out. Rejecting the mismatch lets choose_port() pick a free
+    # sibling port and bring up the worker's own sidecar.
+    expected_pair = os.environ.get("JARVIS_PAIR_ID")
+    if expected_pair:
+        return str(data.get("pair_id") or "") == str(expected_pair)
+    return True
 
 
 def port_is_free(port: int) -> bool:
@@ -422,6 +633,12 @@ def start_sidecar(args: list[str]) -> subprocess.Popen[str] | None:
                         "url": os.environ["JARVIS_SIDECAR_URL"],
                         "port": int(os.environ["JARVIS_SIDECAR_PORT"]),
                         "pid": proc.pid,
+                        "pair_id": os.environ.get("JARVIS_PAIR_ID"),
+                        **(
+                            {"label": os.environ["JARVIS_WINDOW_LABEL"]}
+                            if os.environ.get("JARVIS_WINDOW_LABEL")
+                            else {}
+                        ),
                         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     },
                     indent=2,
@@ -446,8 +663,11 @@ def build_forward_args(args: list[str], config_path: Path) -> list[str]:
         forward.extend(["--extension", str(EXTENSION_PATH)])
     if FACE_EXTENSION_PATH.exists():
         forward.extend(["--extension", str(FACE_EXTENSION_PATH)])
-    forward.extend(default_provider_args(args, config_path))
-    forward.extend(args)
+    if IMAGE_EXTENSION_PATH.exists():
+        forward.extend(["--extension", str(IMAGE_EXTENSION_PATH)])
+    provider_args, remaining_args = resolve_provider_args(args, config_path)
+    forward.extend(provider_args)
+    forward.extend(remaining_args)
     return forward
 
 
@@ -465,8 +685,17 @@ def run_agent(args: list[str], config_path: Path) -> int:
                 {
                     "pi_root": str(PI_ROOT),
                     "sidecar_url": os.environ.get("JARVIS_SIDECAR_URL"),
+                    "pair_id": os.environ.get("JARVIS_PAIR_ID"),
+                    "window_label": os.environ.get("JARVIS_WINDOW_LABEL"),
+                    "sidecar_runtime": os.environ.get("JARVIS_SIDECAR_RUNTIME"),
                     "config_path": str(config_path),
                     "pi_agent_dir": os.environ.get("JARVIS_CODE_CODING_AGENT_DIR"),
+                    "skip_sidecar": skip_sidecar(args),
+                    "chat_model_override": os.environ.get("JARVIS_CHAT_MODEL_OVERRIDE"),
+                    "enable_extension_discovery": truthy(os.environ.get("JARVIS_ENABLE_EXTENSION_DISCOVERY")),
+                    "extension_path": str(EXTENSION_PATH),
+                    "face_extension_path": str(FACE_EXTENSION_PATH),
+                    "image_extension_path": str(IMAGE_EXTENSION_PATH),
                     "forward_args": forward,
                 },
                 indent=2,

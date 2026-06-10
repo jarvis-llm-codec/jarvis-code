@@ -6,12 +6,27 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
+import { getKeybindings } from "./keybindings.js";
 import { isKeyRelease, matchesKey } from "./keys.js";
 import type { Terminal } from "./terminal.js";
 import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.js";
 import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.js";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
+const SCROLL_LOCK_HISTORY_CAP = 5000;
+const SCROLL_LOCK_TRUNCATED_LINE = "[older history remains in terminal scrollback]";
+const SCROLL_LOCK_DISABLED_ENV = "JARVIS_DISABLE_SCROLL_LOCK";
+
+type ScrollLockState = {
+	top: number;
+	entryRawLineCount: number;
+	rawLineCount: number;
+	dropped: number;
+};
+
+function isScrollLockDisabled(): boolean {
+	return process.env[SCROLL_LOCK_DISABLED_ENV] === "1";
+}
 
 function extractKittyImageIds(line: string): number[] {
 	const sequenceStart = line.indexOf(KITTY_SEQUENCE_PREFIX);
@@ -259,6 +274,8 @@ export class TUI extends Container {
 	private previousViewportTop = 0; // Track previous viewport top for resize-aware cursor moves
 	private fullRedrawCount = 0;
 	private stopped = false;
+	private scrollLockState: ScrollLockState | undefined;
+	private forceScreenClearRender = false;
 
 	// Overlay stack for modal components rendered on top of base content
 	private focusOrderCounter = 0;
@@ -413,6 +430,32 @@ export class TUI extends Container {
 		return this.overlayStack.some((o) => this.isOverlayVisible(o));
 	}
 
+	isScrollLockActive(): boolean {
+		return this.scrollLockState !== undefined;
+	}
+
+	private enterScrollLock(): boolean {
+		if (isScrollLockDisabled() || this.getTopmostVisibleOverlay()) return false;
+		const { rawLineCount, dropped, lines } = this.buildScrollLockSource(this.terminal.columns);
+		const contentHeight = this.scrollLockContentHeight(this.terminal.rows);
+		this.scrollLockState = {
+			top: Math.max(0, lines.length - contentHeight),
+			entryRawLineCount: rawLineCount,
+			rawLineCount,
+			dropped,
+		};
+		this.terminal.hideCursor();
+		this.requestRender();
+		return true;
+	}
+
+	private leaveScrollLock(): void {
+		if (!this.scrollLockState) return;
+		this.scrollLockState = undefined;
+		this.forceScreenClearRender = true;
+		this.requestRender();
+	}
+
 	/** Check if an overlay entry is currently visible */
 	private isOverlayVisible(entry: (typeof this.overlayStack)[number]): boolean {
 		if (entry.hidden) return false;
@@ -475,6 +518,10 @@ export class TUI extends Container {
 		if (this.renderTimer) {
 			clearTimeout(this.renderTimer);
 			this.renderTimer = undefined;
+		}
+		if (this.scrollLockState) {
+			this.scrollLockState = undefined;
+			this.previousLines = [];
 		}
 		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
 		if (this.previousLines.length > 0) {
@@ -564,6 +611,26 @@ export class TUI extends Container {
 			return;
 		}
 
+		if (this.scrollLockState) {
+			if (matchesKey(data, "ctrl+c")) {
+				// Never trap interrupt behind the pager: exit and let the
+				// focused component handle Ctrl+C as in live mode.
+				this.leaveScrollLock();
+			} else if (this.getTopmostVisibleOverlay()) {
+				// A modal appeared while reading history. Reveal it; this key
+				// is consumed so the user sees the overlay before acting on it.
+				this.leaveScrollLock();
+				return;
+			} else {
+				this.handleScrollLockInput(data);
+				return;
+			}
+		}
+
+		if (!isScrollLockDisabled() && getKeybindings().matches(data, "tui.history.scroll")) {
+			if (this.enterScrollLock()) return;
+		}
+
 		// Global debug key handler (Shift+Ctrl+D)
 		if (matchesKey(data, "shift+ctrl+d") && this.onDebug) {
 			this.onDebug();
@@ -594,6 +661,46 @@ export class TUI extends Container {
 			this.focusedComponent.handleInput(data);
 			this.requestRender();
 		}
+	}
+
+	private handleScrollLockInput(data: string): void {
+		// Kitty keyboard protocol (flags 1+2+4) sends key release events.
+		// Ignore them so pager navigation keys don't trigger twice on those terminals.
+		if (isKeyRelease(data)) return;
+		const state = this.scrollLockState;
+		if (!state) return;
+		const page = this.scrollLockContentHeight(this.terminal.rows);
+		const maxTop = Math.max(0, this.buildScrollLockSource(this.terminal.columns).lines.length - page);
+		const moveTo = (top: number): void => {
+			state.top = Math.max(0, Math.min(top, maxTop));
+			this.requestRender();
+		};
+
+		if (matchesKey(data, "escape") || data === "q" || data === "Q" || matchesKey(data, "end")) {
+			this.leaveScrollLock();
+			return;
+		}
+		if (matchesKey(data, "up")) {
+			moveTo(state.top - 1);
+			return;
+		}
+		if (matchesKey(data, "down")) {
+			moveTo(state.top + 1);
+			return;
+		}
+		if (matchesKey(data, "pageUp")) {
+			moveTo(state.top - page);
+			return;
+		}
+		if (matchesKey(data, "pageDown")) {
+			moveTo(state.top + page);
+			return;
+		}
+		if (matchesKey(data, "home")) {
+			moveTo(0);
+			return;
+		}
+		this.requestRender();
 	}
 
 	private consumeCellSizeResponse(data: string): boolean {
@@ -871,6 +978,76 @@ export class TUI extends Container {
 		return this.deleteKittyImages(ids);
 	}
 
+	private scrollLockContentHeight(termHeight: number): number {
+		return Math.max(1, termHeight - 1);
+	}
+
+	private buildScrollLockSource(width: number): { lines: string[]; rawLineCount: number; dropped: number } {
+		const rawLines = this.render(width).map((line) => line.replaceAll(CURSOR_MARKER, ""));
+		const rawLineCount = rawLines.length;
+		if (rawLines.length <= SCROLL_LOCK_HISTORY_CAP) {
+			return { lines: rawLines, rawLineCount, dropped: 0 };
+		}
+		const kept = rawLines.slice(-(SCROLL_LOCK_HISTORY_CAP - 1));
+		const dropped = rawLines.length - kept.length;
+		return {
+			lines: [SCROLL_LOCK_TRUNCATED_LINE, ...kept],
+			rawLineCount,
+			dropped,
+		};
+	}
+
+	private formatScrollLockLine(line: string, width: number): string {
+		const normalized = normalizeTerminalOutput(line);
+		const clipped = visibleWidth(normalized) > width ? sliceByColumn(normalized, 0, width, true) : normalized;
+		return clipped + TUI.SEGMENT_RESET;
+	}
+
+	private buildScrollLockViewport(width: number, height: number): string[] {
+		const state = this.scrollLockState;
+		if (!state) return [];
+		const source = this.buildScrollLockSource(width);
+		const droppedDelta = Math.max(0, source.dropped - state.dropped);
+		if (droppedDelta > 0) {
+			state.top = Math.max(0, state.top - droppedDelta);
+		}
+		state.rawLineCount = source.rawLineCount;
+		state.dropped = source.dropped;
+
+		const contentHeight = this.scrollLockContentHeight(height);
+		const maxTop = Math.max(0, source.lines.length - contentHeight);
+		state.top = Math.max(0, Math.min(state.top, maxTop));
+		const visible = source.lines.slice(state.top, state.top + contentHeight);
+		while (visible.length < contentHeight) visible.push("");
+
+		const lines = visible.map((line) => this.formatScrollLockLine(line, width));
+		if (height > 1) {
+			const maxScrollable = Math.max(1, source.lines.length - contentHeight);
+			const percent = maxTop === 0 ? 100 : Math.round((state.top / maxScrollable) * 100);
+			const newCount = Math.max(0, source.rawLineCount - state.entryRawLineCount);
+			const status = `-- SCROLL ${percent}% | ${newCount} new below | Esc/q live | End tail --`;
+			lines.push(this.formatScrollLockLine(status, width));
+		}
+		return lines.slice(0, height);
+	}
+
+	private doScrollLockRender(width: number, height: number): void {
+		const lines = this.buildScrollLockViewport(width, height);
+		while (lines.length < height) lines.push(TUI.SEGMENT_RESET);
+		let buffer = "\x1b[?2026h\x1b[H\x1b[2J";
+		for (let i = 0; i < lines.length; i++) {
+			if (i > 0) buffer += "\r\n";
+			buffer += lines[i];
+		}
+		buffer += "\x1b[?2026l";
+		this.terminal.write(buffer);
+		this.cursorRow = Math.max(0, lines.length - 1);
+		this.hardwareCursorRow = this.cursorRow;
+		this.previousWidth = width;
+		this.previousHeight = height;
+		this.terminal.hideCursor();
+	}
+
 	/** Splice overlay content into a base line at a specific column. Single-pass optimized. */
 	private compositeLineAt(
 		baseLine: string,
@@ -954,6 +1131,15 @@ export class TUI extends Container {
 		if (this.stopped) return;
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
+		if (this.scrollLockState && this.getTopmostVisibleOverlay()) {
+			// A modal overlay demands attention: leave the pager so it renders.
+			this.scrollLockState = undefined;
+			this.forceScreenClearRender = true;
+		}
+		if (this.scrollLockState) {
+			this.doScrollLockRender(width, height);
+			return;
+		}
 		const widthChanged = this.previousWidth !== 0 && this.previousWidth !== width;
 		const heightChanged = this.previousHeight !== 0 && this.previousHeight !== height;
 		const previousBufferLength = this.previousHeight > 0 ? this.previousViewportTop + this.previousHeight : height;
@@ -980,12 +1166,15 @@ export class TUI extends Container {
 		newLines = this.applyLineResets(newLines);
 
 		// Helper to clear scrollback and viewport and render all new lines
-		const fullRender = (clear: boolean): void => {
+		const fullRender = (clear: boolean, clearScrollback = clear): void => {
 			this.fullRedrawCount += 1;
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
 			if (clear) {
 				buffer += this.deleteKittyImages(this.previousKittyImageIds);
-				buffer += "\x1b[2J\x1b[H\x1b[3J"; // Clear screen, home, then clear scrollback
+				buffer += "\x1b[2J\x1b[H"; // Clear screen and home
+				if (clearScrollback) {
+					buffer += "\x1b[3J"; // Clear scrollback on existing full-clear paths
+				}
 			}
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) buffer += "\r\n";
@@ -1022,6 +1211,13 @@ export class TUI extends Container {
 				// debug logging must never crash the app
 			}
 		};
+
+		if (this.forceScreenClearRender) {
+			this.forceScreenClearRender = false;
+			logRedraw("scroll lock exit");
+			fullRender(true, false);
+			return;
+		}
 
 		// First render - just output everything without clearing (assumes clean screen)
 		if (this.previousLines.length === 0 && !widthChanged && !heightChanged) {

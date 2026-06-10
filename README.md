@@ -52,6 +52,11 @@ Working *with* the grain instead of against it, it never slows as it grows — a
 ## ✨ What's inside
 
 - 🧠 **JLC memory** — a bounded, self-organizing memory injected into every model turn; full history kept locally for recall
+- 🪟 **Multi-window orchestration** — spawn worker windows from chat, delegate builds as jobs with server-enforced review cycles, or let two windows argue to consensus in GAN rounds; all windows share one memory, so any window recalls what another did
+- 🧭 **Plan dialogue + design recon** — a vague "build me X" pops a quick dialog of choices (recommended defaults, Esc accepts all), then live web research distills current design trends into a per-project Design Brief before the first file is written
+- 🦙 **Local-first endpoints** — keyless presets for Ollama, LM Studio, and llama.cpp; your local models show up in `/model-setting` next to cloud providers and just work
+- ✋ **Tool lessons** — a failed shell command and the fix that followed are remembered machine-wide and offered the next time the same failure appears, at zero always-on token cost
+- 📜 **Scroll-lock pager** — read history while output streams; the view stays put (`Shift+PageUp` / `Ctrl+PageUp`, `Esc` back to live)
 - 🖥️ **Terminal-native engine** — a fast TUI coding agent (TypeScript, under `pi/`)
 - 🔌 **Python sidecar** — a FastAPI service for memory, project routing, and raw recall
 - 📁 **Per-project `JARVIS.md`** — project memory that lives with the repo, like `CLAUDE.md`

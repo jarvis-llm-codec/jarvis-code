@@ -6,7 +6,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -17,8 +16,17 @@ from typing import Any, Callable, Literal, TypedDict
 from .embedder import LocalEmbedder
 
 try:
-    from jarvis_sidecar.raw_store import _timestamp_local_date as timestamp_local_date
+    from jarvis_sidecar.file_locks import cross_process_file_lock, locked_atomic_write_text
+    from jarvis_sidecar.raw_store import (
+        normalize_origin_window,
+        normalize_turn_origin,
+        _timestamp_local_date as timestamp_local_date,
+    )
 except Exception:  # pragma: no cover - sidecar package unavailable in standalone mode
+    cross_process_file_lock = None
+    locked_atomic_write_text = None
+    normalize_origin_window = None
+    normalize_turn_origin = None
     timestamp_local_date = None
 
 _MAX_CACHED_LOCKS = 1000
@@ -31,28 +39,66 @@ def _normalize_session_id(session_id: str | None) -> str:
     return raw or _SESSION_ID
 
 
+def _normalize_origin(origin: str | None) -> str:
+    if callable(normalize_turn_origin):
+        return normalize_turn_origin(origin)
+    value = str(origin or "").strip()
+    return value if value in {"user", "monologue_directive", "monologue_report"} else "user"
+
+
+def _normalize_origin_window(origin_window: str | None) -> str | None:
+    if callable(normalize_origin_window):
+        return normalize_origin_window(origin_window)
+    value = str(origin_window or "").strip()
+    return value[:64] if value else None
+
+
+def _normalize_origin_window_label(label: str | None) -> str | None:
+    text = "".join(ch for ch in str(label or "") if ord(ch) >= 32 and ord(ch) != 127).strip()
+    return text[:32] if text else None
+
+
+def _origin_fields(source: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "origin": _normalize_origin(source.get("origin")),
+        "origin_window": _normalize_origin_window(source.get("origin_window")),
+        "origin_window_label": _normalize_origin_window_label(source.get("origin_window_label")),
+    }
+
+
+def _fragment_for_turn(turn: dict[str, Any], *, score: float = 0.0) -> dict[str, Any]:
+    return {
+        "turn": turn.get("turn", 0),
+        "score": round(score, 4),
+        "user": turn.get("user", ""),
+        "assistant": turn.get("assistant", ""),
+        "ts": turn.get("ts", ""),
+        **_origin_fields(turn),
+    }
+
+
+def _missing_lock_error(name: str) -> RuntimeError:
+    message = (
+        f"jarvis_sidecar.file_locks.{name} unavailable; refusing shared retriever write without a lock"
+    )
+    print(f"[jlc:ret] {message}", file=sys.stderr)
+    return RuntimeError(message)
+
+
+def _require_cross_process_file_lock():
+    if not callable(cross_process_file_lock):
+        raise _missing_lock_error("cross_process_file_lock")
+    return cross_process_file_lock
+
+
+def _require_locked_atomic_write_text():
+    if not callable(locked_atomic_write_text):
+        raise _missing_lock_error("locked_atomic_write_text")
+    return locked_atomic_write_text
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    # Owner-only (0o600) on POSIX. Windows lacks os.fchmod; ACLs handle this.
-    try:
-        os.fchmod(fd, 0o600)
-    except (AttributeError, OSError):
-        pass
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", errors="replace", newline="") as fh:
-            fh.write(content)
-            fh.flush()
-            try:
-                os.fsync(fh.fileno())
-            except OSError:
-                pass
-        os.replace(tmp_name, str(path))
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+    _require_locked_atomic_write_text()(path, content)
 
 _tokenize_re = re.compile(r"[\w]+", re.UNICODE)
 
@@ -168,7 +214,17 @@ class JLCRetriever:
 
     # ── Store ──
 
-    def save_turn(self, turn: int, user_msg: str, assistant_msg: str, session_id: str | None = None) -> Path:
+    def save_turn(
+        self,
+        turn: int,
+        user_msg: str,
+        assistant_msg: str,
+        session_id: str | None = None,
+        *,
+        origin: str = "user",
+        origin_window: str | None = None,
+        origin_window_label: str | None = None,
+    ) -> Path:
         """Append a turn to the conversation's JSONL file.
 
         Per-conv threading.Lock prevents line interleaving when multiple
@@ -184,11 +240,21 @@ class JLCRetriever:
             "ts": datetime.now(UTC).isoformat(),
             "user": user_msg.strip(),
             "assistant": assistant_msg.strip(),
+            "origin": _normalize_origin(origin),
+            "origin_window": _normalize_origin_window(origin_window),
+            "origin_window_label": _normalize_origin_window_label(origin_window_label),
         }
         line = json.dumps(entry, ensure_ascii=False) + "\n"
         with self._save_lock(conv_id):
-            with turns_file.open("a", encoding="utf-8") as f:
-                f.write(line)
+            file_lock = _require_cross_process_file_lock()
+            with file_lock(turns_file):
+                with turns_file.open("a", encoding="utf-8") as f:
+                    f.write(line)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
 
         # Invalidate BM25 corpus cache for this conversation.
         with self._bm25_cache_guard:
@@ -413,13 +479,15 @@ class JLCRetriever:
             index_path = self._index_jsonl_path(conv_id)
             index_path.parent.mkdir(parents=True, exist_ok=True)
             line = json.dumps({"turn": turn_data.get("turn", 0), "embedding": embeddings[0]}, ensure_ascii=False) + "\n"
-            with index_path.open("a", encoding="utf-8", newline="") as fh:
-                fh.write(line)
-                fh.flush()
-                try:
-                    os.fsync(fh.fileno())
-                except OSError:
-                    pass
+            file_lock = _require_cross_process_file_lock()
+            with file_lock(index_path):
+                with index_path.open("a", encoding="utf-8", newline="") as fh:
+                    fh.write(line)
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
         finally:
             lock.release()
         return True
@@ -491,13 +559,7 @@ class JLCRetriever:
         for turn_num in sorted(window_turns):
             if turn_num in turn_map:
                 t = turn_map[turn_num]
-                fragments.append({
-                    "turn": turn_num,
-                    "score": score_by_turn.get(turn_num, 0.0),
-                    "user": t.get("user", ""),
-                    "assistant": t.get("assistant", ""),
-                    "ts": t.get("ts", ""),
-                })
+                fragments.append(_fragment_for_turn(t, score=score_by_turn.get(turn_num, 0.0)))
 
         return {"confidence": confidence, "fragments": fragments}
 
@@ -619,13 +681,7 @@ class JLCRetriever:
         fragments = []
         for turn_idx, score in top:
             t = turns[turn_idx]
-            fragments.append({
-                "turn": t.get("turn", 0),
-                "score": round(score, 4),
-                "user": t.get("user", ""),
-                "assistant": t.get("assistant", ""),
-                "ts": t.get("ts", ""),
-            })
+            fragments.append(_fragment_for_turn(t, score=score))
         return {"confidence": confidence, "fragments": fragments}
 
     @staticmethod
@@ -806,13 +862,7 @@ class JLCRetriever:
         for turn_num in sorted(window_turns):
             if turn_num in turn_map:
                 t = turn_map[turn_num]
-                fragments.append({
-                    "turn": turn_num,
-                    "score": score_by_turn.get(turn_num, 0.0),
-                    "user": t.get("user", ""),
-                    "assistant": t.get("assistant", ""),
-                    "ts": t.get("ts", ""),
-                })
+                fragments.append(_fragment_for_turn(t, score=score_by_turn.get(turn_num, 0.0)))
 
         return {"confidence": confidence, "fragments": fragments}
 
@@ -864,13 +914,7 @@ class JLCRetriever:
         for t in turns:
             text = (t.get("user", "") + " " + t.get("assistant", "")).lower()
             if kw_lower in text:
-                results.append({
-                    "turn": t["turn"],
-                    "score": 1.0,
-                    "user": t.get("user", ""),
-                    "assistant": t.get("assistant", ""),
-                    "ts": t.get("ts", ""),
-                })
+                results.append(_fragment_for_turn(t, score=1.0))
                 if len(results) >= max_results:
                     return results
 
@@ -895,13 +939,8 @@ class JLCRetriever:
             hits = sum(1 for tok in tokens if tok in text)
             if hits == 0:
                 continue
-            scored.append((hits / len(tokens), {
-                "turn": t["turn"],
-                "score": round(hits / len(tokens), 4),
-                "user": t.get("user", ""),
-                "assistant": t.get("assistant", ""),
-                "ts": t.get("ts", ""),
-            }))
+            score = hits / len(tokens)
+            scored.append((score, _fragment_for_turn(t, score=score)))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [entry for _, entry in scored[:max_results]]
@@ -922,6 +961,7 @@ class JLCRetriever:
                     "tags": t.get("tags", []),
                     "user": t.get("user", ""),
                     "assistant": t.get("assistant", ""),
+                    **_origin_fields(t),
                 })
         return results
 
@@ -941,7 +981,18 @@ class JLCRetriever:
         """Combine user + assistant into a single searchable string."""
         u = turn.get("user", "")
         a = turn.get("assistant", "")
-        return f"User: {u}\nAssistant: {a}"
+        origin = _normalize_origin(turn.get("origin"))
+        origin_window = _normalize_origin_window(turn.get("origin_window")) or ""
+        origin_window_label = _normalize_origin_window_label(turn.get("origin_window_label")) or ""
+        origin_line = ""
+        if origin != "user" or origin_window or origin_window_label:
+            origin_line = f"Origin: {origin}"
+            if origin_window:
+                origin_line += f" window={origin_window}"
+            if origin_window_label:
+                origin_line += f" label={origin_window_label}"
+            origin_line += "\n"
+        return f"{origin_line}User: {u}\nAssistant: {a}"
 
     @staticmethod
     def _cosine_sim(a: list[float], b: list[float]) -> float:

@@ -1,29 +1,32 @@
 /**
- * jarvis-image.ts — 이미지 생성/편집 도구 ( generate_image · edit_image )
+ * jarvis-image.ts — image generation/editing tools ( generate_image · edit_image )
  *
- * 자비스코드의 손에 붓을 하나 더 쥐여준다. 코딩 도구(read/write/edit/bash)
- * 옆에 이미지 도구를 얹어, 대화 중에 이미지를 만들고 워크스페이스에 저장한다.
- * 코어는 건드리지 않는다 — jarvis-face와 같은 순수 확장.
+ * Gives JARVIS Code one more brush. It adds image tools beside the coding
+ * tools (read/write/edit/bash), so images can be created during a conversation
+ * and saved into the workspace.
+ * The core stays untouched — this is a pure extension like jarvis-face.
  *
- * provider = NVIDIA NIM (build.nvidia.com). Jun이 이미 쓰는 nvapi 키를 그대로
- * 재사용한다. text→image는 FLUX.1-dev로 즉시 되고(429 없음, 품질 최상),
- * 게임 스프라이트 "시트"는 한 장 안에 여러 프레임을 함께 그려 프레임 간
- * 일관성이 저절로 잡힌다. "기존 캐릭터에 새 포즈 추가" 같은 레퍼런스 편집은
- * FLUX.1 Kontext의 asset-upload 플로우로 간다.
+ * provider = NVIDIA NIM (build.nvidia.com). Reuses the existing nvapi key.
+ * text→image works immediately with FLUX.1-dev (no 429s, best quality).
+ * Game sprite "sheets" draw multiple frames together in one image, so
+ * frame-to-frame consistency comes naturally. Reference edits such as
+ * "add a new pose to an existing character" use the FLUX.1 Kontext
+ * asset-upload flow.
  *
- * 설계 원칙:
- *  - 크기로 막는다: 생성물을 디스크에 저장하고, 모델 컨텍스트엔 base64를 절대
- *    안 넣는다. 반환값은 저장 경로 + 메타데이터(바이트/모델/시드)뿐.
- *  - 키는 환경변수 우선, credentials.yaml 폴백 (사이드카와 대칭). 코드/레포에
- *    키 하드코딩 0.
- *  - 실패는 사람이 읽을 수 있게: 비-200은 상태코드 + 본문 요약으로 graceful.
+ * Design principles:
+ *  - Keep payloads small: save generated files to disk and never put base64 in
+ *    the model context. Return only saved paths plus metadata (bytes/model/seed).
+ *  - Prefer environment variables for keys, with credentials.yaml as a fallback
+ *    (matching the sidecar). No keys are hardcoded in code or the repo.
+ *  - Make failures readable: non-200 responses return the status code plus a
+ *    short body summary gracefully.
  *
- * 환경변수 (키 탐색 순서):
+ * Environment variables (key lookup order):
  *  NVIDIA_API_KEY → NIM_API_KEY → NIM_API_KEY_1 → NIM_API_KEY_2,
- *  없으면 credentials.yaml의 env 블록에서 같은 이름들을 찾는다.
- *  JLC_IMAGE_MODEL      (선택) — text→image 기본 모델 덮어쓰기
- *  JLC_IMAGE_EDIT_MODEL (선택) — 편집 기본 모델 덮어쓰기
- *  JLC_IMAGE_DIR        (선택) — output_path 미지정 시 저장 폴더 (기본 ~/.jarvis-code/jlc-images)
+ *  then the same names in the env block of credentials.yaml.
+ *  JLC_IMAGE_MODEL      (optional) — override the default text→image model
+ *  JLC_IMAGE_EDIT_MODEL (optional) — override the default edit model
+ *  JLC_IMAGE_DIR        (optional) — save folder when output_path is omitted (default ~/.jarvis-code/jlc-images)
  */
 
 import * as fs from "node:fs";
@@ -34,15 +37,20 @@ import { Type } from "typebox";
 
 const GENAI_BASE = "https://ai.api.nvidia.com/v1/genai";
 const ASSETS_URL = "https://api.nvcf.nvidia.com/v2/nvcf/assets";
-// flux.1-dev = 풀(비증류) 모델. 정돈된 품질이 가장 낫다 (Jun A/B 결정, 2026-06-10).
-// 화려/고속이 필요하면 model 파라미터로 flux.2-klein-4b / flux.1-schnell 선택.
+const VERSION_FILE = "jarvis_version.json";
+const FALLBACK_JARVIS_VERSION = "1.01.0";
+// flux.1-dev = full (non-distilled) model. It gives the cleanest quality (A/B decision, 2026-06-10).
+// For richer or faster output, choose flux.2-klein-4b / flux.1-schnell with the model parameter.
 const DEFAULT_MODEL = "black-forest-labs/flux.1-dev";
 const DEFAULT_EDIT_MODEL = "black-forest-labs/flux.1-kontext-dev";
+const MISSING_NVIDIA_KEY_MESSAGE =
+	"Image generation is off. Add your NVIDIA key: /api-key → NVIDIA NIM (free tier: build.nvidia.com)";
 
-// FLUX.1-dev가 허용하는 width/height 격자 — 그 밖의 값은 422. 가장 가까운 값으로 스냅.
+// Width/height grid allowed by FLUX.1-dev — other values return 422, so snap to the nearest value.
 const ALLOWED_DIMS = [768, 832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344];
 
 const KEY_ENV_NAMES = ["NVIDIA_API_KEY", "NIM_API_KEY", "NIM_API_KEY_1", "NIM_API_KEY_2"];
+let cachedJarvisUserAgent: string | undefined;
 
 interface NvArtifact {
 	base64: string;
@@ -55,7 +63,59 @@ interface NvResponse {
 	error?: { message?: string; code?: number };
 }
 
-/** 환경변수 → credentials.yaml(env 블록) 순으로 nvapi 키를 찾는다. */
+function findRepoRoot(start: string): string | undefined {
+	let current = path.resolve(start);
+	for (;;) {
+		if (fs.existsSync(path.join(current, VERSION_FILE))) return current;
+		const parent = path.dirname(current);
+		if (parent === current) return undefined;
+		current = parent;
+	}
+}
+
+function readJarvisVersion(): string {
+	const starts = [
+		process.env.JARVIS_CODE_ROOT,
+		process.cwd(),
+		__dirname,
+		path.resolve(__dirname, "../../../.."),
+		path.resolve(__dirname, "../../../../.."),
+	].filter((candidate): candidate is string => Boolean(candidate?.trim()));
+	for (const start of starts) {
+		const root = findRepoRoot(start);
+		if (!root) continue;
+		try {
+			const raw = JSON.parse(fs.readFileSync(path.join(root, VERSION_FILE), "utf-8")) as { version?: unknown };
+			const version = typeof raw.version === "string" ? raw.version.trim() : "";
+			if (/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) return version;
+		} catch {
+			/* next candidate */
+		}
+	}
+	return FALLBACK_JARVIS_VERSION;
+}
+
+function jarvisUserAgent(): string {
+	if (!cachedJarvisUserAgent) {
+		cachedJarvisUserAgent = `jarvis-code/${readJarvisVersion()} (pi-agent)`;
+	}
+	return cachedJarvisUserAgent;
+}
+
+function withJarvisUserAgent(headers: Record<string, string>): Record<string, string> {
+	const next = { ...headers };
+	const key = Object.keys(next).find((name) => name.toLowerCase() === "user-agent");
+	if (!key) {
+		next["User-Agent"] = jarvisUserAgent();
+		return next;
+	}
+	if (!next[key].includes(jarvisUserAgent())) {
+		next[key] = `${next[key]} ${jarvisUserAgent()}`.trim();
+	}
+	return next;
+}
+
+/** Finds an nvapi key from environment variables, then credentials.yaml (env block). */
 function resolveApiKey(): string | undefined {
 	for (const name of KEY_ENV_NAMES) {
 		const v = process.env[name]?.trim();
@@ -69,9 +129,10 @@ function resolveApiKey(): string | undefined {
 }
 
 /**
- * credentials.yaml의 env 블록에서 키를 읽는다. 사이드카의 credentials_path()와
- * 같은 자리를 본다: JARVIS_CODE_CONFIG의 sibling, 없으면 흔한 후보들.
- * yaml 의존성 없이 단순 정규식 — env 블록은 `  KEY: value` 고정 포맷이다.
+ * Reads keys from the env block of credentials.yaml. It checks the same places
+ * as the sidecar's credentials_path(): the sibling of JARVIS_CODE_CONFIG, then
+ * common fallback candidates. Uses a simple regex instead of a YAML dependency;
+ * the env block has the fixed `  KEY: value` format.
  */
 function readKeyFromCredentials(key: string): string | undefined {
 	const candidates: string[] = [];
@@ -87,26 +148,26 @@ function readKeyFromCredentials(key: string): string | undefined {
 			const m = re.exec(text);
 			if (m?.[1]) return m[1].trim();
 		} catch {
-			/* 다음 후보 */
+			/* next candidate */
 		}
 	}
 	return undefined;
 }
 
 /**
- * 모델마다 허용 steps/cfg_scale 범위가 다르다 — 증류 모델(klein/schnell)은 소수
- * 스텝 전용이고 klein은 cfg_scale이 1로 고정이다. 안 맞으면 422. 모델에 맞게
- * 기본값을 주고 사용자 값도 유효범위로 클램프한다.
+ * Each model has its own allowed steps/cfg_scale range. Distilled models
+ * (klein/schnell) use only a few steps, and klein fixes cfg_scale at 1.
+ * Invalid values return 422, so defaults and user values are clamped per model.
  */
 function resolveSampling(model: string, steps?: number, cfg?: number): { steps: number; cfg_scale: number } {
 	const m = model.toLowerCase();
 	if (m.includes("klein")) {
-		return { steps: Math.min(Math.max(Math.round(steps ?? 4), 1), 4), cfg_scale: 1 }; // klein: steps≤4, cfg=1 고정
+		return { steps: Math.min(Math.max(Math.round(steps ?? 4), 1), 4), cfg_scale: 1 }; // klein: steps≤4, cfg=1 fixed
 	}
 	if (m.includes("schnell")) {
-		return { steps: Math.min(Math.max(Math.round(steps ?? 4), 1), 8), cfg_scale: cfg ?? 0 }; // schnell: 소수 스텝, cfg 0
+		return { steps: Math.min(Math.max(Math.round(steps ?? 4), 1), 8), cfg_scale: cfg ?? 0 }; // schnell: few steps, cfg 0
 	}
-	return { steps: steps ?? 40, cfg_scale: cfg ?? 3.5 }; // flux.1-dev 등 풀 모델
+	return { steps: steps ?? 40, cfg_scale: cfg ?? 3.5 }; // full models such as flux.1-dev
 }
 
 function snapDim(n: number | undefined, fallback: number): number {
@@ -116,7 +177,7 @@ function snapDim(n: number | undefined, fallback: number): number {
 	return best;
 }
 
-/** base64 매직바이트로 실제 포맷 → 확장자. NVIDIA FLUX는 보통 JPEG를 돌려준다. */
+/** Maps actual format to extension from base64 magic bytes. NVIDIA FLUX usually returns JPEG. */
 function extForBase64(b64: string): string {
 	const head = Buffer.from(b64.slice(0, 16), "base64");
 	if (head[0] === 0xff && head[1] === 0xd8) return ".jpg";
@@ -143,7 +204,7 @@ function slugify(s: string): string {
 }
 
 function resolveCwd(ctx: ExtensionContext): string {
-	// cwd는 stale 런타임에서 throw할 수 있다 — jarvis-jlc와 같은 방어.
+	// cwd can throw in a stale runtime — same defense as jarvis-jlc.
 	try {
 		return ctx.cwd;
 	} catch {
@@ -151,17 +212,19 @@ function resolveCwd(ctx: ExtensionContext): string {
 	}
 }
 
-/** artifacts[].base64 들을 디스크에 저장하고 cwd 상대경로 목록을 돌려준다. */
+/** Saves artifacts[].base64 to disk and returns paths relative to cwd. */
 function saveArtifacts(
 	arts: NvArtifact[],
 	cwd: string,
 	prompt: string,
 	outputPath: string | undefined,
 ): { abs: string[]; rel: string[]; bytes: number; seeds: (number | undefined)[] } {
-	// 기본은 글로벌 한 곳(~/.jarvis-code/jlc-images) — dev 툴 관행(~/.ollama, ~/.aws)대로
-	// 숨김 홈 dir에 그룹화. "그냥 그려줘"가 켠 위치에 안 흩어지고, 개인 Pictures(클라우드
-	// 동기화)도 안 오염시킨다. 프로젝트 자산은 에이전트가 output_path로(예 ./assets/x.png)
-	// 주거나 복사 — 그건 툴이 아니라 에이전트 일. JLC_IMAGE_DIR로 다른 곳 고정 가능.
+	// Default to one global location (~/.jarvis-code/jlc-images), following dev-tool
+	// conventions (~/.ollama, ~/.aws) by grouping under a hidden home directory.
+	// Casual "draw this" requests do not scatter files into the active cwd or
+	// pollute personal Pictures folders that may sync to cloud storage. For project
+	// assets, the agent should pass output_path (e.g. ./assets/x.png) or copy files;
+	// that is agent work, not tool work. JLC_IMAGE_DIR can pin a different location.
 	const baseDir = process.env.JLC_IMAGE_DIR || path.join(os.homedir(), ".jarvis-code", "jlc-images");
 	const ts = Date.now();
 	const abs: string[] = [];
@@ -175,7 +238,7 @@ function saveArtifacts(
 			if (arts.length === 1) outAbs = given;
 			else {
 				const e = path.extname(given) || ext;
-				outAbs = given.slice(0, given.length - path.extname(given).length) + `-${i + 1}` + e;
+				outAbs = `${given.slice(0, given.length - path.extname(given).length)}-${i + 1}${e}`;
 			}
 		} else {
 			outAbs = path.join(baseDir, `${slugify(prompt)}-${ts}${arts.length > 1 ? `-${i + 1}` : ""}${ext}`);
@@ -185,7 +248,7 @@ function saveArtifacts(
 		abs.push(outAbs);
 		seeds.push(a.seed);
 	}
-	// cwd 안이면 상대경로, 밖(글로벌 등)이면 절대경로로 보여준다.
+	// Show relative paths inside cwd, absolute paths outside it (global output, etc.).
 	const rel = abs.map((p) => {
 		const r = path.relative(cwd, p);
 		return r && !r.startsWith("..") ? r : p;
@@ -240,12 +303,12 @@ async function postGenAI(
 	signal: AbortSignal | undefined,
 	extraHeaders: Record<string, string> = {},
 ): Promise<GenAIOutcome> {
-	const headers = {
+	const headers = withJarvisUserAgent({
 		Authorization: `Bearer ${apiKey}`,
 		"Content-Type": "application/json",
 		Accept: "application/json",
 		...extraHeaders,
-	};
+	});
 	const payload = JSON.stringify(body);
 	let last: GenAIOutcome = { ok: false, status: 0, json: null, bodyText: "", networkError: "no attempt" };
 	for (let attempt = 0; attempt < 3; attempt++) {
@@ -277,11 +340,15 @@ async function postGenAI(
 	return last;
 }
 
-/** NVIDIA NVCF 자산 업로드: 자산 생성 → presigned URL에 PUT. assetId 반환. */
+/** NVIDIA NVCF asset upload: create asset → PUT to presigned URL. Returns assetId. */
 async function uploadAsset(apiKey: string, bytes: Buffer, mime: string, signal?: AbortSignal): Promise<string> {
 	const createRes = await fetch(ASSETS_URL, {
 		method: "POST",
-		headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", accept: "application/json" },
+		headers: withJarvisUserAgent({
+			Authorization: `Bearer ${apiKey}`,
+			"Content-Type": "application/json",
+			accept: "application/json",
+		}),
 		body: JSON.stringify({ contentType: mime, description: "jarvis-image reference" }),
 		signal,
 	});
@@ -289,7 +356,10 @@ async function uploadAsset(apiKey: string, bytes: Buffer, mime: string, signal?:
 	const { assetId, uploadUrl } = (await createRes.json()) as { assetId: string; uploadUrl: string };
 	const putRes = await fetch(uploadUrl, {
 		method: "PUT",
-		headers: { "Content-Type": mime, "x-amz-meta-nvcf-asset-description": "jarvis-image reference" },
+		headers: withJarvisUserAgent({
+			"Content-Type": mime,
+			"x-amz-meta-nvcf-asset-description": "jarvis-image reference",
+		}),
 		body: bytes,
 		signal,
 	});
@@ -337,11 +407,7 @@ export const generateImageTool = defineTool({
 	async execute(_toolCallId, params, signal, onUpdate, ctx: ExtensionContext) {
 		const apiKey = resolveApiKey();
 		if (!apiKey) {
-			return errorResult(
-				"No NVIDIA API key found. Set NVIDIA_API_KEY (or NIM_API_KEY) in the environment, " +
-					"or add it under the `env:` block of your jarvis-code credentials.yaml.",
-				"missing_api_key",
-			);
+			return errorResult(MISSING_NVIDIA_KEY_MESSAGE, "missing_api_key");
 		}
 		const cwd = resolveCwd(ctx);
 		const model = (params.model || process.env.JLC_IMAGE_MODEL || DEFAULT_MODEL).trim();
@@ -422,11 +488,7 @@ export const editImageTool = defineTool({
 	async execute(_toolCallId, params, signal, onUpdate, ctx: ExtensionContext) {
 		const apiKey = resolveApiKey();
 		if (!apiKey) {
-			return errorResult(
-				"No NVIDIA API key found. Set NVIDIA_API_KEY (or NIM_API_KEY) in the environment, " +
-					"or add it under the `env:` block of your jarvis-code credentials.yaml.",
-				"missing_api_key",
-			);
+			return errorResult(MISSING_NVIDIA_KEY_MESSAGE, "missing_api_key");
 		}
 		const cwd = resolveCwd(ctx);
 		const model = (params.model || process.env.JLC_IMAGE_EDIT_MODEL || DEFAULT_EDIT_MODEL).trim();
@@ -454,7 +516,7 @@ export const editImageTool = defineTool({
 			apiKey,
 			{
 				prompt: params.prompt,
-				// NVIDIA asset 참조 포맷: data:<mime>;example_id,<assetId>
+				// NVIDIA asset reference format: data:<mime>;example_id,<assetId>
 				image: `data:${mime};example_id,${assetId}`,
 				cfg_scale: params.cfg_scale ?? 3.5,
 				steps: params.steps ?? 30,

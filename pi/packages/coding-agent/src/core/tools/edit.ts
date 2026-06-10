@@ -7,6 +7,7 @@ import { renderDiff } from "../../modes/interactive/components/diff.js";
 import type { ToolDefinition } from "../extensions/types.js";
 import {
 	applyEditsToNormalizedContent,
+	computeArgsDiff,
 	computeEditsDiff,
 	detectLineEnding,
 	type Edit,
@@ -447,7 +448,19 @@ export function createEditToolDefinition(
 				component.settledError = false;
 			}
 
-			if (context.argsComplete && previewInput && !component.preview && !component.previewPending) {
+			if (context.alreadyApplied) {
+				// regime-B (presolved/already-applied): the SDK applied the edit to disk
+				// before pi sees it, so the file-based computeEditsDiff would re-read the
+				// file and re-search the now-replaced oldText -> a false "Could not find
+				// the exact text" error (or a bogus re-apply diff). NEVER take the file
+				// path for an already-applied tool. Diff the args (oldText -> newText)
+				// directly instead — that IS the change that was applied. Synchronous,
+				// no file IO. On a real edit failure (context.isError) draw NO preview
+				// diff; renderResult/formatEditResult shows the error text instead.
+				if (!context.isError && previewInput && !component.preview && !component.previewPending) {
+					setEditPreview(component, computeArgsDiff(previewInput.edits), argsKey);
+				}
+			} else if (context.argsComplete && previewInput && !component.preview && !component.previewPending) {
 				component.previewPending = true;
 				const requestKey = argsKey;
 				void computeEditsDiff(previewInput.path, previewInput.edits, context.cwd).then((preview) => {

@@ -249,6 +249,13 @@ export interface ToolCall {
 	name: string;
 	arguments: Record<string, any>;
 	thoughtSignature?: string; // Google-specific: opaque signature for reusing thought context
+	// Pre-resolved result (regime-B / anthropic-agent-sdk ONLY): when the JLC sidecar
+	// has already executed a native tool upstream, it ships the result inline on the
+	// tool_call delta so pi renders the tool widget WITHOUT re-executing. The agent
+	// loop short-circuits execution and terminates the turn on this. Absent on every
+	// other provider/regime (OpenAI/regime-A streams never carry it).
+	presolvedResult?: string;
+	presolvedIsError?: boolean;
 }
 
 export interface Usage {

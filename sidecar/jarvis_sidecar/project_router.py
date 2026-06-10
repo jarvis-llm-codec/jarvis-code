@@ -5,12 +5,13 @@ import os
 from datetime import UTC, datetime
 from typing import Any
 
+from .file_locks import locked_atomic_write_text
 from .workspace import (
+    InvalidProjectNameError,
     RegistryCorruptError,
     WorkspaceProject,
     WorkspaceRegistry,
     parse_project_switch_command,
-    resolve_code_path,
     workspace_root,
 )
 
@@ -84,7 +85,7 @@ class ProjectRouter:
             payload["project_id"] = project_id
         if self._active_updated_at is not None:
             payload["updated_at"] = self._active_updated_at.isoformat()
-        self._active_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        locked_atomic_write_text(self._active_path, json.dumps(payload, ensure_ascii=False, indent=2))
 
     def _remember_active(self, project: WorkspaceProject) -> None:
         self._active_updated_at = datetime.now(UTC)
@@ -327,7 +328,11 @@ class ProjectRouter:
             warnings.append(f"unknown project: {slug_or_name}. Use auto_create=True to register.")
             return None, warnings
 
-        project = self.registry.create_or_get(slug_or_name, code_path=code_path)
+        try:
+            project = self.registry.create_or_get(slug_or_name, code_path=code_path)
+        except InvalidProjectNameError as exc:
+            warnings.append(str(exc))
+            return None, warnings
         self._remember_active(project)
         self._last_resolved_from = "explicit_switch"
         return project, warnings

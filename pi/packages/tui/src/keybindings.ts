@@ -27,6 +27,8 @@ export interface Keybindings {
 	"tui.editor.yank": true;
 	"tui.editor.yankPop": true;
 	"tui.editor.undo": true;
+	// Conversation history
+	"tui.history.scroll": true;
 	// Generic input actions
 	"tui.input.newLine": true;
 	"tui.input.submit": true;
@@ -115,6 +117,13 @@ export const TUI_KEYBINDINGS = {
 	"tui.editor.yank": { defaultKeys: "ctrl+y", description: "Yank" },
 	"tui.editor.yankPop": { defaultKeys: "alt+y", description: "Yank pop" },
 	"tui.editor.undo": { defaultKeys: "ctrl+-", description: "Undo" },
+	"tui.history.scroll": {
+		// shift+pageUp is intercepted natively by many terminals (Windows
+		// Terminal scrollUpPage, xterm/gnome scrollback) - ctrl+pageUp is the
+		// fallback that reaches the app there.
+		defaultKeys: ["shift+pageUp", "ctrl+pageUp"],
+		description: "Open conversation scrollback",
+	},
 	"tui.input.newLine": { defaultKeys: "shift+enter", description: "Insert newline" },
 	"tui.input.submit": { defaultKeys: "enter", description: "Submit input" },
 	"tui.input.tab": { defaultKeys: "tab", description: "Tab / autocomplete" },

@@ -26,6 +26,7 @@ packages/*/dist-firefox/
 coverage/
 # jarvis-image extension output (when run from this dir during dev)
 jlc-images/
+generated/
 .nyc_output/
 .pi_config/
 tui-debug.log

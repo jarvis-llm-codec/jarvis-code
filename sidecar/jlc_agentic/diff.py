@@ -13,10 +13,13 @@ class DiffDriftError(ValueError):
 
 
 _PRIORITY_SUFFIX_RE = re.compile(r"\s*\[P\d\]\s*$")
+_PRIORITY_SUFFIX_CAPTURE_RE = re.compile(r"\s*\[(P[0-3])\]\s*$")
 _KEEP_RE = re.compile(r'^KEEP "([^"]+)"\s*$')
-_APPEND_RE = re.compile(r'^APPEND "([^"]+)"\s+\[(P[0-3])\]\s*$')
+_APPEND_RE = re.compile(r'^APPEND "([^"]+)"(?:\s+\[(P[0-3])\])?\s*$')
 _UPDATE_BY_TURN_RE = re.compile(r'^UPDATE_BY_TURN "([^"]+)"\s+t(\d+)\s*$')
 _SECTION_HEADING_RE = re.compile(r"^## .*$", re.MULTILINE)
+_JHB_START = "<<<JHB>>>"
+_JHB_END = "<<<END_JHB>>>"
 
 
 def section_title(heading_line: str) -> str:
@@ -67,8 +70,14 @@ def parse_diff_dsl(diff_output: str) -> tuple[list[tuple[str, object]], list[str
             match = _APPEND_RE.fullmatch(line)
             if not match:
                 raise DiffParseError(f"Malformed APPEND marker: {line!r}")
-            title = section_title(match.group(1))
+            raw_title = match.group(1)
             priority = match.group(2)
+            if priority is None:
+                priority_match = _PRIORITY_SUFFIX_CAPTURE_RE.search(raw_title)
+                if priority_match is None:
+                    raise DiffParseError(f"Malformed APPEND marker: {line!r}")
+                priority = priority_match.group(1)
+            title = section_title(raw_title)
             if not title:
                 raise DiffParseError(f"APPEND marker has empty title: {line!r}")
             body_lines, index = _collect_command_body(lines, index + 1)
@@ -230,6 +239,71 @@ def _clean_body(lines: list[str]) -> str:
 
 def _is_bullet_line(line: str) -> bool:
     return bool(re.match(r"^\s*-\s+", line))
+
+
+def strip_jhb_wrappers(text: str) -> str:
+    """Remove accidental code fences and JHB delimiters from an encoder block."""
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized = _strip_outer_code_fence(normalized)
+    start = normalized.find(_JHB_START)
+    end = normalized.rfind(_JHB_END)
+    if start != -1 and end != -1 and end > start:
+        normalized = normalized[start + len(_JHB_START) : end].strip()
+        normalized = _strip_outer_code_fence(normalized)
+    return normalized.strip()
+
+
+def normalize_stored_jhb(text: str) -> str:
+    """Convert accidentally persisted encoder DSL/wrappers into canonical JHB markdown.
+
+    Normal on-disk JHB is markdown sections (`## Title [Pn]` plus bullets).
+    This helper only rewrites obvious corrupted/raw forms: fenced files, JHB
+    delimiter blocks, or files whose first meaningful line is diff DSL.
+    """
+
+    if not text.strip():
+        return ""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    body = strip_jhb_wrappers(normalized)
+    first_line = _first_meaningful_line(body)
+    needs_normalization = (
+        _JHB_START in normalized
+        or _JHB_END in normalized
+        or _is_outer_code_fence(normalized.strip())
+        or first_line == "PASSTHROUGH"
+        or first_line.startswith("APPEND")
+        or first_line.startswith("KEEP")
+        or first_line.startswith("UPDATE_BY_TURN")
+    )
+    if not needs_normalization:
+        return text
+    try:
+        return apply_diff("", body)
+    except (DiffDriftError, DiffParseError):
+        if _parse_jhb_sections(body):
+            return body.rstrip(" \t\n") + "\n"
+        return text
+
+
+def _first_meaningful_line(text: str) -> str:
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _is_outer_code_fence(text: str) -> bool:
+    lines = text.strip().split("\n")
+    return len(lines) >= 2 and lines[0].strip().startswith("```") and lines[-1].strip().startswith("```")
+
+
+def _strip_outer_code_fence(text: str) -> str:
+    if not _is_outer_code_fence(text):
+        return text
+    lines = text.strip().split("\n")
+    return "\n".join(lines[1:-1]).strip()
 
 
 def compute_jhb_sha(jhb: str) -> str:

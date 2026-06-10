@@ -18,6 +18,37 @@ function isThinkingPlaceholder(line: string): boolean {
 	return /^\[?thinking(?:\.\.\.)?\]?$/i.test(line) || /^thinking\s+(off|minimal|low|medium|high|xhigh)$/i.test(line);
 }
 
+const AGENT_SDK_TOOL_ACTIVITY_LINE_RE =
+	/^\[(?:read|write|edit|shell|web search|web fetch|glob|grep|list|todo|agent task|ask user|job send|job close|done|failed(?::[^\]]+)?|agent tool:[^\]]+)(?:\]|:)/i;
+
+// Tool labels whose following lines are a result body we keep in the collapsed
+// view (sidecar Path A: the body rides reasoning_content). A '[done...]' /
+// '[failed...]' label is followed by the bounded tool/file body; everything up to
+// the next activity label is that body.
+const AGENT_SDK_TOOL_BODY_OPENER_RE = /^\[(?:done|failed)\b/i;
+
+function visibleAgentSdkToolActivityLines(thinking: string): string[] {
+	const out: string[] = [];
+	let inBody = false;
+	for (const raw of thinking.split(/\r?\n/)) {
+		const trimmed = raw.trim();
+		if (AGENT_SDK_TOOL_ACTIVITY_LINE_RE.test(trimmed)) {
+			out.push(trimmed);
+			// A result-bearing label opens a body section; the next label closes it.
+			inBody = AGENT_SDK_TOOL_BODY_OPENER_RE.test(trimmed);
+			continue;
+		}
+		// Keep the tool/file body lines too (not just the label), so e.g. a file
+		// read streams its content in the collapsed view. Preserve leading indent
+		// (source code), trim only trailing whitespace. The sidecar already bounds
+		// the body (size + line count), so this cannot flood unbounded.
+		if (inBody) {
+			out.push(raw.replace(/\s+$/, ""));
+		}
+	}
+	return out;
+}
+
 /**
  * Component that renders a complete assistant message
  */
@@ -138,10 +169,17 @@ export class AssistantMessageComponent extends Container {
 					.some((c) => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()));
 
 				if (this.hideThinkingBlock || (this.finalized && !this.showFinalizedThinking)) {
-					// Show static thinking label when hidden
-					this.contentContainer.addChild(
-						new Text(theme.italic(theme.fg("thinkingText", getFoldedThinkingLabel(content.thinking))), 1, 0),
-					);
+					const activityLines = visibleAgentSdkToolActivityLines(content.thinking);
+					if (activityLines.length > 0) {
+						for (const line of activityLines) {
+							this.contentContainer.addChild(new Text(theme.italic(theme.fg("thinkingText", line)), 1, 0));
+						}
+					} else {
+						// Show static thinking label when hidden
+						this.contentContainer.addChild(
+							new Text(theme.italic(theme.fg("thinkingText", getFoldedThinkingLabel(content.thinking))), 1, 0),
+						);
+					}
 					if (hasVisibleContentAfter) {
 						this.contentContainer.addChild(new Spacer(1));
 					}

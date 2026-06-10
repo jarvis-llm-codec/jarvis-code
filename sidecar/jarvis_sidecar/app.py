@@ -3,26 +3,33 @@ from __future__ import annotations
 import html as html_lib
 import json
 import os
+import queue
 import re
 import sys
 import threading
 import traceback
+import urllib.parse
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+import yaml
 
 from jlc_agentic.agentic.tools.web_search import handler as brave_web_search
 from jlc_agentic.providers import get_llm
 from jlc_agentic.providers import load_config as load_runtime_config
 from jlc_agentic.providers import clear_cache
+from jlc_agentic.providers import _apply_chat_model_override
+from jlc_agentic.providers import turn_context
 from jlc_agentic.slim import JarvisAgentic
+from jlc_agentic.user_agent import JARVIS_CODE_VERSION
 
 from .config import (
     credentials_path,
@@ -34,14 +41,41 @@ from .config import (
     internal_memory_root,
     load_credentials_into_env,
     providers_path,
+    remove_credential_env,
     save_credential_env,
     setup_default_project_root,
 )
+from .directives import (
+    GANDirectiveError,
+    JobDirectiveError,
+    append_directive,
+    get_gan_history,
+    get_job_history,
+    get_pending as get_pending_directives,
+    list_windows as list_directive_windows,
+)
+from .control_bridge import answer_request as answer_control_bridge_request
+from .control_bridge import pending_requests as pending_control_bridge_requests
 from .evidence import EvidenceError, retrieve_evidence, run_evidence_gc, store_evidence
-from .llm_setting import apply_picks as llm_apply_picks
+from .llm_setting import apply_partial_picks as llm_apply_partial_picks
+from .llm_setting import clear_model_catalog_cache as llm_clear_model_catalog_cache
+from .llm_setting import custom_provider_auth_env as llm_custom_provider_auth_env
+from .llm_setting import custom_provider_id_from_label as llm_custom_provider_id_from_label
 from .llm_setting import current_roles as llm_current_roles
-from .llm_setting import fetch_all as llm_fetch_all
+from .llm_setting import fetch_all_detailed as llm_fetch_all_detailed
+from .llm_setting import fetch_model_catalog as llm_fetch_model_catalog
+from .llm_setting import find_provider_duplicate as llm_find_provider_duplicate
 from .llm_setting import load_catalog as llm_load_catalog
+from .llm_setting import load_repo_providers as llm_load_repo_providers
+from .llm_setting import provider_roles as llm_provider_roles
+from .llm_setting import provider_source as llm_provider_source
+from .llm_setting import provider_supports_model_setting as llm_provider_supports_model_setting
+from .llm_setting import validate_model_pick as llm_validate_model_pick
+from .llm_setting import remove_user_provider as llm_remove_user_provider
+from .llm_setting import split_model_spec as llm_split_model_spec
+from .llm_setting import upsert_user_provider as llm_upsert_user_provider
+from .llm_setting import validate_launchable_model_spec as llm_validate_launchable_model_spec
+from .tool_lessons import observe as observe_tool_lesson
 from .memory_files import (
     clear_interrupt_checkpoint,
     ensure_workspace_memory,
@@ -50,21 +84,35 @@ from .memory_files import (
     update_jarvis_md as update_project_jarvis_md,
     write_interrupt_checkpoint,
 )
+from . import pairing
 from .project_router import ProjectRouter
 from .raw_store import (
     append_encoder_turn,
     append_raw_turn,
     extract_local_dates,
     extract_turn_numbers,
+    normalize_origin_window,
+    normalize_turn_origin,
     recall_raw,
-    recent_failure_modes,
+    recent_failure_modes,  # noqa: F401 - re-exported for tests/diagnostics
     recent_turns,
 )
+from .spawn import DEFAULT_SPAWN_TIMEOUT_SECONDS as SPAWN_DEFAULT_TIMEOUT_SECONDS
+from .spawn import next_worker_label as spawn_next_worker_label
+from .spawn import spawn_window as spawn_jarvis_window
+from .wrapper_watch import start_wrapper_watch
 from .provider_router_holder import set_provider_router as set_sidecar_provider_router
 from .web_tools import docs_search as docs_search_tool
 from .web_tools import package_info as package_info_tool
 from .web_tools import web_fetch as web_fetch_tool
-from .workspace import RegistryCorruptError, parse_setup_default_root_command
+from .window_labels import (
+    normalize_pair8,
+    resolve_live_label,
+    runtime_label_for_pair8,
+    sanitize_window_label,
+    set_runtime_label,
+)
+from .workspace import InvalidProjectNameError, RegistryCorruptError, parse_setup_default_root_command
 
 _SESSION_ID = "jarvis_session"
 
@@ -79,6 +127,122 @@ _encoder_stream_print_kind: str | None = None
 _project_memory_load_log_keys: set[str] = set()
 _ANSI_PURPLE = "\x1b[95m"
 _ANSI_RESET = "\x1b[0m"
+
+
+def _openai_proxy_request_id() -> str:
+    return f"chatcmpl-jarvis-{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}"
+
+
+def _openai_proxy_conv_id(request: Request) -> str:
+    """Per-window conversation id for the OpenAI-compatible chat proxy.
+
+    The Pi client (jarvis-jlc.ts) tags each window's proxy calls with the
+    ``X-Jarvis-Pair`` header (its JARVIS_PAIR_ID). Prefer it so the Agent SDK
+    adapter's turn_context.conv_id is window-scoped; fall back to the launcher's
+    pinned JLC_UI_CONV_ID, then the legacy ``"conversation"`` default (matching
+    the WS chat path) so existing storage paths still resolve.
+    """
+    pair = (request.headers.get("x-jarvis-pair") or "").strip()
+    if pair:
+        return pair
+    return (os.environ.get("JLC_UI_CONV_ID") or "").strip() or "conversation"
+
+
+def _openai_proxy_usage(llm: Any) -> dict[str, Any] | None:
+    meta = getattr(llm, "llm_meta", None)
+    if not isinstance(meta, dict):
+        return None
+    prompt_tokens = int(meta.get("tokens_in") or 0)
+    completion_tokens = int(meta.get("tokens_out") or 0)
+    cache_read = int(meta.get("cache_read") or meta.get("cache_read_tokens") or 0)
+    cache_write = int(meta.get("cache_write") or meta.get("cache_write_tokens") or 0)
+    total_tokens = int(
+        meta.get("total_tokens")
+        or meta.get("total")
+        or (prompt_tokens + completion_tokens + cache_read + cache_write)
+    )
+    if prompt_tokens <= 0 and completion_tokens <= 0 and cache_read <= 0 and cache_write <= 0 and total_tokens <= 0:
+        return None
+    usage: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens + cache_read + cache_write,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+    if cache_read or cache_write:
+        usage["prompt_tokens_details"] = {
+            "cached_tokens": cache_read + cache_write,
+            "cache_write_tokens": cache_write,
+        }
+    return usage
+
+
+def _openai_proxy_model_name(body: dict[str, Any], llm: Any) -> str:
+    meta = getattr(llm, "llm_meta", None)
+    if isinstance(meta, dict):
+        litellm_id = str(meta.get("litellm_id") or "").strip()
+        if litellm_id:
+            return litellm_id
+    model = str(body.get("model") or "").strip()
+    return model or "jarvis-sidecar-chat"
+
+
+def _openai_proxy_chunk(
+    chunk: dict[str, Any],
+    *,
+    request_id: str,
+    created: int,
+    model: str,
+    usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    data = dict(chunk)
+    data.setdefault("id", request_id)
+    data.setdefault("object", "chat.completion.chunk")
+    data.setdefault("created", created)
+    data.setdefault("model", model)
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        for idx, choice in enumerate(choices):
+            if isinstance(choice, dict):
+                choice.setdefault("index", idx)
+    if usage is not None:
+        data["usage"] = usage
+    return data
+
+
+def _openai_proxy_finish_reason(chunk: dict[str, Any]) -> str | None:
+    choices = chunk.get("choices")
+    if not isinstance(choices, list):
+        return None
+    for choice in choices:
+        if isinstance(choice, dict) and choice.get("finish_reason"):
+            return str(choice["finish_reason"])
+    return None
+
+
+def _openai_proxy_stream_kwargs(body: dict[str, Any]) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    for key in (
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "max_completion_tokens",
+        "reasoning_effort",
+        "jarvis_critic_phase",
+        "jarvis_second_eyes_phase",
+        "tool_choice",
+        "store",
+    ):
+        if key in body:
+            kwargs[key] = body[key]
+    if "max_completion_tokens" in kwargs and "max_tokens" not in kwargs:
+        kwargs["max_tokens"] = kwargs["max_completion_tokens"]
+    return kwargs
+
+
+def _openai_proxy_sse(data: dict[str, Any] | str) -> str:
+    if data == "[DONE]":
+        return "data: [DONE]\n\n"
+    return f"data: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
 def _print_project_memory_loaded(*, project_name: str | None, project_path: str, tokens: int) -> None:
@@ -155,6 +319,96 @@ def _guard_memory_write_path(project_path: str | None) -> str | None:
         return None
     project = _registered_memory_project(project_path)
     return project.path if project is not None else None
+
+
+def _memory_write_state_for_write() -> tuple[bool, bool]:
+    if pairing.memory_write_enabled():
+        return True, False
+    promoted = pairing.acquire_memory_write_lock()
+    return pairing.memory_write_enabled(), bool(promoted)
+
+
+def _memory_write_notice_payload(promoted: bool) -> dict[str, Any]:
+    if not promoted:
+        return {}
+    return {
+        "memory_write_reenabled": True,
+        "memory_write_notice": pairing.MEMORY_WRITE_ENABLED_MESSAGE,
+    }
+
+
+def _current_pair8() -> str | None:
+    pair8 = pairing.current_pair_id()[:8]
+    return pair8 or None
+
+
+# Sentinel pair8 used by control-bridge endpoints when no real pair_id is
+# resolvable.  Must match _CONTROL_FALLBACK_PAIR8 in
+# jlc_agentic/providers/anthropic_agent_sdk.py so that enqueue (sdk file)
+# and dequeue (/control/pending, /control/{id}/answer here) agree.
+# Must be 8 alphanumerics so control_bridge._coerce_pair8 (^[A-Za-z0-9]{8}$)
+# accepts it; the older "__self__" sentinel failed that regex and was dropped.
+_CONTROL_FALLBACK_PAIR8 = "selfself"
+
+
+def _current_window_label() -> str | None:
+    return runtime_label_for_pair8(_current_pair8())
+
+
+def _resolve_directive_window(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("to_window is required")
+    direct = normalize_pair8(raw)
+    windows = list_directive_windows()
+    # A known pair8 address always wins, even over another window's label —
+    # the address layer is the invariant. But an 8-char alphanumeric string
+    # that matches NO known window may be a label ("darkwing"); resolving it
+    # blindly as an address would fire the directive into a queue nobody
+    # consumes. Try label resolution first, then fall back to treating it as
+    # an address (a freshly spawned window's jhb dir may not be listed yet).
+    if direct:
+        direct_matches = [window for window in windows if str(window.get("pair8") or "") == direct]
+        if any(bool(window.get("alive")) for window in direct_matches):
+            return direct
+        if direct_matches:
+            raise ValueError(f"window is not live: {raw!r}")
+    resolved = resolve_live_label(raw, windows)
+    if resolved:
+        return resolved
+    if direct:
+        return direct
+    raise ValueError(f"unknown window: {raw!r}")
+
+
+def _origin_window_label(origin_window: str | None) -> str | None:
+    return runtime_label_for_pair8(origin_window)
+
+
+def _request_origin_window(requested: str | None, *, origin: str = "user") -> str | None:
+    pair8 = _current_pair8()
+    normalized_origin = normalize_turn_origin(origin)
+    if normalized_origin == "monologue_directive":
+        return normalize_origin_window(requested) or pair8
+    if pair8:
+        return pair8
+    return normalize_origin_window(requested)
+
+
+def _origin_recall_label(record: dict[str, Any], *, current_origin_window: str | None = None) -> str:
+    origin = normalize_turn_origin(record.get("origin"))
+    window = normalize_origin_window(record.get("origin_window"))
+    stamped_label = sanitize_window_label(record.get("origin_window_label"))
+    if origin.startswith("monologue_"):
+        if stamped_label:
+            return f"[독백·{stamped_label}] "
+        return f"[독백·창{window}] " if window else "[독백] "
+    current = normalize_origin_window(current_origin_window)
+    if origin == "user" and current and window and window != current:
+        if stamped_label:
+            return f"[창 {stamped_label}] "
+        return f"[창 {window}] "
+    return ""
 
 
 def _path_key(value: str | None) -> str | None:
@@ -318,12 +572,70 @@ class TurnRequest(BaseModel):
     tool_events: list[dict[str, Any]] = Field(default_factory=list)
     llm_meta: dict[str, Any] = Field(default_factory=dict)
     bench_conv_id: str | None = None
+    origin: str = "user"
+    origin_window: str | None = None
 
 
 class RecallRequest(BaseModel):
     queries: list[str] = Field(default_factory=list)
     top_k: int = 5
     bench_conv_id: str | None = None
+
+
+class DelegateSubagentRequest(BaseModel):
+    name: str
+    task: str
+    read_only: bool | None = None
+    system_prompt: str | None = None
+    sub_id: str | None = None
+    project_root: str | None = None
+    bench_conv_id: str | None = None
+
+
+class OrchestrateRequest(BaseModel):
+    task: str
+    dimensions: list[str]
+    max_concurrency: int | None = None
+    max_calls: int | None = None
+    max_tokens: int | None = None
+    max_wallclock_sec: float | None = None
+    project_root: str | None = None
+    orchestration_id: str | None = None
+
+
+class DirectiveRequest(BaseModel):
+    to_window: str | None = None
+    body: str | None = None
+    message: str | None = None
+    kind: Literal["directive", "report"] = "directive"
+    from_window: str | None = None
+    gan_target: str | None = None
+    issues_open: int | None = None
+    gan_status: Literal["agreed", "escalated"] | None = None
+    job_target: str | None = None
+    job_status: Literal["done", "escalated"] | None = None
+
+
+class ControlBridgeAnswerRequest(BaseModel):
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+class SpawnWindowRequest(BaseModel):
+    timeout_seconds: float = SPAWN_DEFAULT_TIMEOUT_SECONDS
+    model: str | None = None
+    label: str | None = None
+
+
+class ToolLessonObserveRequest(BaseModel):
+    tool: str = "bash"
+    command: str
+    is_error: bool = False
+    output_head: str | None = None
+    turn_id: str | None = None
+
+
+class WindowLabelRequest(BaseModel):
+    label: str
 
 
 class RegisterProjectRequest(BaseModel):
@@ -477,14 +789,29 @@ class TranslateInputRequest(BaseModel):
 
 
 class LLMSettingApplyRequest(BaseModel):
-    chat: str  # "provider/model"
-    encoder: str  # "provider/model"
+    chat: str | None = None  # "provider/model"
+    subagent: str | None = None  # "provider/model"
+    router: str | None = None  # "provider/model"
+    encoder: str | None = None  # "provider/model"
+    force: bool = False  # skip catalog/key validation (escape hatch)
 
 
 class CredentialSetRequest(BaseModel):
     env_name: str
     value: str
     do_validate: bool = Field(default=True, alias="validate")
+
+
+class CredentialCustomProviderRequest(BaseModel):
+    label: str
+    base_url: str
+    api_key: str = ""
+    do_validate: bool = Field(default=True, alias="validate")
+
+
+class CredentialCustomProviderRemoveRequest(BaseModel):
+    provider_id: str
+    remove_key: bool = True
 
 
 router = ProjectRouter()
@@ -524,14 +851,34 @@ def _init_provider_router() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     try:
+        pairing.acquire_memory_write_lock()
+        start_wrapper_watch()
         _init_provider_router()
         run_evidence_gc()
         yield
     finally:
         await close_agent()
+        pairing.release_memory_write_lock()
 
 
-app = FastAPI(title="JARVIS Code JLC Sidecar", version="1.01.0", lifespan=lifespan)
+app = FastAPI(title="JARVIS Code JLC Sidecar", version=JARVIS_CODE_VERSION, lifespan=lifespan)
+
+
+@app.middleware("http")
+async def enforce_pair_id(request: Request, call_next):
+    if not pairing.pair_enforced():
+        return await call_next(request)
+    path = request.url.path
+    if path == "/health":
+        return await call_next(request)
+    if request.method.upper() == "GET" and path.startswith("/debug/"):
+        return await call_next(request)
+    if not pairing.pair_matches(request.headers.get("x-jarvis-pair")):
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "error": pairing.PAIR_MISMATCH_MESSAGE},
+        )
+    return await call_next(request)
 
 
 _SUBTURN_DEBUG_HTML = """<!doctype html>
@@ -1464,23 +1811,40 @@ def _note_session_mode(session_id: str) -> None:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "service": "jarvis-jlc-sidecar", "agent_loaded": _agent is not None}
+    return {
+        "ok": True,
+        "service": "jarvis-jlc-sidecar",
+        "agent_loaded": _agent is not None,
+        "pair_id": pairing.current_pair_id() or None,
+        "window_label": _current_window_label(),
+        "memory_write_enabled": pairing.memory_write_enabled(),
+    }
 
 
 @app.get("/status")
 def status() -> dict[str, Any]:
     ensure_sidecar_config()
     config = load_runtime_config()
+    # Reflect a spawned worker's per-process chat override (JARVIS_CHAT_MODEL_OVERRIDE)
+    # so the footer's chat line shows the real chat model the sidecar drives, not the
+    # encoder provider Pi runs. No-op for the main window (no override env).
+    config = _apply_chat_model_override(config)
     default_project_root = get_effective_project_root()
     protected_roots = get_protected_roots()
     roles = {
         role: _summarize_role(role, (config.get("roles") or {}).get(role))
-        for role in ("chat", "subagent", "encoder")
+        for role in ("chat", "subagent", "router", "encoder")
     }
     return {
         "ok": True,
         "service": "jarvis-jlc-sidecar",
         "agent_loaded": _agent is not None,
+        "pair_id": pairing.current_pair_id() or None,
+        "window_label": _current_window_label(),
+        "memory_write_enabled": pairing.memory_write_enabled(),
+        "memory_write_disabled_reason": None
+        if pairing.memory_write_enabled()
+        else pairing.MEMORY_WRITE_DISABLED_MESSAGE,
         "roles": roles,
         "mode": "bench" if _last_bench_conv_id else "default",
         "bench_conv_id": _last_bench_conv_id,
@@ -1504,6 +1868,7 @@ def status() -> dict[str, Any]:
 def context(req: ContextRequest) -> dict[str, Any]:
     session_id = _effective_session_id(req.bench_conv_id)
     _note_session_mode(session_id)
+    current_origin_window = _current_pair8()
     print(
         f"[jarvis-sidecar] /context session={session_id} mode={req.mode} "
         f"user_len={len(req.user_message or '')}",
@@ -1530,7 +1895,14 @@ def context(req: ContextRequest) -> dict[str, Any]:
         else:
             memory_project_path = guarded_path
 
-    file_states = ensure_workspace_memory(memory_project_path)
+    memory_write_enabled, memory_write_promoted = _memory_write_state_for_write()
+    if memory_write_enabled:
+        file_states = ensure_workspace_memory(memory_project_path)
+        if memory_write_promoted:
+            warnings.append(pairing.MEMORY_WRITE_ENABLED_MESSAGE)
+    else:
+        file_states = {"memory_write": "disabled"}
+        warnings.append(pairing.MEMORY_WRITE_DISABLED_MESSAGE)
     project_memory, project_warnings = read_project_memory(memory_project_path, max_chars=60000 if selected else 12000)
     warnings.extend(project_warnings)
     if (
@@ -1593,7 +1965,10 @@ def context(req: ContextRequest) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"JLC auto recall degraded: {exc}")
             recall_block = ""
-        raw_recall_block = _format_raw_hits(recall_raw(req.user_message, top_k=_recall_top_k, session_id=session_id))
+        raw_recall_block = _format_raw_hits(
+            recall_raw(req.user_message, top_k=_recall_top_k, session_id=session_id),
+            current_origin_window=current_origin_window,
+        )
         if raw_recall_block:
             recall_block = (
                 f"{raw_recall_block}\n\n{recall_block}"
@@ -1609,7 +1984,10 @@ def context(req: ContextRequest) -> dict[str, Any]:
         _recent_limit = max(0, int(os.environ.get("JARVIS_RECENT_TURNS", "1")))
     except ValueError:
         _recent_limit = 1
-    recent_raw_block = _format_recent_turns(recent_turns(limit=_recent_limit, session_id=session_id))
+    recent_raw_block = _format_recent_turns(
+        recent_turns(limit=_recent_limit, session_id=session_id, origin_window=current_origin_window),
+        current_origin_window=current_origin_window,
+    )
     workspace_block = _build_workspace_block(selected)
 
     context_block = _build_context_block(
@@ -1622,6 +2000,7 @@ def context(req: ContextRequest) -> dict[str, Any]:
         trace=trace,
         warnings=warnings,
         memory_mode=memory_mode,
+        mode=req.mode,
     )
     return {
         "context": context_block,
@@ -1688,7 +2067,7 @@ def list_projects() -> dict[str, Any]:
 
 @app.post("/route_turn")
 async def route_turn(req: RouteTurnRequest) -> dict[str, Any]:
-    """Use the configured chat model as the first-pass JARVIS route judge."""
+    """Use the configured chat role as the first-pass JARVIS route judge."""
     user_message = (req.user_message or "").strip()
     if not user_message:
         return _route_turn_fallback("chat", "empty user message")
@@ -1696,22 +2075,74 @@ async def route_turn(req: RouteTurnRequest) -> dict[str, Any]:
     system = _route_turn_system_prompt()
     user = _route_turn_user_prompt(req, projects)
     try:
-        llm = get_llm("chat")
+        # Route classification runs on the lightweight `router` role before the main
+        # provider call. The router role mirrors the encoder model (the user's fast
+        # model), so routing always rides whatever fast model they run — never `chat`
+        # (gpt-5.5), whose ~6s TTFT floor would tax every turn (chat + build), and
+        # never a model pinned by name they may lack credentials for. The classifier
+        # emits a tiny JSON object, so a fast model is quality-equivalent here.
+        # (2026-06-24: route-specific fast model.)
+        import time as _time
+
+        llm = get_llm("router")
+        _route_t0 = _time.monotonic()
         raw = await llm.chat(
             system=system,
             user=user,
             max_tokens=900,
             reasoning_effort="none",
         )
+        # Token counts prove the routing call is cheap and reasoning stays off:
+        # think>0 would mean reasoning leaked despite "none". in/out/cache also show
+        # whether latency variance tracks payload size or codex backend jitter.
+        _route_meta = getattr(llm, "llm_meta", None) or {}
+        _route_think = int(_route_meta.get("reasoning_tokens") or 0)
+        _route_in = int(_route_meta.get("tokens_in") or 0)
+        _route_out = int(_route_meta.get("tokens_out") or 0)
+        _route_cr = int(_route_meta.get("cache_read_tokens") or 0)
+        _route_cw = int(_route_meta.get("cache_write_tokens") or 0)
+        # retries>0 on a slow call means latency came from a provider fallback/retry
+        # (e.g. a codex 503/empty-stream re-attempt), not pure backend TTFT jitter.
+        _route_retries = int(_route_meta.get("fallback_attempts") or 0)
+        print(
+            f"[jarvis-sidecar] /route_turn llm={_time.monotonic() - _route_t0:.1f}s "
+            f"(role=router reasoning=none think={_route_think} "
+            f"in={_route_in} out={_route_out} cache={_route_cr}/{_route_cw} "
+            f"retries={_route_retries})",
+            file=sys.stderr,
+            flush=True,
+        )
         parsed = _extract_json_object(raw)
+        if not parsed:
+            return {
+                **_route_turn_fallback("chat", "chat route LLM returned invalid JSON"),
+                "ok": False,
+                "error": "invalid route JSON",
+                "router_role_used": "router",
+                "raw_text": raw[:2000],
+            }
         decision = _normalize_route_decision(parsed, raw=raw)
         decision["ok"] = True
+        decision["router_role_used"] = "router"
+        # Surface the structured decision so we can see whether the classifier set the
+        # language-agnostic create/register flags even when it picks an odd route
+        # (e.g. a new-project build that landed on chat_control). These flags, not the
+        # user's words, are the only language-neutral signal a deterministic backstop
+        # may trust. (2026-06-24 debug)
+        print(
+            f"[jarvis-sidecar] /route_turn decision route={decision.get('route')} "
+            f"create={decision.get('create_project')} register={decision.get('register_project')} "
+            f"expected={decision.get('expected_action')} conf={decision.get('confidence')}",
+            file=sys.stderr,
+            flush=True,
+        )
         return decision
     except Exception as exc:  # noqa: BLE001
         return {
-            **_route_turn_fallback("chat", f"chat LLM router unavailable: {exc}"),
+            **_route_turn_fallback("chat", f"chat route LLM unavailable: {exc}"),
             "ok": False,
             "error": str(exc),
+            "router_role_used": "router",
         }
 
 
@@ -1726,7 +2157,20 @@ def turn(req: TurnRequest) -> dict[str, Any]:
         flush=True,
     )
     project_path = _guard_memory_write_path(req.project_path)
+    memory_write_enabled, memory_write_promoted = _memory_write_state_for_write()
+    if not memory_write_enabled:
+        return {
+            "ok": True,
+            "memory_mode": "light",
+            "scheduled_encode": False,
+            "raw_saved": False,
+            "memory_write_disabled": True,
+            "warning": pairing.MEMORY_WRITE_DISABLED_MESSAGE,
+        }
     ensure_workspace_memory(project_path)
+    origin = normalize_turn_origin(req.origin)
+    origin_window = _request_origin_window(req.origin_window, origin=origin)
+    origin_window_label = _origin_window_label(origin_window)
     raw_path = append_raw_turn(
         project_path=project_path,
         user_message=req.user_message,
@@ -1734,6 +2178,9 @@ def turn(req: TurnRequest) -> dict[str, Any]:
         tool_events=req.tool_events,
         llm_meta=req.llm_meta,
         session_id=session_id,
+        origin=origin,
+        origin_window=origin_window,
+        origin_window_label=origin_window_label,
     )
     light_result = {"updated": [], "mode": "light"}
     try:
@@ -1741,11 +2188,9 @@ def turn(req: TurnRequest) -> dict[str, Any]:
         if agent is None:
             detail = f": {_agent_last_error}" if _agent_last_error else ""
             raise RuntimeError(f"JLC agent unavailable{detail}")
-        prev_jhb = agent.render_jhb(session_id=session_id)
 
         # Inject chat token counts into encoder before encode
         encoder = getattr(agent, "encoder", None)
-        slim = getattr(agent, "slim", None)
         usage = (req.llm_meta or {}).get("usage", {})
         if encoder is not None and usage:
             reasoning_tokens = usage.get("reasoningTokens") or usage.get("reasoning_tokens") or usage.get("thought") or 0
@@ -1843,6 +2288,9 @@ def turn(req: TurnRequest) -> dict[str, Any]:
             llm_meta={**req.llm_meta, "tool_events": req.tool_events},
             on_done=_on_encode_done,
             session_id=session_id,
+            origin=origin,
+            origin_window=origin_window,
+            origin_window_label=origin_window_label,
         )
         print(
             f"[jarvis-sidecar] /turn scheduled encoder session={session_id}",
@@ -1859,6 +2307,7 @@ def turn(req: TurnRequest) -> dict[str, Any]:
             "raw_saved": True,
             "raw_path": str(raw_path),
             "light_memory": light_result,
+            **_memory_write_notice_payload(memory_write_promoted),
             
             "warning": str(exc),
         }
@@ -1870,6 +2319,7 @@ def turn(req: TurnRequest) -> dict[str, Any]:
         "raw_saved": True,
         "raw_path": str(raw_path),
         "light_memory": light_result,
+        **_memory_write_notice_payload(memory_write_promoted),
         
     }
 
@@ -1918,6 +2368,7 @@ def encoding_status(conv_id: str, clear: bool = False, min_turn: int | None = No
 def recall(req: RecallRequest) -> dict[str, Any]:
     session_id = _effective_session_id(req.bench_conv_id)
     _note_session_mode(session_id)
+    current_origin_window = _current_pair8()
     results = []
     warnings = []
     for query in req.queries:
@@ -1925,7 +2376,7 @@ def recall(req: RecallRequest) -> dict[str, Any]:
             raw_hits = recall_raw(query, top_k=req.top_k, session_id=session_id)
             results.append({
                 "query": query,
-                "text": _format_raw_hits(raw_hits),
+                "text": _format_raw_hits(raw_hits, current_origin_window=current_origin_window),
                 "fragments": _raw_hits_to_fragments(raw_hits),
                 "confidence": "HIGH" if raw_hits else "LOW",
                 "source": "raw_explicit",
@@ -1947,7 +2398,7 @@ def recall(req: RecallRequest) -> dict[str, Any]:
             confidence = recall_result.get("confidence", "LOW")
             if not text and not fragments:
                 raw_hits = recall_raw(query, top_k=req.top_k, session_id=session_id)
-                text = _format_raw_hits(raw_hits)
+                text = _format_raw_hits(raw_hits, current_origin_window=current_origin_window)
                 fragments = _raw_hits_to_fragments(raw_hits)
                 confidence = "LOW"
                 if raw_hits:
@@ -1968,7 +2419,7 @@ def recall(req: RecallRequest) -> dict[str, Any]:
             if raw_hits:
                 results.append({
                     "query": query,
-                    "text": _format_raw_hits(raw_hits),
+                    "text": _format_raw_hits(raw_hits, current_origin_window=current_origin_window),
                     "fragments": _raw_hits_to_fragments(raw_hits),
                     "confidence": "LOW",
                     "source": "raw_fallback",
@@ -1977,6 +2428,414 @@ def recall(req: RecallRequest) -> dict[str, Any]:
             else:
                 warnings.append(f"recall failed for query {query!r}: {exc}")
     return {"ok": bool(results) or not warnings, "results": results, "warnings": warnings}
+
+
+def _run_delegate_subagent_request(
+    req: DelegateSubagentRequest,
+    *,
+    on_token: Any | None = None,
+    on_raw: Any | None = None,
+) -> dict[str, Any]:
+    name = req.name.strip()
+    task = req.task.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if not task:
+        raise HTTPException(status_code=400, detail="task is required")
+
+    agent = get_agent()
+    if agent is None:
+        raise HTTPException(status_code=503, detail="JLC agent unavailable")
+
+    session_id = _effective_session_id(req.bench_conv_id)
+    _note_session_mode(session_id)
+    try:
+        from jlc_agentic.agentic import subagent as _subagent
+
+        handler = _subagent.make_handler(
+            llm_client=None,
+            on_token=on_token,
+            on_raw=on_raw,
+            conv_id=session_id,
+            storage_root=str(agent.jhb_root),
+            project_root=req.project_root,
+            retriever=agent.retriever,
+        )
+        return handler(
+            name=name,
+            task=task,
+            read_only=req.read_only,
+            system_prompt=req.system_prompt,
+            sub_id=req.sub_id,
+            project_root=req.project_root,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (KeyError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _orchestration_result_payload(result: Any) -> dict[str, Any]:
+    payload = asdict(result)
+    state = payload.get("state")
+    if hasattr(state, "value"):
+        payload["state"] = state.value
+    return payload
+
+
+def _run_orchestrate_request(
+    req: OrchestrateRequest,
+    *,
+    on_event: Any | None = None,
+) -> Any:
+    task = req.task.strip()
+    dimensions = [str(dimension).strip() for dimension in req.dimensions if str(dimension).strip()]
+    if not task:
+        raise HTTPException(status_code=400, detail="task is required")
+    if not dimensions:
+        raise HTTPException(status_code=400, detail="dimensions is required")
+
+    session_id = _effective_session_id(None)
+    _note_session_mode(session_id)
+    try:
+        from jlc_agentic.agentic import orchestrate as _orchestrate
+
+        budget = _orchestrate.OrchestrationBudget(
+            max_calls=req.max_calls,
+            max_tokens=req.max_tokens,
+            max_wallclock_sec=req.max_wallclock_sec,
+        )
+        spec = _orchestrate.OrchestrationSpec(
+            task=task,
+            dimensions=dimensions,
+            max_concurrency=req.max_concurrency or 3,
+            budget=budget,
+            project_root=req.project_root,
+            conv_id=session_id,
+        )
+        return _orchestrate.run_orchestration(
+            spec,
+            orchestration_id=req.orchestration_id,
+            on_event=on_event,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (KeyError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _subagent_delegate_stream(req: DelegateSubagentRequest) -> StreamingResponse:
+    events: queue.Queue[Any] = queue.Queue()
+    sentinel = object()
+
+    def emit(event: dict[str, Any]) -> None:
+        events.put(event)
+
+    def on_token(text: str, kind: str = "content") -> None:
+        token = str(text or "")
+        if not token:
+            return
+        token_kind = str(kind or "content")
+        event_name = "reasoning" if "reason" in token_kind.lower() else "content"
+        emit({"event": event_name, "kind": token_kind, "text": token})
+
+    def on_raw(line: str) -> None:
+        text = str(line or "")
+        if text:
+            emit({"event": "activity", "line": text})
+
+    def worker() -> None:
+        try:
+            result = _run_delegate_subagent_request(
+                req,
+                on_token=on_token,
+                on_raw=on_raw,
+            )
+            emit({"event": "result", "result": result})
+        except HTTPException as exc:
+            emit({"event": "error", "error": str(exc.detail), "status_code": exc.status_code})
+        except Exception as exc:  # noqa: BLE001
+            emit({"event": "error", "error": str(exc)})
+        finally:
+            events.put(sentinel)
+
+    def iter_events():
+        thread = threading.Thread(target=worker, name="subagent-delegate-stream", daemon=True)
+        thread.start()
+        saw_sentinel = False
+        try:
+            while True:
+                item = events.get()
+                if item is sentinel:
+                    saw_sentinel = True
+                    break
+                yield _openai_proxy_sse(item)
+            yield _openai_proxy_sse("[DONE]")
+        finally:
+            thread.join(timeout=1.0 if saw_sentinel else 0.1)
+
+    return StreamingResponse(
+        iter_events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _orchestrate_event_line(event: dict[str, Any]) -> str:
+    event_name = str(event.get("event") or "activity")
+    dimension = event.get("dimension")
+    if event_name == "orchestration_start":
+        total = len(event.get("dimensions") or [])
+        return f"orchestration start dimensions={total}"
+    if event_name == "finder_start":
+        return f"finder[{dimension}] start"
+    if event_name == "finder_done":
+        halt = event.get("halt_reason")
+        in_tokens = event.get("in_tokens")
+        out_tokens = event.get("out_tokens")
+        return f"finder[{dimension}] done halt={halt} in={in_tokens} out={out_tokens}"
+    if event_name == "finder_error":
+        return f"finder[{dimension}] error: {event.get('error')}"
+    if event_name == "verify_start":
+        return "verify start"
+    if event_name == "verify_done":
+        return f"verify done in={event.get('in_tokens')} out={event.get('out_tokens')}"
+    if event_name == "budget_exhausted":
+        return (
+            f"budget exhausted: {event.get('which')} "
+            f"ran={event.get('ran')}/{event.get('total')} in_flight={event.get('in_flight')}"
+        )
+    if event_name == "cancelled":
+        return "cancelled"
+    if event_name == "orchestration_done":
+        return (
+            f"orchestration done state={event.get('state')} "
+            f"finders={event.get('finders_ran')}/{event.get('finders_total')} "
+            f"stop_reason={event.get('stop_reason')}"
+        )
+    return event_name
+
+
+def _orchestrate_stream(req: OrchestrateRequest) -> StreamingResponse:
+    events: queue.Queue[Any] = queue.Queue()
+    sentinel = object()
+
+    def emit(event: dict[str, Any]) -> None:
+        events.put(event)
+
+    def on_engine_event(event: dict[str, Any]) -> None:
+        event_name = str(event.get("event") or "")
+        if event_name == "orchestration_done":
+            # The full SSE result is emitted from the returned OrchestrationResult below.
+            return
+        emit({
+            "event": "activity",
+            "kind": "activity",
+            "line": _orchestrate_event_line(event),
+            "source": event,
+        })
+
+    def worker() -> None:
+        try:
+            result = _run_orchestrate_request(req, on_event=on_engine_event)
+            emit({"event": "result", "kind": "result", "result": _orchestration_result_payload(result)})
+        except HTTPException as exc:
+            emit({"event": "error", "kind": "error", "error": str(exc.detail), "status_code": exc.status_code})
+        except Exception as exc:  # noqa: BLE001
+            emit({"event": "error", "kind": "error", "error": str(exc)})
+        finally:
+            events.put(sentinel)
+
+    def iter_events():
+        thread = threading.Thread(target=worker, name="orchestrate-stream", daemon=True)
+        thread.start()
+        saw_sentinel = False
+        try:
+            while True:
+                item = events.get()
+                if item is sentinel:
+                    saw_sentinel = True
+                    break
+                yield _openai_proxy_sse(item)
+            yield _openai_proxy_sse("[DONE]")
+        finally:
+            thread.join(timeout=1.0 if saw_sentinel else 0.1)
+
+    return StreamingResponse(
+        iter_events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/subagent/delegate")
+def delegate_subagent(req: DelegateSubagentRequest, request: Request) -> Any:
+    accept = request.headers.get("accept", "").lower()
+    if "text/event-stream" in accept:
+        return _subagent_delegate_stream(req)
+    return _run_delegate_subagent_request(req)
+
+
+@app.post("/orchestrate")
+def orchestrate(req: OrchestrateRequest, request: Request) -> Any:
+    accept = request.headers.get("accept", "").lower()
+    if "text/event-stream" in accept:
+        return _orchestrate_stream(req)
+    return _orchestration_result_payload(_run_orchestrate_request(req))
+
+
+@app.post("/directives")
+def post_directive(req: DirectiveRequest) -> dict[str, Any]:
+    from_window = _current_pair8() or "external"
+    body = req.body if req.body is not None else req.message
+    if not str(body or "").strip():
+        raise HTTPException(status_code=400, detail="directive body is required")
+    try:
+        to_window = _resolve_directive_window(req.to_window) if req.to_window else None
+        item = append_directive(
+            kind=req.kind,
+            from_window=from_window,
+            to_window=to_window,
+            body=str(body),
+            gan_target=req.gan_target,
+            issues_open=req.issues_open,
+            gan_status=req.gan_status,
+            job_target=req.job_target,
+            job_status=req.job_status,
+        )
+    except (GANDirectiveError, JobDirectiveError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "item": item, "windows": list_directive_windows()}
+
+
+@app.get("/directives/pending")
+def pending_directives(
+    kind: Literal["directive", "report"] | None = Query(default=None),
+    consume: bool = True,
+    limit: int = 50,
+    known_mtime_ns: int | None = None,
+    known_size: int | None = None,
+) -> dict[str, Any]:
+    pair8 = _current_pair8()
+    if not pair8:
+        raise HTTPException(status_code=400, detail="JARVIS_PAIR_ID is required")
+    try:
+        return get_pending_directives(
+            to_window=pair8,
+            kind=kind,
+            consume=consume,
+            limit=limit,
+            known_mtime_ns=known_mtime_ns,
+            known_size=known_size,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/directives/windows")
+def directive_windows() -> dict[str, Any]:
+    return {"ok": True, "windows": list_directive_windows()}
+
+
+@app.get("/control/pending")
+def control_bridge_pending(limit: int = 10) -> dict[str, Any]:
+    # Control-bridge: use sentinel so Pi can poll even without a real pair_id.
+    # _current_pair8() returns None when JARVIS_PAIR_ID is unset; fall back to
+    # _CONTROL_FALLBACK_PAIR8 so the bucket matches what the Agent-SDK enqueued.
+    pair8 = _current_pair8() or _CONTROL_FALLBACK_PAIR8
+    try:
+        requests = pending_control_bridge_requests(to_window=pair8, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "requests": requests}
+
+
+@app.post("/control/{request_id}/answer")
+def control_bridge_answer(request_id: str, req: ControlBridgeAnswerRequest) -> dict[str, Any]:
+    # Control-bridge: same sentinel logic as control_bridge_pending so that
+    # the bucket key used when Pi posts the answer matches the enqueued bucket.
+    pair8 = _current_pair8() or _CONTROL_FALLBACK_PAIR8
+    try:
+        return answer_control_bridge_request(request_id=request_id, to_window=pair8, result=req.result)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="control request not found") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/gan/{gan_id}")
+def gan_history(gan_id: str) -> dict[str, Any]:
+    try:
+        return get_gan_history(gan_id)
+    except GANDirectiveError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/job/{job_id}")
+def job_history(job_id: str) -> dict[str, Any]:
+    try:
+        return get_job_history(job_id)
+    except JobDirectiveError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/label")
+def set_window_label(req: WindowLabelRequest) -> dict[str, Any]:
+    pair8 = _current_pair8()
+    if not pair8:
+        raise HTTPException(status_code=400, detail="JARVIS_PAIR_ID is required")
+    try:
+        result = set_runtime_label(pair8, req.label)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **result}
+
+
+@app.post("/spawn")
+def spawn_window(req: SpawnWindowRequest) -> dict[str, Any]:
+    provider: str | None = None
+    model: str | None = None
+    routing_note: str | None = None
+    if req.model:
+        try:
+            provider, model, routing_note = llm_validate_launchable_model_spec(req.model)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        spawned = spawn_jarvis_window(
+            timeout_seconds=req.timeout_seconds,
+            provider=provider,
+            model=model,
+            label=sanitize_window_label(req.label) or spawn_next_worker_label(),
+        )
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"spawn failed: {exc}") from exc
+    result = {"ok": True, "window": spawned, "pair8": spawned["pair8"]}
+    if routing_note:
+        result["model_routing"] = routing_note
+    return result
+
+
+@app.post("/tool_lesson/observe")
+def tool_lesson_observe(req: ToolLessonObserveRequest) -> dict[str, Any]:
+    return observe_tool_lesson(
+        tool=req.tool,
+        command=req.command,
+        is_error=req.is_error,
+        output_head=req.output_head,
+        pair8=_current_pair8(),
+        turn_id=req.turn_id,
+    )
 
 
 @app.post("/web_search")
@@ -2012,22 +2871,32 @@ def credentials_catalog() -> dict[str, Any]:
     """Credential targets used by the Pi /api-key command."""
     load_credentials_into_env()
     catalog = llm_load_catalog()
+    repo_providers = llm_load_repo_providers()
     targets: dict[str, dict[str, Any]] = {}
     for pid, cfg in catalog.get("providers", {}).items():
         env_name = cfg.get("auth_env")
         if not isinstance(env_name, str) or not env_name.strip():
             continue
+        source = "bundled" if pid in repo_providers else "custom"
+        roles = sorted(llm_provider_roles(cfg))
+        kind = "llm" if llm_provider_supports_model_setting(cfg) else ("image" if "image" in roles else "provider")
         targets[pid] = {
             "label": cfg.get("label", pid),
             "env_name": env_name,
-            "kind": "llm",
+            "kind": kind,
             "configured": bool(os.environ.get(env_name, "").strip()),
+            "source": source,
+            "custom": source == "custom",
+            "base_url": cfg.get("base_url"),
+            "roles": roles,
         }
     targets["brave-search"] = {
         "label": "Brave Search",
         "env_name": "BRAVE_SEARCH_API_KEY",
         "kind": "web_search",
         "configured": bool(os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()),
+        "source": "bundled",
+        "custom": False,
     }
     return {"ok": True, "targets": targets, "credentials_path": str(credentials_path())}
 
@@ -2043,6 +2912,7 @@ def credentials_set(req: CredentialSetRequest) -> dict[str, Any]:
     except (OSError, ValueError) as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
+    llm_clear_model_catalog_cache()
     validation = _validate_credential_env(env_name) if req.do_validate else {"ok": True, "skipped": True}
     try:
         clear_cache()
@@ -2054,6 +2924,136 @@ def credentials_set(req: CredentialSetRequest) -> dict[str, Any]:
         "env_name": env_name,
         "credentials_path": str(path),
         "validation": validation,
+    }
+
+
+@app.post("/credentials/custom")
+def credentials_custom_provider(req: CredentialCustomProviderRequest) -> dict[str, Any]:
+    label = req.label.strip()
+    base_url = req.base_url.strip().rstrip("/")
+    api_key = req.api_key.strip()
+    if not label:
+        return {"ok": False, "error": "label is required"}
+    if not _is_http_base_url(base_url):
+        return {"ok": False, "error": "base_url must be an http or https URL"}
+    keyless = not api_key
+
+    try:
+        provider_id = llm_custom_provider_id_from_label(label)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    duplicate = llm_find_provider_duplicate(provider_id, base_url)
+    duplicate_provider_id: str | None = None
+    credentials_file: Path | None = None
+    if duplicate is not None:
+        duplicate_provider_id, duplicate_cfg = duplicate
+        provider_id = duplicate_provider_id
+        cfg = dict(duplicate_cfg)
+        source = llm_provider_source(provider_id)
+        env_value = duplicate_cfg.get("auth_env")
+        env_name = env_value.strip() if isinstance(env_value, str) and env_value.strip() else None
+        if keyless:
+            if source == "bundled" and env_name:
+                return {"ok": False, "error": f"api_key is required for bundled provider {duplicate_provider_id}"}
+            if source == "custom" and duplicate_provider_id == llm_custom_provider_id_from_label(label):
+                cfg.update(
+                    {
+                        "label": label,
+                        "auth_env": "",
+                        "base_url": base_url,
+                        "api_format": "openai-completions",
+                        "models_endpoint": "/models",
+                    }
+                )
+                env_name = None
+                try:
+                    llm_upsert_user_provider(provider_id, cfg)
+                except (OSError, ValueError, yaml.YAMLError) as exc:
+                    return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        else:
+            if env_name is None:
+                return {"ok": False, "error": f"provider {duplicate_provider_id} does not accept API-key credentials"}
+            if source == "custom" and duplicate_provider_id == llm_custom_provider_id_from_label(label):
+                cfg.update(
+                    {
+                        "label": label,
+                        "auth_env": env_name,
+                        "base_url": base_url,
+                        "api_format": "openai-completions",
+                        "models_endpoint": "/models",
+                    }
+                )
+                try:
+                    llm_upsert_user_provider(provider_id, cfg)
+                except (OSError, ValueError, yaml.YAMLError) as exc:
+                    return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    else:
+        env_name = None if keyless else llm_custom_provider_auth_env(provider_id)
+        source = "custom"
+        cfg = {
+            "label": label,
+            "auth_env": env_name or "",
+            "base_url": base_url,
+            "api_format": "openai-completions",
+            "models_endpoint": "/models",
+        }
+        try:
+            llm_upsert_user_provider(provider_id, cfg)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    if not keyless:
+        if env_name is None:
+            return {"ok": False, "error": "env_name is required for API-key credentials"}
+        try:
+            credentials_file = save_credential_env(env_name, api_key)
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    llm_clear_model_catalog_cache()
+    validation = _validate_provider_models(provider_id, cfg) if req.do_validate else {"ok": True, "skipped": True}
+    _refresh_provider_runtime()
+    return {
+        "ok": True,
+        "provider_id": provider_id,
+        "label": cfg.get("label", provider_id),
+        "env_name": env_name,
+        "source": source,
+        "duplicate": duplicate_provider_id is not None,
+        "credentials_path": str(credentials_file) if credentials_file is not None else None,
+        "validation": validation,
+    }
+
+
+@app.post("/credentials/custom/remove")
+def credentials_custom_provider_remove(req: CredentialCustomProviderRemoveRequest) -> dict[str, Any]:
+    provider_id = req.provider_id.strip()
+    if not provider_id:
+        return {"ok": False, "error": "provider_id is required"}
+    if provider_id in llm_load_repo_providers():
+        return {"ok": False, "error": "bundled providers cannot be removed"}
+    try:
+        _overlay_path, removed = llm_remove_user_provider(provider_id)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if removed is None:
+        return {"ok": False, "error": "custom provider not found"}
+    env_name = removed.get("auth_env")
+    credentials_file: str | None = None
+    if req.remove_key and isinstance(env_name, str) and env_name.strip():
+        try:
+            credentials_file = str(remove_credential_env(env_name))
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    llm_clear_model_catalog_cache()
+    _refresh_provider_runtime()
+    return {
+        "ok": True,
+        "provider_id": provider_id,
+        "removed_key": bool(req.remove_key and env_name),
+        "env_name": env_name if isinstance(env_name, str) else None,
+        "credentials_path": credentials_file,
     }
 
 
@@ -2072,10 +3072,36 @@ def _validate_credential_env(env_name: str) -> dict[str, Any]:
     if not matched:
         return {"ok": True, "warning": "saved; no live validator for this env"}
     for pid in matched:
-        models = llm_fetch_all({"providers": {pid: catalog["providers"][pid]}}).get(pid)
-        if models:
-            return {"ok": True, "provider": pid, "models": len(models)}
+        cfg = catalog["providers"][pid]
+        if not llm_provider_supports_model_setting(cfg):
+            continue
+        result = llm_fetch_model_catalog(pid, cfg, force_refresh=True, allow_fallback=False)
+        if result.models:
+            return {"ok": True, "provider": pid, "models": len(result.models)}
+    if all(not llm_provider_supports_model_setting(catalog["providers"][pid]) for pid in matched):
+        return {"ok": True, "provider": matched[0], "skipped": True, "warning": "saved; no live validator for image provider"}
     return {"ok": False, "error": f"saved, but validation failed for: {', '.join(matched)}"}
+
+
+def _is_http_base_url(base_url: str) -> bool:
+    parsed = urllib.parse.urlparse(base_url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _validate_provider_models(provider_id: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    load_credentials_into_env()
+    result = llm_fetch_model_catalog(provider_id, cfg, force_refresh=True, allow_fallback=False)
+    if result.models is not None:
+        return {"ok": True, "provider": provider_id, "models": len(result.models)}
+    return {"ok": False, "provider": provider_id, "error": "saved, but could not reach /models"}
+
+
+def _refresh_provider_runtime() -> None:
+    try:
+        clear_cache()
+        _init_provider_router()
+    except Exception:
+        pass
 
 
 @app.post("/register_project")
@@ -2084,6 +3110,8 @@ def register_project(req: RegisterProjectRequest) -> dict[str, Any]:
     try:
         project = router.create_project(name, code_path=req.path)
         project, warnings = router.switch_project(project.slug, code_path=project.code_path, auto_create=False)
+    except InvalidProjectNameError as exc:
+        return {"ok": False, "error": str(exc), **router.registry.status_fields()}
     except RegistryCorruptError as exc:
         return {"ok": False, "error": str(exc), **router.registry.status_fields()}
     if project is None:
@@ -2092,7 +3120,8 @@ def register_project(req: RegisterProjectRequest) -> dict[str, Any]:
     if guarded_project is None:
         return {"ok": False, "error": "registered project disappeared before memory seed"}
     project = guarded_project
-    file_states = ensure_workspace_memory(project.path)
+    memory_write_enabled, memory_write_promoted = _memory_write_state_for_write()
+    file_states = ensure_workspace_memory(project.path) if memory_write_enabled else {"memory_write": "disabled"}
     return {
         "ok": True,
         **_project_payload(project),
@@ -2100,6 +3129,7 @@ def register_project(req: RegisterProjectRequest) -> dict[str, Any]:
         + ([] if project.code_path == req.path else ["requested path redirected to a safe location"]),
         "jarvis_md": file_states.get("JARVIS.md", "missing"),
         "memory_files": file_states,
+        **_memory_write_notice_payload(memory_write_promoted),
     }
 
 
@@ -2155,6 +3185,8 @@ def unregister_project(req: UnregisterProjectRequest) -> dict[str, Any]:
 def switch_project(req: SwitchRequest) -> dict[str, Any]:
     try:
         project, warnings = router.switch_project(req.slug_or_name, code_path=req.code_path, auto_create=req.auto_create)
+    except InvalidProjectNameError as exc:
+        return {"ok": False, "warnings": [str(exc)], **router.registry.status_fields()}
     except RegistryCorruptError as exc:
         return {"ok": False, "error": str(exc), **router.registry.status_fields()}
     if project is None:
@@ -2163,12 +3195,14 @@ def switch_project(req: SwitchRequest) -> dict[str, Any]:
     if guarded_project is None:
         return {"ok": False, "error": "selected project disappeared before memory seed"}
     project = guarded_project
-    file_states = ensure_workspace_memory(project.path)
+    memory_write_enabled, memory_write_promoted = _memory_write_state_for_write()
+    file_states = ensure_workspace_memory(project.path) if memory_write_enabled else {"memory_write": "disabled"}
     return {
         "ok": True,
         **_project_payload(project),
         "warnings": warnings,
         "memory_files": file_states,
+        **_memory_write_notice_payload(memory_write_promoted),
     }
 
 
@@ -2188,6 +3222,14 @@ def setup(req: SetupRequest) -> dict[str, Any]:
 
 @app.post("/update_jarvis_md")
 def update_jarvis_md(req: UpdateJarvisMdRequest) -> dict[str, Any]:
+    memory_write_enabled, memory_write_promoted = _memory_write_state_for_write()
+    if not memory_write_enabled:
+        return {
+            "ok": True,
+            "skipped": True,
+            "memory_write_disabled": True,
+            "warning": pairing.MEMORY_WRITE_DISABLED_MESSAGE,
+        }
     project = _registered_memory_project(req.project_path)
     if project is None:
         return {
@@ -2199,16 +3241,26 @@ def update_jarvis_md(req: UpdateJarvisMdRequest) -> dict[str, Any]:
     if req.updates is not None:
         result = update_project_jarvis_md_batch(project.path, updates=req.updates)
         _print_project_memory_updated(project_path=project.path, result=result)
+        result.update(_memory_write_notice_payload(memory_write_promoted))
         return result
     if req.field is None:
         return {"ok": False, "error": "field is required when updates is not provided"}
     result = update_project_jarvis_md(project.path, field=req.field, value=req.value)
     _print_project_memory_updated(project_path=project.path, result=result)
+    result.update(_memory_write_notice_payload(memory_write_promoted))
     return result
 
 
 @app.post("/interrupt_checkpoint")
 def interrupt_checkpoint(req: InterruptCheckpointRequest) -> dict[str, Any]:
+    memory_write_enabled, memory_write_promoted = _memory_write_state_for_write()
+    if not memory_write_enabled:
+        return {
+            "ok": True,
+            "skipped": True,
+            "memory_write_disabled": True,
+            "warning": pairing.MEMORY_WRITE_DISABLED_MESSAGE,
+        }
     result = write_interrupt_checkpoint(
         req.project_path,
         user_message=req.user_message,
@@ -2220,18 +3272,36 @@ def interrupt_checkpoint(req: InterruptCheckpointRequest) -> dict[str, Any]:
         reason=req.reason,
     )
     _print_project_memory_updated(project_path=req.project_path, result=result)
+    result.update(_memory_write_notice_payload(memory_write_promoted))
     return result
 
 
 @app.post("/interrupt_checkpoint/clear")
 def clear_interrupt_checkpoint_endpoint(req: ClearInterruptCheckpointRequest) -> dict[str, Any]:
+    memory_write_enabled, memory_write_promoted = _memory_write_state_for_write()
+    if not memory_write_enabled:
+        return {
+            "ok": True,
+            "skipped": True,
+            "memory_write_disabled": True,
+            "warning": pairing.MEMORY_WRITE_DISABLED_MESSAGE,
+        }
     result = clear_interrupt_checkpoint(req.project_path)
     _print_project_memory_updated(project_path=req.project_path, result=result)
+    result.update(_memory_write_notice_payload(memory_write_promoted))
     return result
 
 
 @app.post("/evidence/store")
 def evidence_store_endpoint(req: EvidenceStoreRequest) -> dict[str, Any]:
+    memory_write_enabled, memory_write_promoted = _memory_write_state_for_write()
+    if not memory_write_enabled:
+        return {
+            "ok": True,
+            "skipped": True,
+            "memory_write_disabled": True,
+            "warning": pairing.MEMORY_WRITE_DISABLED_MESSAGE,
+        }
     try:
         payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
         result = store_evidence(payload)
@@ -2239,6 +3309,7 @@ def evidence_store_endpoint(req: EvidenceStoreRequest) -> dict[str, Any]:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     if result.get("ok") is False:
         raise HTTPException(status_code=409, detail=result.get("error") or "evidence store failed")
+    result.update(_memory_write_notice_payload(memory_write_promoted))
     return result
 
 
@@ -2374,6 +3445,169 @@ def observe_subturn_debug(req: SubturnObserveRequest) -> dict[str, Any]:
     return {"ok": True, "debug_event_id": record["id"]}
 
 
+@app.get("/v1/models")
+def openai_compatible_models() -> dict[str, Any]:
+    """Expose the current sidecar chat role as an OpenAI-compatible local proxy.
+
+    Pi registers this endpoint dynamically for sidecar-only chat providers such
+    as anthropic-agent-sdk. The model list is intentionally tiny: it represents
+    the active sidecar chat runtime, not the full picker catalog.
+    """
+    config = _apply_chat_model_override(load_runtime_config())
+    roles = config.get("roles") or {}
+    chat = str(roles.get("chat") or "")
+    split = llm_split_model_spec(chat)
+    model = split[1] if split else "jarvis-sidecar-chat"
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model,
+                "object": "model",
+                "created": 0,
+                "owned_by": "jarvis-sidecar",
+            }
+        ],
+    }
+
+
+@app.post("/v1/chat/completions")
+async def openai_compatible_chat_completions(request: Request) -> Any:
+    """OpenAI-compatible streaming chat proxy for sidecar-owned chat adapters."""
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="request body must be an object")
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(status_code=400, detail="messages must be a non-empty list")
+
+    llm = get_llm("chat")
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        tools = None
+    parallel_tool_calls = body.get("parallel_tool_calls")
+    call_kwargs = _openai_proxy_stream_kwargs(body)
+    created = int(datetime.now(UTC).timestamp())
+    request_id = _openai_proxy_request_id()
+    # turn_context wiring (D2/D3): the AnthropicAgentSDKAdapter reads conv_id /
+    # project_root / retriever off the thread-local turn_context to set its SDK cwd
+    # and back the bridged recall_turns memory tool. The WS chat path sets this via
+    # ChatTurn.run, but this OpenAI-compatible proxy never did — so the SDK saw an
+    # empty context (conv_id="conversation", cwd=os.getcwd()=sidecar dir, dead
+    # recall). The OpenAI request has no project_root field, so we wire conv_id from
+    # the per-window X-Jarvis-Pair header (already plumbed by jarvis-jlc.ts) and
+    # leave project_root None — a documented limit (the SDK then falls back to its
+    # own cwd default rather than the wrong sidecar dir). No-op for non-SDK
+    # providers, which ignore turn_context. (2026-06-22 fix.)
+    conv_id = _openai_proxy_conv_id(request)
+
+    if body.get("stream", True) is False:
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        finish_reason = "stop"
+        turn_context.set(conv_id=conv_id)
+        try:
+            for chunk in llm.stream_chat_completions(
+                messages,
+                tools=tools,
+                parallel_tool_calls=False if parallel_tool_calls is False else True,
+                stream=True,
+                **call_kwargs,
+            ):
+                if not isinstance(chunk, dict):
+                    continue
+                finish_reason = _openai_proxy_finish_reason(chunk) or finish_reason
+                choices = chunk.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    continue
+                delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+                if not isinstance(delta, dict):
+                    continue
+                content = delta.get("content")
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or delta.get("reasoning_text")
+                if isinstance(content, str):
+                    content_parts.append(content)
+                if isinstance(reasoning, str):
+                    reasoning_parts.append(reasoning)
+        finally:
+            turn_context.clear()
+        model = _openai_proxy_model_name(body, llm)
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts)}
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
+        response: dict[str, Any] = {
+            "id": request_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        }
+        usage = _openai_proxy_usage(llm)
+        if usage is not None:
+            response["usage"] = usage
+        return response
+
+    def iter_events():
+        model = str(body.get("model") or "jarvis-sidecar-chat")
+        saw_finish = False
+        # Set on the generator's own thread (StreamingResponse iterates it on a
+        # worker thread); the SDK adapter reads turn_context on that same thread.
+        turn_context.set(conv_id=conv_id)
+        try:
+            for chunk in llm.stream_chat_completions(
+                messages,
+                tools=tools,
+                parallel_tool_calls=False if parallel_tool_calls is False else True,
+                stream=True,
+                **call_kwargs,
+            ):
+                if not isinstance(chunk, dict):
+                    continue
+                finish_reason = _openai_proxy_finish_reason(chunk)
+                if finish_reason:
+                    saw_finish = True
+                    model = _openai_proxy_model_name(body, llm)
+                usage = _openai_proxy_usage(llm) if finish_reason else None
+                yield _openai_proxy_sse(
+                    _openai_proxy_chunk(
+                        chunk,
+                        request_id=request_id,
+                        created=created,
+                        model=model,
+                        usage=usage,
+                    )
+                )
+            if not saw_finish:
+                model = _openai_proxy_model_name(body, llm)
+                yield _openai_proxy_sse(
+                    _openai_proxy_chunk(
+                        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                        request_id=request_id,
+                        created=created,
+                        model=model,
+                        usage=_openai_proxy_usage(llm),
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001
+            yield _openai_proxy_sse(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "jarvis_sidecar_proxy_error",
+                    }
+                }
+            )
+        finally:
+            turn_context.clear()
+        yield _openai_proxy_sse("[DONE]")
+
+    return StreamingResponse(
+        iter_events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/translate_input")
 async def translate_input(req: TranslateInputRequest) -> dict[str, Any]:
     text = req.text
@@ -2405,15 +3639,22 @@ async def translate_input(req: TranslateInputRequest) -> dict[str, Any]:
 
 
 @app.get("/llmsetting/catalog")
-def llmsetting_catalog() -> dict[str, Any]:
+def llmsetting_catalog(refresh: bool = False) -> dict[str, Any]:
     """Return the LLM provider catalog + live model lists + currently-active
     roles. Consumed by the Pi /model-setting slash command."""
     load_credentials_into_env()
     catalog = llm_load_catalog()
-    fetched = llm_fetch_all(catalog)
+    providers = {
+        pid: cfg
+        for pid, cfg in catalog["providers"].items()
+        if llm_provider_supports_model_setting(cfg)
+    }
+    catalog = {**catalog, "providers": providers}
+    fetched = llm_fetch_all_detailed(catalog, force_refresh=refresh)
     providers_out: dict[str, dict[str, Any]] = {}
-    for pid, cfg in catalog["providers"].items():
-        models = fetched.get(pid)
+    for pid, cfg in providers.items():
+        result = fetched.get(pid)
+        models = result.models if result is not None else None
         if cfg.get("enabled") is False:
             available = False
             reason = cfg.get("note") or "disabled in catalog"
@@ -2422,7 +3663,7 @@ def llmsetting_catalog() -> dict[str, Any]:
             reason = (
                 "not logged in (run /gpt-login)"
                 if cfg.get("auth_kind") == "oauth"
-                else f"no API key (set {cfg.get('auth_env', '?')})"
+                else (result.warning if result is not None and result.warning else f"no API key (set {cfg.get('auth_env', '?')})")
             )
         else:
             available = True
@@ -2435,6 +3676,10 @@ def llmsetting_catalog() -> dict[str, Any]:
             "models": list(models) if models else [],
             "auth_env": cfg.get("auth_env"),
             "auth_kind": cfg.get("auth_kind"),
+            "roles": sorted(llm_provider_roles(cfg)),
+            "catalog_source": result.source if result is not None else "unavailable",
+            "cache_stale": bool(result.cache_stale) if result is not None else False,
+            "catalog_warning": result.warning if result is not None else None,
         }
     return {
         "ok": True,
@@ -2446,26 +3691,92 @@ def llmsetting_catalog() -> dict[str, Any]:
 
 @app.post("/llmsetting/apply")
 def llmsetting_apply(req: LLMSettingApplyRequest) -> dict[str, Any]:
-    """Write the picked chat/encoder roles to data/config.yaml and register
-    the matching entries in pi-agent/models.json."""
-    def _split(value: str) -> tuple[str, str] | None:
-        if "/" not in value:
-            return None
-        provider, model = value.split("/", 1)
-        provider = provider.strip()
-        model = model.strip()
-        if not provider or not model:
-            return None
-        return provider, model
-
-    chat = _split(req.chat)
-    encoder = _split(req.encoder)
-    if not chat or not encoder:
-        return {"ok": False, "error": "chat and encoder must be 'provider/model' strings"}
+    """Write picked chat/subagent/router/encoder roles to data/config.yaml and
+    register the matching entries in pi-agent/models.json."""
+    chat = llm_split_model_spec(req.chat) if req.chat is not None else None
+    subagent = llm_split_model_spec(req.subagent) if req.subagent is not None else None
+    router = llm_split_model_spec(req.router) if req.router is not None else None
+    encoder = llm_split_model_spec(req.encoder) if req.encoder is not None else None
+    if req.chat is not None and chat is None:
+        return {"ok": False, "error": "chat must be a 'provider/model' string"}
+    if req.subagent is not None and subagent is None:
+        return {"ok": False, "error": "subagent must be a 'provider/model' string"}
+    if req.router is not None and router is None:
+        return {"ok": False, "error": "router must be a 'provider/model' string"}
+    if req.encoder is not None and encoder is None:
+        return {"ok": False, "error": "encoder must be a 'provider/model' string"}
+    if chat is None and subagent is None and router is None and encoder is None:
+        return {"ok": False, "error": "chat, subagent, router, or encoder must be provided"}
+    corrections: list[str] = []
+    if not req.force:
+        # Validate against the catalog before anything is written: a typo'd
+        # spec in config.yaml reload-fails, and a keyless provider passes the
+        # swap only to 401 on the first turn.
+        load_credentials_into_env()
+        try:
+            if chat is not None:
+                provider_id, model_id, note = llm_validate_model_pick(chat[0], chat[1])
+                chat = (provider_id, model_id)
+                if note:
+                    corrections.append(f"chat: {note}")
+            if subagent is not None:
+                provider_id, model_id, note = llm_validate_model_pick(subagent[0], subagent[1])
+                subagent = (provider_id, model_id)
+                if note:
+                    corrections.append(f"subagent: {note}")
+            if router is not None:
+                provider_id, model_id, note = llm_validate_model_pick(router[0], router[1])
+                router = (provider_id, model_id)
+                if note:
+                    corrections.append(f"router: {note}")
+            if encoder is not None:
+                provider_id, model_id, note = llm_validate_model_pick(encoder[0], encoder[1])
+                encoder = (provider_id, model_id)
+                if note:
+                    corrections.append(f"encoder: {note}")
+        except ValueError as e:
+            return {"ok": False, "error": str(e), "hint": "pass force=true to save anyway"}
+        # The JHB encoder fires every turn, so anthropic-agent-sdk may run it only
+        # on a haiku-class model — a heavier Claude model would drain the
+        # subscription rate limit. Block at apply time (not just the adapter's
+        # runtime guard) so a bad pick fails fast instead of save->per-turn crash.
+        if (
+            encoder is not None
+            and encoder[0] == "anthropic-agent-sdk"
+            and "haiku" not in encoder[1].lower()
+        ):
+            return {
+                "ok": False,
+                "error": (
+                    f"anthropic-agent-sdk may run the encoder only on a haiku-class "
+                    f"model (it fires every turn — a heavier model would drain your "
+                    f"Claude rate limit). Got {encoder[0]}/{encoder[1]}."
+                ),
+                "hint": "pick anthropic-agent-sdk/claude-haiku-4-5 for the encoder, or pass force=true",
+            }
     try:
-        paths = llm_apply_picks(chat, encoder)
+        paths = llm_apply_partial_picks(
+            chat=chat,
+            subagent=subagent,
+            router=router,
+            encoder=encoder,
+        )
     except (OSError, KeyError, ValueError) as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # apply_partial_picks just rewrote providers.yaml. Rebuild the registered
+    # ProviderRouter from that fresh file BEFORE the encoder reload below:
+    # get_llm() resolves role aliases against the *live* router, so a model
+    # added by this apply (absent from the boot-time providers.yaml) is
+    # otherwise invisible — reload_encoder_llm() fails with "no matching alias"
+    # and the sidecar silently keeps the stale roles. (2026-06-16)
+    _init_provider_router()
+    current = llm_current_roles()
+    applied_chat = llm_split_model_spec(current.get("chat"))
+    applied_subagent = llm_split_model_spec(current.get("subagent"))
+    applied_router = llm_split_model_spec(current.get("router"))
+    applied_encoder = llm_split_model_spec(current.get("encoder"))
+    if applied_chat is None or applied_subagent is None or applied_router is None or applied_encoder is None:
+        return {"ok": False, "error": "applied roles could not be read back from config.yaml"}
     # Refresh in-process caches so the running sidecar picks up the new roles
     # without needing a restart. Chat goes through _LazyChatLLM so the module
     # cache invalidation inside reload_encoder_llm() covers it too; encoder is
@@ -2473,32 +3784,37 @@ def llmsetting_apply(req: LLMSettingApplyRequest) -> dict[str, Any]:
     global _agent_last_error
     global _agent_last_error_ts
     reload_warning: str | None = None
-    try:
-        with _agent_guard:
-            agent = _agent
-            if agent is None:
-                # A previous invalid encoder may have placed construction in
-                # retry backoff. The user just changed its configuration, so
-                # the old failure must not delay or describe the new choice.
-                _agent_last_error = None
-                _agent_last_error_ts = None
-        if agent is not None and hasattr(agent, "reload_encoder_llm"):
-            agent.reload_encoder_llm()
-        else:
-            clear_cache()
-            if get_agent() is None and _agent_last_error:
-                reload_warning = _agent_last_error
-    except Exception as exc:  # noqa: BLE001
-        reload_warning = f"{type(exc).__name__}: {exc}"
-        print(f"[jarvis-sidecar] /llmsetting/apply reload failed: {exc}", file=sys.stderr)
+    if chat is not None or router is not None or encoder is not None:
+        try:
+            with _agent_guard:
+                agent = _agent
+                if agent is None:
+                    # A previous invalid encoder may have placed construction in
+                    # retry backoff. The user just changed its configuration, so
+                    # the old failure must not delay or describe the new choice.
+                    _agent_last_error = None
+                    _agent_last_error_ts = None
+            if agent is not None and hasattr(agent, "reload_encoder_llm"):
+                agent.reload_encoder_llm()
+            else:
+                clear_cache()
+                if get_agent() is None and _agent_last_error:
+                    reload_warning = _agent_last_error
+        except Exception as exc:  # noqa: BLE001
+            reload_warning = f"{type(exc).__name__}: {exc}"
+            print(f"[jarvis-sidecar] /llmsetting/apply reload failed: {exc}", file=sys.stderr)
     result = {
         "ok": True,
-        "chat": f"{chat[0]}/{chat[1]}",
-        "encoder": f"{encoder[0]}/{encoder[1]}",
+        "chat": f"{applied_chat[0]}/{applied_chat[1]}",
+        "subagent": f"{applied_subagent[0]}/{applied_subagent[1]}",
+        "router": f"{applied_router[0]}/{applied_router[1]}",
+        "encoder": f"{applied_encoder[0]}/{applied_encoder[1]}",
         "config_path": paths["config_path"],
         "providers_path": paths["providers_path"],
         "models_json_path": paths["models_json_path"],
     }
+    if corrections:
+        result["corrections"] = corrections
     if reload_warning:
         result["reload_warning"] = reload_warning
     return result
@@ -2515,34 +3831,58 @@ def _build_context_block(
     trace: dict[str, Any],
     warnings: list[str],
     memory_mode: str,
+    mode: str | None = None,
 ) -> str:
     runtime_now = _runtime_now()
-    parts = [
-        "[JARVIS Code Memory]",
-        "Use this block as durable project memory. It is not the user's request.",
-        "Use ## Runtime Clock for all relative time words. Do not guess current date/time from model memory.",
-        "Short confirmations, denials, or acknowledgements are usually answers to the previous assistant question. Check ## Recent Turns before treating them as a new casual topic.",
-        "When present, ## Retrieved Prior Turns is query-specific evidence for the current user message. If it conflicts with JHB or Recent Turns, trust Retrieved Prior Turns and treat the conflicting summary/recent answer as stale or mistaken.",
-        "JHB is a compact lossy summary, not the full transcript. ## Retrieved Prior Turns may be prefilled from the current chat query; prefer it over calling recall_turns.",
-        "Use recall_turns only as a last-resort fallback when JHB, ## Recent Turns, and ## Retrieved Prior Turns still lack the exact prior fact needed. Do not call it for ordinary follow-ups, brand-new questions, or when the injected context already answers clearly.",
-        "Daily chat keeps compact JHB memory. Coding projects use the unified JARVIS.md file at the project's code path (see ## Memory Project Files below).",
-        "Each project keeps a single JARVIS.md at its code path. There is no separate workspace folder; do not invent or reference one.",
-        "active_memory_project_path equals active_code_project_path under the unified-JARVIS.md policy. Both point at the project's code directory; JARVIS.md lives directly inside it.",
-        "If the user asks to create, start, set up, build, or register a project and the target name/path is clear, treat that as explicit consent to call register_project; ask only when the target is ambiguous, missing, or unsafe.",
-        "If the user's utterance clearly targets a different project, call switch_project before editing memory. If the target is ambiguous across multiple projects, ask a clarifying question first.",
-        "cwd is not project identity. Project identity comes from user utterance and the JARVIS memory registry.",
-        "Before invoking write or edit on a non-trivial file, output one short assistant line stating intent and target (e.g. 'Editing JARVIS.md: NOW section' or 'Editing app.py: <change>'). Current providers do not stream tool-call arguments incrementally, so this single line is what the user sees while you generate the tool input. Skip the line only for tiny writes or trivial edits.",
-        f"memory_mode: {memory_mode}",
-        f"active_memory_project_path: {project_path or 'none'}",
-        f"active_code_project_path: {code_path or 'none'}",
-        f"project_selection_source: {trace.get('source', 'none')}",
-        f"default_project_root: {get_effective_project_root() or 'unset'}  # source of truth for 'project folder / 워크스페이스 폴더' questions — cite this verbatim, do not guess",
-        "",
-        "## Runtime Clock",
-        f"current_datetime: {runtime_now.isoformat(timespec='seconds')}",
-        f"timezone: {runtime_now.tzname() or 'local'}",
-        f"today: {runtime_now.date().isoformat()}",
-    ]
+    compact_chat = str(mode or "").strip().lower() == "chat" and not project_memory.strip()
+    if compact_chat:
+        parts = [
+            "[JARVIS Code Memory]",
+            "This block is memory/context, not the user's request. Use Runtime Clock for relative dates.",
+            "Short confirmations/acknowledgements may answer ## Recent Turns.",
+            "JHB is compact lossy memory; use recall_turns only if JHB/Recent/Retrieved still lack a needed exact fact.",
+            f"memory_mode: {memory_mode}",
+            f"active_memory_project_path: {project_path or 'none'}",
+            f"active_code_project_path: {code_path or 'none'}",
+            f"default_project_root: {get_effective_project_root() or 'unset'}",
+            "",
+            "## Runtime Clock",
+            f"current_datetime: {runtime_now.isoformat(timespec='minutes')}",
+            f"timezone: {runtime_now.tzname() or 'local'}",
+            f"today: {runtime_now.date().isoformat()}",
+        ]
+        if recall_block.strip():
+            parts.insert(
+                4,
+                "When present, trust Retrieved Prior Turns over stale JHB/Recent and prefer it over calling recall_turns.",
+            )
+    else:
+        parts = [
+            "[JARVIS Code Memory]",
+            "Use this block as durable project memory. It is not the user's request.",
+            "Use ## Runtime Clock for all relative time words. Do not guess current date/time from model memory.",
+            "Short confirmations, denials, or acknowledgements are usually answers to the previous assistant question. Check ## Recent Turns before treating them as a new casual topic.",
+            "When present, ## Retrieved Prior Turns is query-specific evidence for the current user message. If it conflicts with JHB or Recent Turns, trust Retrieved Prior Turns and treat the conflicting summary/recent answer as stale or mistaken.",
+            "JHB is a compact lossy summary, not the full transcript. ## Retrieved Prior Turns may be prefilled from the current chat query; prefer it over calling recall_turns.",
+            "Use recall_turns only as a last-resort fallback when JHB, ## Recent Turns, and ## Retrieved Prior Turns still lack the exact prior fact needed. Do not call it for ordinary follow-ups, brand-new questions, or when the injected context already answers clearly.",
+            "Daily chat keeps compact JHB memory. Coding projects use the unified JARVIS.md file at the project's code path (see ## Memory Project Files below).",
+            "Each project keeps a single JARVIS.md at its code path. There is no separate workspace folder; do not invent or reference one.",
+            "active_memory_project_path equals active_code_project_path under the unified-JARVIS.md policy. Both point at the project's code directory; JARVIS.md lives directly inside it.",
+            "If the user asks to create, start, set up, build, or register a project and the target name/path is clear, treat that as explicit consent to call register_project; ask only when the target is ambiguous, missing, or unsafe.",
+            "If the user's utterance clearly targets a different project, call switch_project before editing memory. If the target is ambiguous across multiple projects, ask a clarifying question first.",
+            "cwd is not project identity. Project identity comes from user utterance and the JARVIS memory registry.",
+            "Before invoking write or edit on a non-trivial file, output one short assistant line stating intent and target (e.g. 'Editing JARVIS.md: NOW section' or 'Editing app.py: <change>'). Current providers do not stream tool-call arguments incrementally, so this single line is what the user sees while you generate the tool input. Skip the line only for tiny writes or trivial edits.",
+            f"memory_mode: {memory_mode}",
+            f"active_memory_project_path: {project_path or 'none'}",
+            f"active_code_project_path: {code_path or 'none'}",
+            f"project_selection_source: {trace.get('source', 'none')}",
+            f"default_project_root: {get_effective_project_root() or 'unset'}  # source of truth for 'project folder / 워크스페이스 폴더' questions — cite this verbatim, do not guess",
+            "",
+            "## Runtime Clock",
+            f"current_datetime: {runtime_now.isoformat(timespec='minutes')}",
+            f"timezone: {runtime_now.tzname() or 'local'}",
+            f"today: {runtime_now.date().isoformat()}",
+        ]
     if warnings:
         parts.append("warnings: " + "; ".join(warnings))
     if recall_block.strip():
@@ -2556,7 +3896,7 @@ def _build_context_block(
     return "\n".join(parts).strip()
 
 
-_ROUTE_VALUES = {"chat", "unregistered_coding", "deepdive", "heavy_deepdive"}
+_ROUTE_VALUES = {"chat", "chat_control", "unregistered_coding", "deepdive", "heavy_deepdive"}
 
 
 def _route_project_summaries() -> list[dict[str, str]]:
@@ -2579,10 +3919,12 @@ def _route_project_summaries() -> list[dict[str, str]]:
 
 def _route_turn_system_prompt() -> str:
     return (
-        "You are the JARVIS Code chat-LLM router. Decide the user's intent before "
-        "the main coding agent runs. Return only one JSON object, with no markdown.\n\n"
+        "You are the JARVIS Code routing model doing a route-only preflight before "
+        "the main turn is built. Decide the user's intent before the main coding "
+        "agent runs. Return only one JSON object, with no markdown.\n\n"
         "Routes:\n"
         "- chat: ordinary conversation, memory recall, questions, confirmations, or discussion that does not need file/tool work.\n"
+        "- chat_control: chat-mode control/tool work such as asking the user, worker/window actions, model settings, web lookup, or managing EXISTING project registrations (list/switch/unregister). It must not mutate files, write project memory, or run shell/code tools, and it is NEVER used to create or build a NEW project (that is deepdive).\n"
         "- unregistered_coding: code/file analysis or edits for an explicit external/unregistered path or material, without JARVIS project memory.\n"
         "- deepdive: registered workspace project work, focused coding/debugging, or clear creation/registration of a new project.\n"
         "- heavy_deepdive: registered workspace project work needing root-cause analysis, broad structure review, multi-file refactor, regression/performance work, or explicit full tests.\n\n"
@@ -2590,19 +3932,30 @@ def _route_turn_system_prompt() -> str:
         "- You understand natural language in any language. Do not require exact slash commands or full paths.\n"
         "- If the user clearly names a registered project by name, slug, nickname, translation, or prior context, set target_project_hint.\n"
         "- If multiple registered projects could match, set needs_clarification=true and route=chat.\n"
-        "- If the user asks to create/start/register a new project and the target is clear, set create_project=true, register_project=true, route=deepdive or heavy_deepdive, and provide an ASCII project_slug.\n"
+        "- SUPREME RULE (outranks every action overlay below): if the user asks to create/start/build/register a NEW project in any language, this is ALWAYS route=deepdive (or heavy_deepdive) with create_project=true, register_project=true, and an ASCII project_slug -- even when you also plan to ask clarifying questions first. Creating or building a new project is NEVER chat_control.\n"
         "- For non-English project targets, produce a concise filesystem-safe ASCII slug by transliterating or translating the intent. Do not hardcode user-specific aliases.\n"
         "- If the user asks to edit an external absolute path without registering it, choose unregistered_coding.\n"
         "- If the user explicitly says not to register, never set register_project.\n\n"
+        "Action overlays:\n"
+        "- If the user requests an independent review/critic/second-agent review workflow, set critic_mode=true. Set critic_heavy=true only for broad/heavy/project-wide critic work.\n"
+        "- If pending_project is present and the user confirms creating/selecting it, set pending_project_decision=confirm. If the user declines, set pending_project_decision=decline. If unclear, set pending_project_decision=unclear.\n"
+        "- expected_action is none for ordinary chat, ask_user when the next chat action should ask the user, spawn_window when the user asks to open a new worker/agent window, project_work for coding/project work, and tool for other tool-backed chat/control actions.\n"
+        "- If expected_action is ask_user, spawn_window, or tool and no project/file mutation is requested AND the turn is not creating/building a new project, prefer route=chat_control over route=chat. (A new project always follows the SUPREME RULE above: deepdive, never chat_control.)\n"
+        "- If the user asks to message, greet, check, label, configure, or continue an already-open worker/window (for example a named worker/window label), set route=chat_control and expected_action=tool, not spawn_window.\n"
+        "- If the user asks for current/external web facts but not file/project work, set route=chat_control and expected_action=tool.\n\n"
         "JSON schema:\n"
         "{"
-        "\"route\":\"chat|unregistered_coding|deepdive|heavy_deepdive\","
+        "\"route\":\"chat|chat_control|unregistered_coding|deepdive|heavy_deepdive\","
         "\"confidence\":\"high|medium|low\","
         "\"target_project_hint\":string|null,"
         "\"project_slug\":string|null,"
         "\"code_path_hint\":string|null,"
         "\"create_project\":boolean,"
         "\"register_project\":boolean,"
+        "\"critic_mode\":boolean,"
+        "\"critic_heavy\":boolean,"
+        "\"expected_action\":\"none|ask_user|spawn_window|project_work|tool\","
+        "\"pending_project_decision\":\"none|confirm|decline|unclear\","
         "\"needs_clarification\":boolean,"
         "\"clarification\":string|null,"
         "\"reason\":string"
@@ -2634,6 +3987,10 @@ def _route_turn_fallback(route: str, reason: str) -> dict[str, Any]:
         "code_path_hint": None,
         "create_project": False,
         "register_project": False,
+        "critic_mode": False,
+        "critic_heavy": False,
+        "expected_action": "none",
+        "pending_project_decision": "none",
         "needs_clarification": False,
         "clarification": None,
         "reason": reason,
@@ -2687,22 +4044,61 @@ def _normalize_route_decision(data: dict[str, Any], *, raw: str) -> dict[str, An
     needs_clarification = _route_bool(data.get("needs_clarification"))
     if needs_clarification:
         route = "chat"
+    critic_mode = _route_bool(data.get("critic_mode"))
+    critic_heavy = critic_mode and _route_bool(data.get("critic_heavy"))
+    expected_action = (_route_str(data.get("expected_action"), max_len=40) or "none").lower()
+    if expected_action not in {"none", "ask_user", "spawn_window", "project_work", "tool"}:
+        expected_action = "none"
+    pending_project_decision = (_route_str(data.get("pending_project_decision"), max_len=40) or "none").lower()
+    if pending_project_decision not in {"none", "confirm", "decline", "unclear"}:
+        pending_project_decision = "none"
+    register_project = _route_bool(data.get("register_project"))
+    create_project = _route_bool(data.get("create_project"))
+    target_project_hint = _route_str(data.get("target_project_hint"))
+    project_slug = _route_str(data.get("project_slug"), max_len=120)
+    # D3 reconcile: a classifier that says route=chat/chat_control but
+    # expected_action=project_work is internally contradictory — downstream (pi)
+    # leaves it unpromoted AND strips tools to ask_user, so real coding work
+    # silently loses its file tools. Promote to the least-privileged coding route
+    # that restores file tools (unregistered_coding), escalating to deepdive only
+    # when a registered/new-project signal is present and heavy_deepdive only on an
+    # explicit heavy-critic signal. needs_clarification -> chat already ran above
+    # and is intentionally NOT overridden (clarification wins). (2026-06-22 fix.)
+    if (
+        not needs_clarification
+        and expected_action == "project_work"
+        and route in {"chat", "chat_control"}
+    ):
+        if critic_heavy:
+            route = "heavy_deepdive"
+        elif register_project or create_project or project_slug or target_project_hint:
+            route = "deepdive"
+        else:
+            route = "unregistered_coding"
     return {
         "route": route,
         "confidence": confidence,
-        "target_project_hint": _route_str(data.get("target_project_hint")),
-        "project_slug": _route_str(data.get("project_slug"), max_len=120),
+        "target_project_hint": target_project_hint,
+        "project_slug": project_slug,
         "code_path_hint": _route_str(data.get("code_path_hint"), max_len=500),
-        "create_project": _route_bool(data.get("create_project")),
-        "register_project": _route_bool(data.get("register_project")),
+        "create_project": create_project,
+        "register_project": register_project,
+        "critic_mode": critic_mode,
+        "critic_heavy": critic_heavy,
+        "expected_action": expected_action,
+        "pending_project_decision": pending_project_decision,
         "needs_clarification": needs_clarification,
         "clarification": _route_str(data.get("clarification"), max_len=500),
-        "reason": _route_str(data.get("reason"), max_len=500) or "chat LLM router decision",
+        "reason": _route_str(data.get("reason"), max_len=500) or "router classifier decision",
         "raw_text": raw[:2000],
     }
 
 
-def _format_recent_turns(turns: list[dict[str, Any]]) -> str:
+def _format_recent_turns(
+    turns: list[dict[str, Any]],
+    *,
+    current_origin_window: str | None = None,
+) -> str:
     """Recent raw turns as plain user/assistant pairs (no timestamps,
     no headers, no preamble). Full text — no per-turn truncation, so
     follow-up resolution sees the actual exchange."""
@@ -2712,14 +4108,19 @@ def _format_recent_turns(turns: list[dict[str, Any]]) -> str:
     for turn in turns:
         user = str(turn.get("user", "")).strip().replace("\r", "")
         assistant = str(turn.get("assistant", "")).strip().replace("\r", "")
+        origin_label = _origin_recall_label(turn, current_origin_window=current_origin_window)
         if user:
-            lines.append(f"user: {user}")
+            lines.append(f"user: {origin_label}{user}")
         if assistant:
             lines.append(f"assistant: {assistant}")
     return "\n".join(lines)
 
 
-def _format_raw_hits(hits: list[dict[str, Any]]) -> str:
+def _format_raw_hits(
+    hits: list[dict[str, Any]],
+    *,
+    current_origin_window: str | None = None,
+) -> str:
     """Format raw JSONL hits into a bounded multi-line recall block.
 
     No LLM summarization is used; long fields are clipped deterministically so
@@ -2735,11 +4136,12 @@ def _format_raw_hits(hits: list[dict[str, Any]]) -> str:
     for hit in hits:
         user = _clip_recall_field(str(hit.get("user", "")), max_chars_per_field)
         assistant = _clip_recall_field(str(hit.get("assistant", "")), max_chars_per_field)
+        origin_label = _origin_recall_label(hit, current_origin_window=current_origin_window)
         line_num = hit.get("line", "?")
         local_date = hit.get("local_date")
         suffix = f" | {local_date}" if local_date else ""
         lines.append(f"--- line {line_num}{suffix} ---")
-        lines.append(f"Q: {user}")
+        lines.append(f"Q: {origin_label}{user}")
         lines.append(f"A: {assistant}")
         lines.append("")
     return "\n".join(lines)
@@ -2767,6 +4169,9 @@ def _raw_hits_to_fragments(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "assistant": str(hit.get("assistant", "")),
             "ts": str(hit.get("ts") or hit.get("timestamp") or ""),
             "local_date": str(hit.get("local_date", "")),
+            "origin": normalize_turn_origin(hit.get("origin")),
+            "origin_window": normalize_origin_window(hit.get("origin_window")),
+            "origin_window_label": sanitize_window_label(hit.get("origin_window_label")),
         })
     return fragments
 

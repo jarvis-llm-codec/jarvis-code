@@ -5,15 +5,25 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import threading
+import time
 import unicodedata
+import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+try:
+    from jarvis_sidecar.file_locks import cross_process_file_lock, locked_append_text, locked_atomic_write_text
+except Exception:  # pragma: no cover - standalone jlc_agentic mode
+    cross_process_file_lock = None
+    locked_append_text = None
+    locked_atomic_write_text = None
 
 _MAX_CACHED_ENCODE_LOCKS = 1000
 _SESSION_ID = "jarvis_session"
@@ -25,10 +35,369 @@ def _normalize_session_id(session_id: str | None) -> str:
     return raw or _SESSION_ID
 
 
+def _normalize_origin(origin: str | None) -> str:
+    if callable(normalize_turn_origin):
+        return normalize_turn_origin(origin)
+    value = str(origin or "").strip()
+    return value if value in {"user", "monologue_directive", "monologue_report"} else "user"
+
+
+def _normalize_origin_window(origin_window: str | None) -> str | None:
+    if callable(normalize_origin_window):
+        return normalize_origin_window(origin_window)
+    value = str(origin_window or "").strip()
+    return value[:64] if value else None
+
+
+def _normalize_origin_window_label(label: str | None) -> str | None:
+    text = "".join(ch for ch in str(label or "") if ord(ch) >= 32 and ord(ch) != 127).strip()
+    return text[:32] if text else None
+
+
+def _current_pair8() -> str:
+    return str(os.environ.get("JARVIS_PAIR_ID") or "").strip()[:8]
+
+
+def _pair_jhb_root(shared_root: Path, pair8: str) -> Path:
+    return shared_root / "_windows" / f"jhb-{pair8}"
+
+
+# JHB storage windows are bounded, reusable slots (`worker1`, `worker2`, ...)
+# rather than per-GUID dirs. Reusing a slot inherits its `jhb.md`, which is what
+# makes JHB memory persist + accumulate across sessions (the GUID layout reset
+# it every launch). `overflow-<pid>` is the safety valve when every slot is held
+# by a live process; it is private (non-inheriting) and reclaimed by the sweep.
+_SLOT_PREFIX = "worker"
+_OVERFLOW_PREFIX = "overflow-"
+_DEFAULT_MAX_SLOTS = 8
+
+# Fallback in-process lock for slot allocation when the cross-process file lock
+# is unavailable (standalone jlc_agentic mode). Single-process serialization
+# only — enough for that mode, since there is just one allocator.
+_slot_alloc_fallback_lock = threading.Lock()
+
+
+def _safe_rmtree(path: Path, guard: Path) -> None:
+    try:
+        resolved_path = path.resolve()
+        resolved_guard = guard.resolve()
+    except OSError:
+        return
+    if resolved_path == resolved_guard or resolved_guard not in resolved_path.parents:
+        return
+    # Only legacy per-GUID dirs and pid-scoped overflow dirs are deletable.
+    # Reusable `worker*` slots are NEVER removed here — they are inherited.
+    if not (path.name.startswith("jhb-") or path.name.startswith(_OVERFLOW_PREFIX)):
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+    try:
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        handle = ctypes.windll.kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == still_active
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
+def _owner_pid(path: Path) -> int | None:
+    try:
+        owner = json.loads((path / "owner.json").read_text(encoding="utf-8"))
+        return int(owner.get("pid") or 0)
+    except Exception:
+        return None
+
+
+_ORPHAN_UNOWNED_JHB_MAX_AGE_S = 24 * 3600
+
+
+def _newest_mtime(path: Path) -> float:
+    try:
+        newest = path.stat().st_mtime
+    except OSError:
+        return 0.0
+    try:
+        for child in path.iterdir():
+            try:
+                newest = max(newest, child.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return newest
+
+
+def _orphaned_unowned_jhb(path: Path) -> bool:
+    """A jhb dir whose owner.json is missing or unreadable (e.g. a 0-byte file
+    left by a crash mid-create) never matches the dead-pid rule and would
+    survive every sweep forever. Collect it only when nothing inside has been
+    touched for a day, so a live window with a momentarily unreadable owner
+    file is never deleted."""
+    newest = _newest_mtime(path)
+    if newest <= 0.0:
+        return False
+    return (time.time() - newest) > _ORPHAN_UNOWNED_JHB_MAX_AGE_S
+
+
+def _max_slots() -> int:
+    try:
+        return max(1, int(os.environ.get("JARVIS_JHB_MAX_SLOTS", str(_DEFAULT_MAX_SLOTS))))
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_SLOTS
+
+
+def _slot_dir(windows_root: Path, n: int) -> Path:
+    return windows_root / f"{_SLOT_PREFIX}{n}"
+
+
+def _slot_is_free(slot: Path) -> bool:
+    """A slot is claimable when no live process owns it. A missing, empty, or
+    unreadable owner.json (pid is None) and a dead pid both count as free. The
+    slot's jhb.md, if any, is preserved on reclaim — that inheritance is the
+    whole point of slot reuse."""
+    pid = _owner_pid(slot)
+    if pid is None:
+        return True
+    return not _pid_alive(pid)
+
+
+def _write_slot_owner(slot: Path, pair8: str) -> None:
+    _atomic_write_text(
+        slot / "owner.json",
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "pair8": pair8,
+                "created_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
+
+
+def _make_overflow_slot(windows_root: Path, pair8: str) -> Path:
+    # Private, non-inheriting throwaway used only when every slot is held by a
+    # live process. The unique suffix guarantees a fresh empty dir so it never
+    # inherits a stale jhb.md from a prior same-pid overflow (PID reuse). The
+    # dead-pid sweep reclaims it later (name starts with the overflow prefix).
+    overflow = windows_root / f"{_OVERFLOW_PREFIX}{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    overflow.mkdir(parents=True, exist_ok=True)
+    _write_slot_owner(overflow, pair8)
+    return overflow
+
+
+def _slot_jhb_mtime(slot: Path) -> float:
+    """Freshness signal for slot selection: mtime of the slot's jhb.md, or 0
+    when it has none. Lets reuse inherit the NEWEST memory among free slots
+    rather than blindly the lowest index (which can revive a stale JHB)."""
+    try:
+        return (slot / _SESSION_ID / "jhb.md").stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _claim_slot_locked(windows_root: Path, pair8: str) -> Path:
+    # Caller holds the allocation lock; liveness is (re)checked here so the
+    # claim decision is made under the lock, never on a stale pre-lock scan.
+    free_existing: list[tuple[float, int, Path]] = []
+    first_unused: Path | None = None
+    for n in range(1, _max_slots() + 1):
+        slot = _slot_dir(windows_root, n)
+        if not slot.exists():
+            if first_unused is None:
+                first_unused = slot
+            continue
+        if _slot_is_free(slot):
+            free_existing.append((_slot_jhb_mtime(slot), n, slot))
+    # Prefer reusing the free slot with the NEWEST jhb.md so a returning
+    # session inherits the freshest memory, not a stale lower-index slot
+    # (concurrent windows can leave a newer JHB in a higher slot). Tie-break on
+    # lower index. An existing slot (which may hold memory) always beats
+    # spinning up a fresh empty one.
+    if free_existing:
+        free_existing.sort(key=lambda item: (item[0], -item[1]))
+        slot = free_existing[-1][2]
+        _write_slot_owner(slot, pair8)
+        return slot
+    if first_unused is not None:
+        first_unused.mkdir(parents=True, exist_ok=True)
+        _write_slot_owner(first_unused, pair8)
+        return first_unused
+    # Every slot has a live owner → safety valve (never block, never crash).
+    return _make_overflow_slot(windows_root, pair8)
+
+
+def _claim_slot(shared_root: Path, pair8: str) -> Path:
+    windows_root = shared_root / "_windows"
+    windows_root.mkdir(parents=True, exist_ok=True)
+    lock_cm = (
+        cross_process_file_lock(windows_root / "slot-alloc")
+        if callable(cross_process_file_lock)
+        else _slot_alloc_fallback_lock
+    )
+    try:
+        with lock_cm:
+            return _claim_slot_locked(windows_root, pair8)
+    except TimeoutError:
+        # Allocation contention exceeded the lock deadline — never crash the
+        # sidecar. Use a private overflow dir; the sweep reclaims it later.
+        print(
+            "[jlc:slim] slot alloc lock timeout; using overflow dir",
+            file=__import__("sys").stderr,
+        )
+        return _make_overflow_slot(windows_root, pair8)
+
+
+def _sweep_stale_windows(windows_root: Path) -> None:
+    """Collect only non-reusable cruft: dead-pid legacy `jhb-*` dirs, dead-pid
+    `overflow-*` dirs, and stale unreadable-owner orphans. Reusable `worker*`
+    slots are NEVER deleted — they are inherited on reclaim. Directive cursors
+    live in the raw-store (not here), so this sweep never touches them (the
+    2026-06-11 redelivery incident stays fixed)."""
+    try:
+        children = list(windows_root.iterdir())
+    except OSError:
+        return
+    for candidate in children:
+        if not candidate.is_dir():
+            continue
+        name = candidate.name
+        if name.startswith(_SLOT_PREFIX):
+            continue  # reusable slot — never sweep
+        if not (name.startswith("jhb-") or name.startswith(_OVERFLOW_PREFIX)):
+            continue
+        pid = _owner_pid(candidate)
+        if pid is not None and not _pid_alive(pid):
+            _safe_rmtree(candidate, windows_root)
+        elif pid is None and _orphaned_unowned_jhb(candidate):
+            _safe_rmtree(candidate, windows_root)
+
+
+def _reset_worker_slot(slot: Path) -> None:
+    """A spawned worker is EPHEMERAL: it must start FRESH every launch and never
+    inherit a prior worker's memory from a reused slot (the slot now also holds
+    the worker's PRIVATE conversation raw-store + retriever store). Wipe-on-start
+    is the primary freshness guarantee (crash-safe, unlike wipe-on-close).
+
+    Wipe everything under the slot EXCEPT the freshly-written owner.json (which
+    marks this live claim). Tightly guarded: only ever a bounded worker/overflow
+    slot directly under ``_windows`` is touched — never the main home
+    (``conversation/`` is not under ``_windows``) and never a shared store."""
+    if slot.parent.name != "_windows":
+        return
+    if not (slot.name.startswith(_SLOT_PREFIX) or slot.name.startswith(_OVERFLOW_PREFIX)):
+        return
+    try:
+        children = list(slot.iterdir())
+    except OSError:
+        return
+    for child in children:
+        if child.name == "owner.json":
+            continue
+        try:
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink()
+        except OSError:
+            continue
+
+
+def _is_spawned_worker() -> bool:
+    # Set by spawn.child_spawn_env on every spawned window; absent for the main
+    # window launched directly. Decides home (main) vs _windows slot (worker).
+    return str(os.environ.get("JARVIS_SPAWNED") or "").strip() not in ("", "0")
+
+
+def _home_claimable(home: Path) -> bool:
+    # The main window's home (conversation/) is claimable when free, owned by a
+    # dead pid, or already owned by THIS process. Only a live OTHER main keeps
+    # it (so two manually-launched mains never clobber each other's memory).
+    pid = _owner_pid(home)
+    if pid is None or pid == os.getpid():
+        return True
+    return not _pid_alive(pid)
+
+
+def _claim_home_or_none(shared_root: Path, pair8: str) -> Path | None:
+    """Atomically claim the conversation home for the main window. The
+    check-then-write must be serialized across processes, or two mains starting
+    at once both see the home free and both claim it (clobbering one JHB).
+    Returns shared_root on success, or None if a live OTHER main holds it (the
+    caller then falls back to a worker slot)."""
+    lock_cm = (
+        cross_process_file_lock(shared_root / "home-claim")
+        if callable(cross_process_file_lock)
+        else _slot_alloc_fallback_lock
+    )
+    try:
+        with lock_cm:
+            if not _home_claimable(shared_root):
+                return None
+            _write_slot_owner(shared_root, pair8)
+            return shared_root
+    except TimeoutError:
+        return None  # contention exceeded the deadline → fall back to a slot
+
+
+def _prepare_pair_jhb_root(shared_root: Path, pair8: str) -> Path:
+    if not pair8:
+        return shared_root
+    windows_root = shared_root / "_windows"
+    if _is_spawned_worker():
+        # Spawned worker: isolated, bounded, reusable slot under _windows.
+        windows_root.mkdir(parents=True, exist_ok=True)
+        _sweep_stale_windows(windows_root)
+        slot = _claim_slot(shared_root, pair8)
+        # Ephemeral worker: wipe any inherited memory so the worker starts fresh
+        # (no prior worker's conversation/JHB/retriever bleeds in on slot reuse).
+        _reset_worker_slot(slot)
+        return slot
+    # Main window: durable home at conversation/<conv_id>/jhb.md (the original
+    # pre-_windows layout). Persists + accumulates across restarts with no slot
+    # churn. Fall back to a worker slot only when a live OTHER main already
+    # holds the home, so two manual mains never clobber each other.
+    if windows_root.exists():
+        _sweep_stale_windows(windows_root)  # keep legacy/_windows cruft bounded
+    home = _claim_home_or_none(shared_root, pair8)
+    if home is not None:
+        return home
+    windows_root.mkdir(parents=True, exist_ok=True)
+    return _claim_slot(shared_root, pair8)
+
+
 def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
     """Write text via temp file + os.replace so a crash mid-write cannot corrupt
     an existing file. Caller ensures parent dir exists.
     """
+    if callable(locked_atomic_write_text):
+        locked_atomic_write_text(path, content, encoding=encoding)
+        return
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
     # Owner-only (0o600) on POSIX. Windows lacks os.fchmod; ACLs handle this.
     try:
@@ -98,12 +467,20 @@ except Exception:  # pragma: no cover - sidecar package unavailable in standalon
     extract_local_dates = None
 try:
     from jarvis_sidecar.raw_store import (
+        _timestamp_local_date as timestamp_local_date,
         append_encoder_turn as append_pi_sidecar_encoder_turn,
         append_meter_turn as append_pi_sidecar_meter_turn,
+        normalize_origin_window,
+        normalize_turn_origin,
+        recent_turns as raw_recent_turns,
     )
 except Exception:  # pragma: no cover - optional sidecar bridge
     append_pi_sidecar_encoder_turn = None
     append_pi_sidecar_meter_turn = None
+    normalize_origin_window = None
+    normalize_turn_origin = None
+    raw_recent_turns = None
+    timestamp_local_date = None
 
 JHB_DELIM = "\n---JHB_END---\n"
 PROJ_DELIM = "\n---PROJECT_END---\n"
@@ -111,7 +488,7 @@ RECALL_DELIM = "\n---RECALL_END---\n"
 
 
 def _paperlog_path(session_id: str) -> Path:
-    root = Path(os.environ.get("JARVIS_RAW_STORE", "~/.jarvis-code/pi-sidecar")).expanduser()
+    root = Path(os.environ.get("JARVIS_RAW_STORE", "~/.jarvis-code/raw-store")).expanduser()
     safe = session_id.strip() or _SESSION_ID
     invalid = '<>:"/\\|?*'
     table = str.maketrans({ch: "_" for ch in invalid})
@@ -146,9 +523,28 @@ def _append_paperlog_row(
         f"prompt_tag={_PROMPT_TAG} | "
         f"{meter_line}"
     )
-    with open(path, "a", encoding="utf-8", newline="\n") as fh:
-        fh.write(line)
-        fh.write("\n")
+    if callable(locked_append_text):
+        locked_append_text(path, line + "\n")
+    else:
+        with open(path, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write(line)
+            fh.write("\n")
+
+
+def _origin_recall_label(record: dict[str, Any], *, current_origin_window: str | None = None) -> str:
+    origin = _normalize_origin(record.get("origin"))
+    window = _normalize_origin_window(record.get("origin_window"))
+    stamped_label = _normalize_origin_window_label(record.get("origin_window_label"))
+    if origin.startswith("monologue_"):
+        if stamped_label:
+            return f"[독백·{stamped_label}] "
+        return f"[독백·창{window}] " if window else "[독백] "
+    current = _normalize_origin_window(current_origin_window)
+    if origin == "user" and current and window and window != current:
+        if stamped_label:
+            return f"[창 {stamped_label}] "
+        return f"[창 {window}] "
+    return ""
 
 
 class JarvisAgentic:
@@ -156,7 +552,23 @@ class JarvisAgentic:
 
     def __init__(self, config_path: str | Path | None = None, completion_client: Any | None = None) -> None:
         self.config: JLCConfig = load_config(config_path)
-        self._jhb_root = Path(self.config.jhb.storage_path).expanduser()
+        self._shared_jhb_root = Path(self.config.jhb.storage_path).expanduser()
+        self._pair8 = _current_pair8()
+        self._jhb_root = _prepare_pair_jhb_root(self._shared_jhb_root, self._pair8)
+        # Worker isolation (2026-06-27): a spawned worker keeps BOTH its
+        # conversation raw-store AND its retriever store PRIVATE under its slot,
+        # so its turns never enter the main window's shared trunk and it never
+        # reads the main's memory (full bidirectional isolation). Setting
+        # JARVIS_CONV_STORE redirects ONLY the conversation session files
+        # (jarvis_session.jsonl/.paperlog) — the directive bus deliberately keeps
+        # using the shared _storage_root() (see raw_store._conv_store_root), so
+        # cross-window comms keep working. The main window (not spawned) keeps the
+        # shared retriever root and the shared conversation store untouched.
+        if _is_spawned_worker() and self._jhb_root != self._shared_jhb_root:
+            os.environ["JARVIS_CONV_STORE"] = str(self._jhb_root / "raw-store")
+            self._retriever_root = self._jhb_root
+        else:
+            self._retriever_root = self._shared_jhb_root
         # Public read-only accessor for the JHB storage root. External wiring
         # (e.g. dispatcher closure binding for recall_turn) should depend on
         # this attribute name instead of poking at `_jhb_root` directly so the
@@ -224,12 +636,13 @@ class JarvisAgentic:
         self.tagger = JLCTagger(custom_patterns=self.config.tagger.custom_patterns, max_tags_per_turn=self.config.tagger.max_tags_per_turn)
         self.graph = JLCGraph(storage_root=self._jhb_root, batch_interval=self.config.graph.batch_interval, max_nodes=self.config.graph.max_nodes, max_edges=self.config.graph.max_edges, prune_stale_turns=self.config.graph.prune_stale_turns)
         self.turn_logger = JLCTurnLogger(storage_root=self._jhb_root)
-        self.retriever = JLCRetriever(storage_root=self._jhb_root, embedder=None)
+        self.retriever = JLCRetriever(storage_root=self._retriever_root, embedder=None)
         self.jre = JREEngine(storage_root=self._jhb_root, embedder=None)
         # bge-m3 cold start is ~30s. Run synchronously so the "Loading weights:
         # 391/391" progress bar surfaces before the chat UI accepts input —
         # users (and recall_turn) need the embedder warm before the first turn.
         self._warmup_embedder()
+        self._schedule_jhb_rebuild_from_raw()
 
     def reload_encoder_llm(self) -> None:
         """Re-fetch the encoder LLM after /llmsetting/apply rewrote
@@ -454,6 +867,119 @@ class JarvisAgentic:
                 # survives in light-memory mode instead of dying silently at startup.
                 print(f"[jlc:warmup] embedder warmup crashed (degraded mode): {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
 
+    def _schedule_jhb_rebuild_from_raw(self, session_id: str | None = None) -> None:
+        if not self._pair8:
+            return
+        if not callable(raw_recent_turns):
+            return
+        # Slot-aware gate (2026-06-16): with reusable worker slots a returning
+        # session inherits its slot's jhb.md, so the common path costs zero
+        # LLM calls. Rebuild from the shared raw store ONLY for a genuinely
+        # empty slot (fresh install / wiped) so a new slot still bootstraps
+        # full memory. Env override: "0" force-disables, "1" always rebuilds.
+        force = os.environ.get("JARVIS_JHB_REBUILD_ON_STARTUP")
+        conv_id = _normalize_session_id(session_id)
+        if force == "0":
+            return
+        if force != "1":
+            if self.load_jhb(conv_id).strip():
+                return  # slot already carries inherited JHB — nothing to rebuild
+            try:
+                if not raw_recent_turns(limit=1, session_id=conv_id):
+                    return  # no raw history to rebuild from
+            except Exception:
+                return
+        thread = threading.Thread(
+            target=self._run_jhb_rebuild_from_raw_thread,
+            args=(conv_id,),
+            name=f"jhb-rebuild-{self._pair8}",
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_jhb_rebuild_from_raw_thread(self, conv_id: str) -> None:
+        try:
+            asyncio.run(self._rebuild_jhb_from_raw(conv_id))
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[jlc:slim] JHB rebuilt from 0 turns (0 LLM calls) failed: {exc}",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
+
+    async def _rebuild_jhb_from_raw(self, conv_id: str) -> None:
+        import sys as _sys
+
+        try:
+            limit = max(0, int(os.environ.get("JARVIS_JHB_REBUILD_TURNS", "50")))
+        except ValueError:
+            limit = 50
+        try:
+            chunk_size = max(1, int(os.environ.get("JARVIS_JHB_REBUILD_CHUNK", "5")))
+        except ValueError:
+            chunk_size = 5
+        if limit <= 0 or not callable(raw_recent_turns):
+            print("[jlc:slim] JHB rebuilt from 0 turns (0 LLM calls)", file=_sys.stderr, flush=True)
+            return
+
+        records = raw_recent_turns(limit=limit, session_id=conv_id)
+        turns: list[dict[str, Any]] = []
+        for idx, record in enumerate(records, start=1):
+            user = str(record.get("user") or "")
+            assistant = str(record.get("assistant") or "")
+            if not user and not assistant:
+                continue
+            turns.append({
+                "_turn_id": idx,
+                "turn": idx,
+                "user": user,
+                "assistant": assistant,
+                "origin": _normalize_origin(record.get("origin")),
+                "origin_window": _normalize_origin_window(record.get("origin_window")),
+                "origin_window_label": _normalize_origin_window_label(record.get("origin_window_label")),
+            })
+
+        if not turns:
+            self.save_jhb(conv_id, "")
+            print("[jlc:slim] JHB rebuilt from 0 turns (0 LLM calls)", file=_sys.stderr, flush=True)
+            return
+
+        lock = self._get_encode_lock(conv_id)
+        await asyncio.to_thread(lock.acquire)
+        llm_calls = 0
+        try:
+            prev_jhb = ""
+            prev_project_md = ""
+            for start in range(0, len(turns), chunk_size):
+                chunk = turns[start:start + chunk_size]
+                current_turn = int(chunk[-1].get("_turn_id") or 0)
+                updated_jhb, prev_project_md, _retry_count = await self.encoder.encode(
+                    prev_jhb=prev_jhb,
+                    user_msg="",
+                    assistant_msg="",
+                    prev_project_md=prev_project_md,
+                    project_active=False,
+                    target_tokens=self.config.jhb.target_tokens,
+                    batch_turns=chunk,
+                    current_turn=current_turn,
+                )
+                llm_calls += 1
+                prev_jhb = updated_jhb
+            self.save_jhb(conv_id, prev_jhb)
+            meta = self._load_meta(conv_id)
+            meta["turn"] = len(turns)
+            meta["rebuilt_from_raw_turns"] = len(turns)
+            meta["rebuilt_llm_calls"] = llm_calls
+            meta["last_rebuilt_at"] = datetime.now(UTC).replace(microsecond=0).isoformat()
+            self._save_meta(conv_id, meta)
+        finally:
+            lock.release()
+        print(
+            f"[jlc:slim] JHB rebuilt from {len(turns)} turns ({llm_calls} LLM calls)",
+            file=_sys.stderr,
+            flush=True,
+        )
+
     def recall_for_query(
         self,
         query: str,
@@ -548,15 +1074,19 @@ class JarvisAgentic:
         if source:
             label = f"[Recalled context — confidence={confidence}, source={source}]"
         lines = [label]
+        current_origin_window = getattr(self, "_pair8", None)
         for frag in fragments:
             turn = frag.get("turn", "?")
             score = frag.get("score", 0.0)
             local_date = frag.get("local_date")
+            if not local_date and callable(timestamp_local_date):
+                local_date = timestamp_local_date(frag.get("ts") or frag.get("timestamp"))
             user = frag.get("user") or ""
             assistant = frag.get("assistant") or ""
+            origin_label = _origin_recall_label(frag, current_origin_window=current_origin_window)
             suffix = f" | {local_date}" if local_date else ""
             lines.append(f"--- turn {turn}{suffix} (score={score}) ---")
-            lines.append(f"Q: {user}")
+            lines.append(f"Q: {origin_label}{user}")
             lines.append(f"A: {assistant}")
             lines.append("")  # blank line between turns
         lines.append(
@@ -578,6 +1108,9 @@ class JarvisAgentic:
         on_token: Any | None = None,
         on_done: Any | None = None,
         session_id: str | None = None,
+        origin: str = "user",
+        origin_window: str | None = None,
+        origin_window_label: str | None = None,
     ) -> int | None:
         """Fire-and-forget encode + persist for this turn's JHB.
 
@@ -605,6 +1138,9 @@ class JarvisAgentic:
                 "user": user_msg,
                 "assistant": assistant_msg,
                 "llm_meta": llm_meta,
+                "origin": _normalize_origin(origin),
+                "origin_window": _normalize_origin_window(origin_window),
+                "origin_window_label": _normalize_origin_window_label(origin_window_label),
             })
             # Cold-start exception: fire on turn 1 of a fresh conv so JHB is
             # seeded before turns 2-4 inject. After the first fire, batch
@@ -678,6 +1214,9 @@ class JarvisAgentic:
                     entry.get("user", "") or "",
                     entry.get("assistant", "") or "",
                     conv_id,
+                    origin=_normalize_origin(entry.get("origin")),
+                    origin_window=_normalize_origin_window(entry.get("origin_window")),
+                    origin_window_label=_normalize_origin_window_label(entry.get("origin_window_label")),
                 )
             except Exception as exc:
                 print(
@@ -773,6 +1312,9 @@ class JarvisAgentic:
         llm_meta: dict[str, Any] | None = None,
         on_token: Any | None = None,
         on_done: Any | None = None,
+        origin: str = "user",
+        origin_window: str | None = None,
+        origin_window_label: str | None = None,
     ) -> None:
         """W2.9.21 §4.2: legacy single-turn dispatch path. Retained for
         tests and standalone callers that bypass the buffer (e.g. _poc
@@ -813,6 +1355,9 @@ class JarvisAgentic:
                         llm_meta=llm_meta,
                         on_token=on_token,
                         on_done=on_done,
+                        origin=origin,
+                        origin_window=origin_window,
+                        origin_window_label=origin_window_label,
                     )
                 finally:
                     try:
@@ -848,6 +1393,9 @@ class JarvisAgentic:
                             llm_meta=llm_meta,
                             on_token=on_token,
                             on_done=on_done,
+                            origin=origin,
+                            origin_window=origin_window,
+                            origin_window_label=origin_window_label,
                         )
                     )
                 finally:
@@ -1068,6 +1616,9 @@ class JarvisAgentic:
         llm_meta: dict[str, Any] | None = None,
         on_token: Any | None = None,
         on_done: Any | None = None,
+        origin: str = "user",
+        origin_window: str | None = None,
+        origin_window_label: str | None = None,
     ) -> None:
         lock = self._get_encode_lock(conv_id)
         await asyncio.to_thread(lock.acquire)
@@ -1080,6 +1631,9 @@ class JarvisAgentic:
                 llm_meta=llm_meta,
                 on_token=on_token,
                 on_done=on_done,
+                origin=origin,
+                origin_window=origin_window,
+                origin_window_label=origin_window_label,
             )
         finally:
             lock.release()
@@ -1093,6 +1647,9 @@ class JarvisAgentic:
         llm_meta: dict[str, Any] | None = None,
         on_token: Any | None = None,
         on_done: Any | None = None,
+        origin: str = "user",
+        origin_window: str | None = None,
+        origin_window_label: str | None = None,
     ) -> None:
         prev_jhb = self.load_jhb(conv_id)
         # Path B (2026-05-09): legacy `## Conversation Tail` blocks left over
@@ -1106,11 +1663,29 @@ class JarvisAgentic:
         turn = self._increment_turn(conv_id)
 
         try:
-            self.retriever.save_turn(turn, user_msg, assistant_msg, conv_id)
+            self.retriever.save_turn(
+                turn,
+                user_msg,
+                assistant_msg,
+                conv_id,
+                origin=origin,
+                origin_window=origin_window,
+                origin_window_label=origin_window_label,
+            )
         except Exception as exc:
             print(f"[jlc:slim] retriever.save_turn failed conv={conv_id}: {exc}", file=__import__('sys').stderr)
         try:
-            await self.retriever.index_turn({"turn": turn, "user": user_msg, "assistant": assistant_msg}, conv_id)
+            await self.retriever.index_turn(
+                {
+                    "turn": turn,
+                    "user": user_msg,
+                    "assistant": assistant_msg,
+                    "origin": _normalize_origin(origin),
+                    "origin_window": _normalize_origin_window(origin_window),
+                    "origin_window_label": _normalize_origin_window_label(origin_window_label),
+                },
+                conv_id,
+            )
         except Exception as exc:
             print(f"[jlc:slim] retriever.index_turn failed conv={conv_id}: {exc}", file=__import__('sys').stderr)
 
@@ -1127,6 +1702,9 @@ class JarvisAgentic:
                 "project_active": bool(project_path),
                 "target_tokens": coding_target,
                 "current_turn": turn,
+                "origin": _normalize_origin(origin),
+                "origin_window": _normalize_origin_window(origin_window),
+                "origin_window_label": _normalize_origin_window_label(origin_window_label),
             }
             if on_token is not None:
                 encode_kwargs["on_token"] = on_token
@@ -1265,6 +1843,9 @@ class JarvisAgentic:
                 # belonged to. Without this, "그때 수정한 거?" is ambiguous
                 # across mixed-project history.
                 "project_path": project_path or "",
+                "origin": _normalize_origin(origin),
+                "origin_window": _normalize_origin_window(origin_window),
+                "origin_window_label": _normalize_origin_window_label(origin_window_label),
             }
             if llm_meta:
                 entry["llm_meta"] = llm_meta
@@ -1322,13 +1903,28 @@ class JarvisAgentic:
             if turn_id is None:
                 turn_id = self._increment_turn(conv_id)
                 try:
-                    self.retriever.save_turn(turn_id, t.get("user", "") or "", t.get("assistant", "") or "", conv_id)
+                    self.retriever.save_turn(
+                        turn_id,
+                        t.get("user", "") or "",
+                        t.get("assistant", "") or "",
+                        conv_id,
+                        origin=_normalize_origin(t.get("origin")),
+                        origin_window=_normalize_origin_window(t.get("origin_window")),
+                        origin_window_label=_normalize_origin_window_label(t.get("origin_window_label")),
+                    )
                 except Exception as exc:
                     print(f"[jlc:slim] retriever.save_turn failed conv={conv_id} turn={turn_id}: {exc}", file=_sys.stderr)
             turn_ids.append(turn_id)
             try:
                 await self.retriever.index_turn(
-                    {"turn": turn_id, "user": t.get("user", "") or "", "assistant": t.get("assistant", "") or ""},
+                    {
+                        "turn": turn_id,
+                        "user": t.get("user", "") or "",
+                        "assistant": t.get("assistant", "") or "",
+                        "origin": _normalize_origin(t.get("origin")),
+                        "origin_window": _normalize_origin_window(t.get("origin_window")),
+                        "origin_window_label": _normalize_origin_window_label(t.get("origin_window_label")),
+                    },
                     conv_id,
                 )
             except Exception as exc:
@@ -1440,7 +2036,10 @@ class JarvisAgentic:
         if not path.exists():
             return ""
         try:
-            return path.read_text(encoding="utf-8")
+            text = path.read_text(encoding="utf-8")
+            from .diff import normalize_stored_jhb  # noqa: PLC0415
+
+            return normalize_stored_jhb(text)
         except Exception:
             return ""
 
@@ -1448,6 +2047,12 @@ class JarvisAgentic:
         # Path B (2026-05-09): JHB is durable-only; the conversation tail
         # is injected raw at chat time, not stored here. Strip any tail
         # block the encoder may still emit out of habit before persisting.
+        try:
+            from .diff import normalize_stored_jhb  # noqa: PLC0415
+
+            jhb = normalize_stored_jhb(jhb)
+        except Exception:
+            pass
         jhb = self._strip_tail_section(jhb)
         merged = unicodedata.normalize("NFC", jhb).strip()
         new_sha = self._content_sha1(merged)
@@ -1611,4 +2216,3 @@ class JarvisAgentic:
     def _content_sha1(content: str) -> str:
         normalized = unicodedata.normalize("NFC", content)
         return hashlib.sha1(normalized.encode("utf-8", errors="replace")).hexdigest()
-

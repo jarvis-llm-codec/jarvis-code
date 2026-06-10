@@ -20,6 +20,25 @@ providers:
     api_format: openai-completions
     models_endpoint: "/models"
 
+  ollama:
+    label: "Ollama (local)"
+    base_url: "http://localhost:11434/v1"
+    api_format: openai-completions
+    models_endpoint: "/models"
+
+  lmstudio:
+    label: "LM Studio (local)"
+    base_url: "http://localhost:1234/v1"
+    api_format: openai-completions
+    models_endpoint: "/models"
+
+  llamacpp:
+    label: "llama.cpp server (local)"
+    base_url: "http://localhost:8080/v1"
+    api_format: openai-completions
+    models_endpoint: "/models"
+    note: "Default port 8080; override base_url in your user catalog if different."
+
   openai-codex:
     label: "OpenAI (Subscription / OAuth)"
     auth_kind: oauth
@@ -48,6 +67,27 @@ providers:
     api_format: anthropic
     models_endpoint: "/models"
 
+  # Subscription credit backend: delegates the turn to the embedded Claude Agent
+  # SDK (auth via the logged-in Claude Code CLI, no API key). Mirrors the
+  # openai-codex (oauth) entry. No live /models endpoint — uses the static list.
+  anthropic-agent-sdk:
+    label: "Claude (Anthropic) Agent-SDK"
+    auth_kind: agent-sdk
+    api_format: anthropic
+    # chat/subagent run the agentic path. encoder is allowed too, but the apply
+    # gate + adapter restrict it to haiku-class models: the JHB encoder fires every
+    # turn, so a heavier model (opus/sonnet) would drain the subscription rate
+    # limit. Haiku lets a subscription-only user run the encoder with no second
+    # provider and no API key. (2026-06-16)
+    roles:
+      - chat
+      - subagent
+      - encoder
+    models_static:
+      - claude-opus-4-8
+      - claude-sonnet-4-6
+      - claude-haiku-4-5-20251001
+
   google:
     label: "Gemini (Google)"
     auth_env: GEMINI_API_KEY
@@ -72,6 +112,22 @@ providers:
       - glm-4.7
       - kimi-k2.5
       - minimax-M2.5
+
+  openrouter:
+    label: "OpenRouter (aggregator)"
+    auth_env: OPENROUTER_API_KEY
+    base_url: "https://openrouter.ai/api/v1"
+    api_format: openai-completions
+    models_endpoint: "/models"
+
+  nvidia-nim:
+    label: "NVIDIA NIM (image generation)"
+    auth_env: NVIDIA_API_KEY
+    base_url: "https://ai.api.nvidia.com/v1/genai"
+    api_format: openai-completions
+    models_endpoint: "/models"
+    roles:
+      - image
 
 recommended:
   chat:

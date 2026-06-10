@@ -492,6 +492,8 @@ export class AgentSession {
 
 	// Track last assistant message for auto-compaction check
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
+	private _emptyAssistantRetryAttempted = false;
+	private _emptyAssistantRetryInProgress = false;
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = (event: AgentEvent): void => {
@@ -522,7 +524,11 @@ export class AgentSession {
 		}
 
 		const lastAssistant = this._findLastAssistantInMessages(event.messages);
-		if (!lastAssistant || !this._isRetryableError(lastAssistant)) {
+		if (
+			!lastAssistant ||
+			(!this._isRetryableError(lastAssistant) &&
+				!this._isRetryableEmptyAssistantResponse(lastAssistant, event.messages))
+		) {
 			return;
 		}
 
@@ -546,6 +552,8 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
+			this._emptyAssistantRetryAttempted = false;
+			this._emptyAssistantRetryInProgress = false;
 			const messageText = this._getUserMessageText(event.message);
 			if (messageText) {
 				// Check steering queue first
@@ -602,13 +610,18 @@ export class AgentSession {
 
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
-				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
+				if (
+					assistantMsg.stopReason !== "error" &&
+					!this._isEmptyAssistantMessage(assistantMsg) &&
+					(this._retryAttempt > 0 || this._emptyAssistantRetryInProgress)
+				) {
 					this._emit({
 						type: "auto_retry_end",
 						success: true,
-						attempt: this._retryAttempt,
+						attempt: Math.max(this._retryAttempt, this._emptyAssistantRetryInProgress ? 1 : 0),
 					});
 					this._retryAttempt = 0;
+					this._emptyAssistantRetryInProgress = false;
 				}
 			}
 		}
@@ -622,6 +635,22 @@ export class AgentSession {
 			if (this._isRetryableError(msg)) {
 				const didRetry = await this._handleRetryableError(msg);
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
+			}
+
+			if (this._isRetryableEmptyAssistantResponse(msg, event.messages)) {
+				const didRetry = await this._handleEmptyAssistantResponse();
+				if (didRetry) return; // Retry was initiated, don't proceed to compaction
+			}
+
+			if (this._emptyAssistantRetryInProgress && this._isEmptyAssistantResponseTurn(msg, event.messages)) {
+				this._emit({
+					type: "auto_retry_end",
+					success: false,
+					attempt: 1,
+					finalError: "Empty assistant response",
+				});
+				this._retryAttempt = 0;
+				this._emptyAssistantRetryInProgress = false;
 			}
 
 			this._resolveRetry();
@@ -2488,6 +2517,47 @@ export class AgentSession {
 	// Auto-Retry
 	// =========================================================================
 
+	private _isEmptyAssistantMessage(message: AssistantMessage): boolean {
+		if (message.stopReason === "error" || message.stopReason === "aborted") return false;
+		if (message.content.length === 0) return true;
+		return message.content.every((block) => {
+			if (block.type === "text") return !block.text.trim();
+			if (block.type === "thinking") return !block.thinking.trim();
+			return false;
+		});
+	}
+
+	private _hasToolActivityAfterLastUser(messages: AgentMessage[]): boolean {
+		let lastUserIndex = -1;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i].role === "user") {
+				lastUserIndex = i;
+				break;
+			}
+		}
+
+		for (let i = lastUserIndex + 1; i < messages.length; i++) {
+			const message = messages[i];
+			if (message.role === "toolResult") return true;
+			if (message.role !== "assistant") continue;
+			const assistant = message as AssistantMessage;
+			if (assistant.content.some((block) => block.type === "toolCall")) return true;
+		}
+		return false;
+	}
+
+	private _isEmptyAssistantResponseTurn(message: AssistantMessage, messages: AgentMessage[]): boolean {
+		return this._isEmptyAssistantMessage(message) && !this._hasToolActivityAfterLastUser(messages);
+	}
+
+	private _isRetryableEmptyAssistantResponse(message: AssistantMessage, messages: AgentMessage[]): boolean {
+		return (
+			!this._emptyAssistantRetryAttempted &&
+			this.settingsManager.getRetryEnabled() &&
+			this._isEmptyAssistantResponseTurn(message, messages)
+		);
+	}
+
 	/**
 	 * Check if an error is retryable (overloaded, rate limit, server errors).
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
@@ -2586,12 +2656,70 @@ export class AgentSession {
 		return true;
 	}
 
+	private async _handleEmptyAssistantResponse(): Promise<boolean> {
+		const settings = this.settingsManager.getRetrySettings();
+		if (!settings.enabled || this._emptyAssistantRetryAttempted) {
+			this._resolveRetry();
+			return false;
+		}
+
+		if (!this._retryPromise) {
+			this._retryPromise = new Promise((resolve) => {
+				this._retryResolve = resolve;
+			});
+		}
+
+		this._emptyAssistantRetryAttempted = true;
+		this._emptyAssistantRetryInProgress = true;
+		this._retryAttempt = 0;
+		const delayMs = settings.baseDelayMs;
+
+		this._emit({
+			type: "auto_retry_start",
+			attempt: 1,
+			maxAttempts: 1,
+			delayMs,
+			errorMessage: "Empty assistant response",
+		});
+
+		const messages = this.agent.state.messages;
+		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+			this.agent.state.messages = messages.slice(0, -1);
+		}
+
+		this._retryAbortController = new AbortController();
+		try {
+			await sleep(delayMs, this._retryAbortController.signal);
+		} catch {
+			this._retryAbortController = undefined;
+			this._emptyAssistantRetryInProgress = false;
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: 1,
+				finalError: "Retry cancelled",
+			});
+			this._resolveRetry();
+			return false;
+		}
+		this._retryAbortController = undefined;
+
+		setTimeout(() => {
+			this.agent.continue().catch(() => {
+				// Retry failed - will be surfaced through the next agent_end.
+			});
+		}, 0);
+
+		return true;
+	}
+
 	/**
 	 * Cancel in-progress retry.
 	 */
 	abortRetry(): void {
 		this._retryAbortController?.abort();
 		// Note: _retryAttempt is reset in the catch block of _autoRetry
+		this._emptyAssistantRetryInProgress = false;
 		this._resolveRetry();
 	}
 

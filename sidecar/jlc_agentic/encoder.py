@@ -214,28 +214,28 @@ class TailEntry:
     created_at: float
 
 
-RECENT_TAIL_SYSTEM_PROMPT = """당신은 최근 N개 대화 턴을 시간순으로 압축합니다. 목적은 다음 턴이 직전 흐름을 잃지 않게 하는 것.
+RECENT_TAIL_SYSTEM_PROMPT = """You compress the most recent N conversation turns in chronological order. The goal is to keep the next turn from losing the immediately preceding flow.
 
-우선순위 (높음→낮음):
-1. assistant가 user에게 던진 open question
-2. 약속·결정·조건 ("X 하면 Y 박을게", "Z 확인 후 진행")
-3. 코딩 thread — in-flight 파일경로, 함수/심볼, 발생 에러, 적용 fix, 미결 edit, 다음 액션
-4. 감정 뉘앙스 (좌절·긴급·만족)
-5. 핵심 사실 1~2개 (다음 턴에서 load-bearing 한 경우만)
+Priority (high -> low):
+1. Open questions the assistant put to the user
+2. Promises, decisions, conditions ("if X then I'll do Y", "proceed after confirming Z")
+3. Coding thread — in-flight file paths, functions/symbols, errors hit, fixes applied, pending edits, next actions
+4. Emotional nuance (frustration, urgency, satisfaction)
+5. One or two key facts (only when load-bearing for the next turn)
 
-전부 drop:
-- 인사·맞장구 ("OK", "ㅇㅇ", "고마워", "넵")
-- JHB에 이미 있는 사실의 재진술
-- 일반 격려·찬사
-- 도구 호출의 raw args (이름·결과 요약만)
+Drop entirely:
+- Greetings and acknowledgements ("OK", "yep", "thanks", "got it")
+- Restatements of facts already in the JHB
+- Generic encouragement or praise
+- Raw tool-call args (keep only the name and a result summary)
 
-형식:
-- 입력된 각 턴마다 반드시 한 줄씩 출력한다.
-- 출력은 `{turn_id}: {한국어 한 줄 prose}` 형식 N행만 허용한다.
-- 추가 설명, 마크다운, 리스트, 코드블록 금지.
-- 입력 순서와 출력 순서를 반드시 유지한다.
+Format:
+- Output exactly one line per input turn.
+- Allowed output is only N lines of `{turn_id}: {one-line prose}`.
+- No extra explanation, markdown, lists, or code blocks.
+- Preserve the input order in the output.
 
-직전 턴일수록 다음 턴에 load-bearing 한 세부를 조금 더 보존하고, 오래된 턴은 더 압축해도 된다. 한국어 기본, 코드 토큰은 원문 그대로."""
+Preserve a little more next-turn-load-bearing detail for the most recent turns; older turns may be compressed harder. Mirror the user's language; keep code tokens verbatim."""
 
 
 class JLCEncoder:
@@ -362,6 +362,9 @@ class JLCEncoder:
         on_token: Callable[[str], None] | Callable[[str, str], None] | None = None,
         batch_turns: list[dict] | None = None,
         current_turn: int | None = None,
+        origin: str = "user",
+        origin_window: str | None = None,
+        origin_window_label: str | None = None,
     ) -> tuple[str, str, int]:
         """Return (updated mini-jhb markdown, previous project markdown, retry_count).
 
@@ -379,6 +382,12 @@ class JLCEncoder:
         active_target = target_tokens if (target_tokens and target_tokens > 0) else self.target_tokens
         self.last_jhb_target = active_target
         self.last_error = None
+        try:
+            from .diff import normalize_stored_jhb  # noqa: PLC0415
+
+            prev_jhb = normalize_stored_jhb(prev_jhb or "")
+        except Exception:
+            prev_jhb = prev_jhb or ""
         last_good = prev_jhb or ""
         last_good_project = prev_project_md or ""
 
@@ -414,7 +423,15 @@ class JLCEncoder:
             )
         else:
             user_prompt = self._build_user_prompt(
-                prev_jhb, user_msg, assistant_msg, prev_project_md, project_active, current_turn,
+                prev_jhb,
+                user_msg,
+                assistant_msg,
+                prev_project_md,
+                project_active,
+                current_turn,
+                origin=origin,
+                origin_window=origin_window,
+                origin_window_label=origin_window_label,
             )
 
         # Aggressive cap: encoder runs under per-conv lock that blocks the next
@@ -858,9 +875,9 @@ class JLCEncoder:
                 f"{item['assistant']}"
             )
         prompt = (
-            "압축할 최근 턴들입니다. 각 TURN마다 한 줄씩, 입력 순서 그대로 출력하세요.\n\n"
+            "These are the most recent turns to compress. Output one line per TURN, in input order.\n\n"
             + "\n\n---\n\n".join(blocks)
-            + f"\n\n각 줄 summary는 {min(max_tokens_per_turn, 220)} 토큰 이하."
+            + f"\n\nKeep each line's summary under {min(max_tokens_per_turn, 220)} tokens."
         )
         self.last_tail_in = self.count_tokens(RECENT_TAIL_SYSTEM_PROMPT) + self.count_tokens(prompt)
         self.last_tail_out = 0
@@ -1139,6 +1156,9 @@ class JLCEncoder:
         prev_project_md: str = "",
         project_active: bool = False,
         current_turn: int | None = None,
+        origin: str = "user",
+        origin_window: str | None = None,
+        origin_window_label: str | None = None,
     ) -> str:
         prev = prev_jhb.strip() if prev_jhb.strip() else "(none)"
         safe_user = unicodedata.normalize("NFC", user_msg)
@@ -1148,10 +1168,17 @@ class JLCEncoder:
             unicodedata.normalize("NFC", assistant_msg.strip())
         )
         turn_line = f"current_turn=t{current_turn}\n" if current_turn is not None else ""
+        origin_line = f"ORIGIN: {origin or 'user'}\n"
+        if origin_window:
+            origin_line += f"ORIGIN_WINDOW: {origin_window}\n"
+        if origin_window_label:
+            origin_line += f"ORIGIN_WINDOW_LABEL: {origin_window_label}\n"
         return (
             turn_line +
             "PREVIOUS JHB:\n"
             f"{prev}\n"
+            "\nNEW MESSAGE METADATA:\n"
+            f"{origin_line}"
             "\nNEW USER MESSAGE:\n"
             f"{safe_user}\n"
             "\nNEW ASSISTANT REPLY:\n"
@@ -1175,8 +1202,16 @@ class JLCEncoder:
             trimmed_assistant = JLCEncoder._neutralize_delimiters(
                 unicodedata.normalize("NFC", (t.get("assistant", "") or "").strip())
             )
+            origin = str(t.get("origin") or "user").strip() or "user"
+            origin_window = str(t.get("origin_window") or "").strip()
+            origin_window_label = str(t.get("origin_window_label") or "").strip()
+            metadata = f"ORIGIN: {origin}\n"
+            if origin_window:
+                metadata += f"ORIGIN_WINDOW: {origin_window}\n"
+            if origin_window_label:
+                metadata += f"ORIGIN_WINDOW_LABEL: {origin_window_label}\n"
             body_parts.append(
-                f"USER:\n{safe_user}\nASSISTANT:\n{trimmed_assistant}\n"
+                f"METADATA:\n{metadata}USER:\n{safe_user}\nASSISTANT:\n{trimmed_assistant}\n"
             )
         body = "\n".join(body_parts)
         turn_line = f"current_turn=t{current_turn}\n" if current_turn is not None else ""
@@ -1250,4 +1285,8 @@ class JLCEncoder:
             return raw[start:end].strip()
 
         jhb = _last_pair("<<<JHB>>>", "<<<END_JHB>>>") or ""
+        if jhb:
+            from .diff import strip_jhb_wrappers  # noqa: PLC0415
+
+            jhb = strip_jhb_wrappers(jhb)
         return jhb

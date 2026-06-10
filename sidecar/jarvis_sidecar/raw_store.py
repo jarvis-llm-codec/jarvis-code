@@ -9,19 +9,61 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+from .file_locks import cross_process_file_lock
+
 _SESSION_ID = "jarvis_session"
 _SESSION_FILE = "jarvis_session.jsonl"
 _SESSION_PAPERLOG_FILE = "jarvis_session.paperlog"
 _KST = timezone(timedelta(hours=9), name="KST")
+VALID_TURN_ORIGINS = frozenset({"user", "monologue_directive", "monologue_report"})
+_storage_root_cache_lock = threading.Lock()
+_storage_root_cache_key: str | None = None
+_storage_root_cache_value: Path | None = None
 
 
 def _storage_root() -> Path:
+    global _storage_root_cache_key, _storage_root_cache_value
     configured = os.environ.get("JARVIS_RAW_STORE")
-    if configured:
-        return Path(configured).expanduser()
-    # Phase 2: default to repo-local <repo>/data/raw-store. parents[2] from
-    # sidecar/jarvis_sidecar/raw_store.py is the repo root.
+    cache_key = configured or "__default__"
+    with _storage_root_cache_lock:
+        if _storage_root_cache_key == cache_key and _storage_root_cache_value is not None:
+            return _storage_root_cache_value
+        if configured:
+            root = Path(configured).expanduser()
+        else:
+            root = Path("~/.jarvis-code/raw-store").expanduser()
+            _ensure_legacy_default_raw_migrated(root)
+        _storage_root_cache_key = cache_key
+        _storage_root_cache_value = root
+        return root
+
+
+def _legacy_repo_storage_root() -> Path:
     return Path(__file__).resolve().parents[2] / "data" / "raw-store"
+
+
+def _legacy_pi_sidecar_storage_root() -> Path:
+    return Path("~/.jarvis-code/pi-sidecar").expanduser()
+
+
+def _ensure_legacy_default_raw_migrated(root: Path) -> None:
+    for legacy in (_legacy_repo_storage_root(), _legacy_pi_sidecar_storage_root()):
+        if legacy == root or not legacy.exists():
+            continue
+        try:
+            sources = [path for path in legacy.iterdir() if path.is_file() and path.suffix in {".jsonl", ".paperlog"}]
+        except OSError:
+            continue
+        for source in sources:
+            target = root / source.name
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with cross_process_file_lock(target):
+                    if target.exists():
+                        continue
+                    target.write_bytes(source.read_bytes())
+            except OSError:
+                continue
 
 
 def _bench_storage_root() -> Path:
@@ -31,6 +73,23 @@ def _bench_storage_root() -> Path:
     return _storage_root().parent / "conversation_bench_archive"
 
 
+def _conv_store_root() -> Path:
+    """Root for the CONVERSATION session files (``jarvis_session.jsonl`` and its
+    ``.paperlog``) ONLY.
+
+    A spawned worker sets ``JARVIS_CONV_STORE`` to a private per-slot path so its
+    conversation turns never enter the main window's shared trunk and it never
+    reads the main's turns (full bidirectional worker isolation). This is split
+    OUT of ``_storage_root()`` on purpose: the directive bus (``directives.py``
+    ``directives_path``/``directives_cursor_root``) keeps using ``_storage_root()``
+    so it stays SHARED across windows — cross-window comms must NOT be isolated.
+    Defaults to the shared raw-store root (the main window never sets the env)."""
+    configured = os.environ.get("JARVIS_CONV_STORE")
+    if configured:
+        return Path(configured).expanduser()
+    return _storage_root()
+
+
 def _sanitize_session_id(session_id: str | None) -> str:
     raw = str(session_id or _SESSION_ID).strip() or _SESSION_ID
     invalid = '<>:"/\\|?*'
@@ -38,17 +97,34 @@ def _sanitize_session_id(session_id: str | None) -> str:
     return raw.translate(table).replace("..", "_")
 
 
+def normalize_turn_origin(origin: str | None) -> str:
+    value = str(origin or "").strip()
+    return value if value in VALID_TURN_ORIGINS else "user"
+
+
+def normalize_origin_window(origin_window: str | None) -> str | None:
+    value = str(origin_window or "").strip()
+    if not value:
+        return None
+    value = value[:64]
+    if ".." in value:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9-]+", value):
+        return None
+    return value
+
+
 def _session_path(session_id: str | None) -> Path:
     safe = _sanitize_session_id(session_id)
     if safe == _SESSION_ID:
-        return _storage_root() / _SESSION_FILE
+        return _conv_store_root() / _SESSION_FILE
     return _bench_storage_root() / f"{safe}.jsonl"
 
 
 def _paperlog_path(session_id: str | None) -> Path:
     safe = _sanitize_session_id(session_id)
     if safe == _SESSION_ID:
-        return _storage_root() / _SESSION_PAPERLOG_FILE
+        return _conv_store_root() / _SESSION_PAPERLOG_FILE
     return _bench_storage_root() / f"{safe}.paperlog"
 
 
@@ -78,6 +154,9 @@ def append_raw_turn(
     tool_events: list[dict[str, Any]],
     llm_meta: dict[str, Any],
     session_id: str = _SESSION_ID,
+    origin: str = "user",
+    origin_window: str | None = None,
+    origin_window_label: str | None = None,
 ) -> Path:
     path = _session_path(session_id)
     root = path.parent
@@ -90,10 +169,14 @@ def append_raw_turn(
         "assistant": assistant_message,
         "tool_events": tool_events,
         "llm_meta": llm_meta,
+        "origin": normalize_turn_origin(origin),
+        "origin_window": normalize_origin_window(origin_window),
+        "origin_window_label": origin_window_label,
     }
     lock_key = str(path)
     with _get_path_lock(lock_key):
-        _append_jsonl_row(path, record)
+        with cross_process_file_lock(path):
+            _append_jsonl_row_unlocked(path, record)
     _append_project_raw_pointer(project_path, path, record)
     return path
 
@@ -120,7 +203,10 @@ def append_encoder_turn(
     }
     lock_key = str(path)
     with _get_path_lock(lock_key):
-        _append_jsonl_row(path, record)
+        with cross_process_file_lock(path):
+            if _encoder_turn_already_written(path, turn_id):
+                return path
+            _append_jsonl_row_unlocked(path, record)
     return path
 
 
@@ -144,7 +230,8 @@ def append_meter_turn(
     }
     lock_key = str(path)
     with _get_path_lock(lock_key):
-        _append_jsonl_row(path, record)
+        with cross_process_file_lock(path):
+            _append_jsonl_row_unlocked(path, record)
     return path
 
 
@@ -176,13 +263,19 @@ def append_paper_turn(
     )
     lock_key = str(path)
     with _get_path_lock(lock_key):
-        with path.open("a", encoding="utf-8", newline="\n") as fh:
-            fh.write(line)
-            fh.write("\n")
+        with cross_process_file_lock(path):
+            with path.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(line)
+                fh.write("\n")
+                fh.flush()
     return path
 
 
-def recent_turns(limit: int = 3, session_id: str = _SESSION_ID) -> list[dict[str, Any]]:
+def recent_turns(
+    limit: int = 3,
+    session_id: str = _SESSION_ID,
+    origin_window: str | None = None,
+) -> list[dict[str, Any]]:
     """Return the most recent N conversation turns (user/assistant pairs) in chronological order.
 
     Skips encoder/meter rows. Used to back-stop stale JHB when the encoder is mid-flight.
@@ -196,6 +289,7 @@ def recent_turns(limit: int = 3, session_id: str = _SESSION_ID) -> list[dict[str
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception:
         return []
+    window_filter = normalize_origin_window(origin_window)
     collected: list[dict[str, Any]] = []
     for line in reversed(lines):
         line = line.strip()
@@ -209,6 +303,10 @@ def recent_turns(limit: int = 3, session_id: str = _SESSION_ID) -> list[dict[str
             continue
         if "user" not in record and "assistant" not in record:
             continue
+        if window_filter is not None:
+            record_window = normalize_origin_window(record.get("origin_window"))
+            if record_window is not None and record_window != window_filter:
+                continue
         collected.append(record)
         if len(collected) >= limit:
             break
@@ -585,11 +683,18 @@ def _append_project_raw_pointer(project_path: str | None, log_path: Path, record
     timestamp = str(record.get("timestamp", ""))
     pointer = f"\n- {timestamp}: raw turn stored at `{log_path}`; user: {user}\n"
     with _get_path_lock(str(raw_md)):
-        with raw_md.open("a", encoding="utf-8", newline="\n") as fh:
-            fh.write(pointer)
+        with cross_process_file_lock(raw_md):
+            with raw_md.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(pointer)
+                fh.flush()
 
 
 def _append_jsonl_row(path: Path, record: dict[str, Any]) -> None:
+    with cross_process_file_lock(path):
+        _append_jsonl_row_unlocked(path, record)
+
+
+def _append_jsonl_row_unlocked(path: Path, record: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8", newline="\n") as fh:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         fh.flush()

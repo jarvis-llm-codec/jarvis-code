@@ -164,6 +164,15 @@ function readCommandOutput(
 	return undefined;
 }
 
+function getConfiguredNpmPrefix(args: string[]): string | undefined {
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--prefix") return args[i + 1];
+		if (arg.startsWith("--prefix=")) return arg.slice("--prefix=".length);
+	}
+	return undefined;
+}
+
 function getGlobalPackageRoots(method: InstallMethod, _packageName: string, npmCommand?: string[]): string[] {
 	switch (method) {
 		case "npm": {
@@ -179,11 +188,15 @@ function getGlobalPackageRoots(method: InstallMethod, _packageName: string, npmC
 				}
 				return roots;
 			}
+			const configuredPrefix = getConfiguredNpmPrefix(npmArgs);
+			const configuredPrefixRoots = configuredPrefix
+				? [join(configuredPrefix, "lib", "node_modules"), join(configuredPrefix, "node_modules")]
+				: [];
 			const root = readCommandOutput(command, [...npmArgs, "root", "-g"], {
 				requireSuccess: configured,
 			});
 			const inferred = configured ? undefined : getInferredNpmInstall();
-			return [root, inferred?.root].filter((x): x is string => !!x);
+			return [root, ...configuredPrefixRoots, inferred?.root].filter((x): x is string => !!x);
 		}
 		case "pnpm": {
 			const root = readCommandOutput("pnpm", ["root", "-g"]);

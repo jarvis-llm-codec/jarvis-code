@@ -127,6 +127,16 @@ def _validate_and_normalize(config: dict[str, Any]) -> None:
         if not isinstance(provider, dict):
             raise ValidationError(f"providers.{provider_name} must be a mapping")
 
+        # Adapter-based providers (e.g. `adapter: anthropic-agent-sdk`) are resolved
+        # directly by providers.get_llm and never flow through the litellm/OAuth
+        # router, so they carry no litellm_id / api_keys / oauth_provider. Exempt
+        # them from the router's per-model validation. (2026-06-15)
+        if provider.get("adapter"):
+            models = provider.get("models")
+            if models is not None and not isinstance(models, dict):
+                raise ValidationError(f"providers.{provider_name}.models must be a mapping")
+            continue
+
         oauth_provider = provider.get("oauth_provider")
         api_keys = provider.get("api_keys")
         if oauth_provider is not None:

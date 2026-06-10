@@ -5,23 +5,23 @@ import json
 import os
 import re
 import socket
-import subprocess
-import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html.parser import HTMLParser
-from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 
+from jlc_agentic.user_agent import JARVIS_CODE_USER_AGENT
 
-USER_AGENT = "JARVIS-Code/1.01 (+https://github.com/jarvis-llm-codec/jarvis-code)"
+USER_AGENT = JARVIS_CODE_USER_AGENT
 DEFAULT_TIMEOUT_SEC = 10.0
 DEFAULT_MAX_CHARS = 12_000
 MAX_FETCH_BYTES = 2_000_000
+MAX_REDIRECTS = 8
 PRIVATE_HOST_ERROR = "Private, loopback, and link-local hosts are blocked for this tool."
+REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
 OFFICIAL_DOC_HINT_DOMAINS = [
     "docs.python.org",
@@ -111,19 +111,11 @@ def web_fetch(url: str, *, max_chars: int = DEFAULT_MAX_CHARS, timeout_sec: floa
     url = str(url or "").strip()
     max_chars = max(500, min(int(max_chars or DEFAULT_MAX_CHARS), 50_000))
     timeout_sec = max(1.0, min(float(timeout_sec or DEFAULT_TIMEOUT_SEC), 30.0))
-    validation = _validate_public_url(url)
-    if validation:
-        return validation
 
-    try:
-        response = httpx.get(
-            url,
-            headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,text/plain,application/json,*/*"},
-            follow_redirects=True,
-            timeout=httpx.Timeout(timeout_sec),
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"web_fetch failed: {exc}", "url": url}
+    response_or_error = _fetch_public_url(url, timeout_sec=timeout_sec)
+    if isinstance(response_or_error, dict):
+        return response_or_error
+    response = response_or_error
 
     content = response.content[:MAX_FETCH_BYTES]
     content_type = response.headers.get("content-type", "")
@@ -143,6 +135,37 @@ def web_fetch(url: str, *, max_chars: int = DEFAULT_MAX_CHARS, timeout_sec: floa
         "truncated": len(response.content) > len(content) or len(str(parsed.get("text", ""))) > max_chars,
         "fetched_at": datetime.now(UTC).isoformat(),
     }
+
+
+def _fetch_public_url(url: str, *, timeout_sec: float) -> httpx.Response | dict[str, Any]:
+    current_url = url
+    # TODO: Close the remaining DNS-rebinding TOCTOU with a resolved-IP-pinning
+    # transport. For now every requested hop is DNS/private-range checked.
+    for _redirect_count in range(MAX_REDIRECTS + 1):
+        validation = _validate_public_url(current_url)
+        if validation:
+            return validation
+        try:
+            response = httpx.get(
+                current_url,
+                headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,text/plain,application/json,*/*"},
+                follow_redirects=False,
+                timeout=httpx.Timeout(timeout_sec),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"web_fetch failed: {exc}", "url": current_url}
+
+        final_url = str(response.url)
+        validation = _validate_public_url(final_url)
+        if validation:
+            return validation
+
+        location = response.headers.get("location", "")
+        if response.status_code not in REDIRECT_STATUS_CODES or not location:
+            return response
+        current_url = urljoin(final_url, location)
+
+    return {"ok": False, "error": f"too many redirects (>{MAX_REDIRECTS})", "url": current_url}
 
 
 def docs_search(
@@ -202,108 +225,6 @@ def package_info(ecosystem: str, package: str, *, include_release_notes: bool = 
     if ecosystem == "github":
         return _github_info(package, include_release_notes=include_release_notes)
     return {"ok": False, "error": "ecosystem must be one of: npm, pypi, github"}
-
-
-def browser_check(
-    url: str,
-    *,
-    wait_ms: int = 1000,
-    screenshot: bool = False,
-    timeout_sec: float = 15.0,
-    max_chars: int = 4_000,
-) -> dict[str, Any]:
-    url = str(url or "").strip()
-    validation = _validate_browser_url(url)
-    if validation:
-        return validation
-    wait_ms = max(0, min(int(wait_ms or 1000), 10_000))
-    timeout_sec = max(2.0, min(float(timeout_sec or 15.0), 45.0))
-    max_chars = max(500, min(int(max_chars or 4_000), 12_000))
-
-    http_result = _http_smoke(url, timeout_sec=timeout_sec, max_chars=max_chars)
-    browser = _find_browser_executable()
-    if not browser:
-        return {
-            "ok": bool(http_result.get("ok")),
-            "url": url,
-            "mode": "http_smoke",
-            "browser": None,
-            "http": http_result,
-            "warnings": ["No local Chrome/Edge/Chromium executable found; skipped headless browser render."],
-        }
-
-    with tempfile.TemporaryDirectory(prefix="jarvis-browser-check-") as tmp:
-        tmp_path = Path(tmp)
-        screenshot_path = tmp_path / "screenshot.png"
-        args = [
-            browser,
-            "--headless=new",
-            "--disable-gpu",
-            "--no-first-run",
-            "--disable-dev-shm-usage",
-            f"--virtual-time-budget={wait_ms}",
-        ]
-        if screenshot:
-            args.append(f"--screenshot={screenshot_path}")
-        args.extend(["--dump-dom", url])
-        try:
-            proc = subprocess.run(
-                args,
-                check=False,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout_sec,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "ok": bool(http_result.get("ok")),
-                "url": url,
-                "mode": "http_smoke",
-                "browser": browser,
-                "http": http_result,
-                "warnings": [f"Headless browser check failed: {exc}"],
-            }
-        dom = _clean_text(proc.stdout or "", max_chars=max_chars)
-        browser_result: dict[str, Any] = {
-            "returncode": proc.returncode,
-            "dom_chars": len(proc.stdout or ""),
-            "dom_preview": dom,
-            "stderr": _clean_text(proc.stderr or "", max_chars=2_000),
-        }
-        if screenshot and screenshot_path.exists():
-            browser_result["screenshot_bytes"] = screenshot_path.stat().st_size
-
-    ok = bool(http_result.get("ok")) and proc.returncode == 0 and len(proc.stdout or "") > 0
-    return {
-        "ok": ok,
-        "url": url,
-        "mode": "headless_browser",
-        "browser": browser,
-        "http": http_result,
-        "browser_result": browser_result,
-    }
-
-
-def _http_smoke(url: str, *, timeout_sec: float, max_chars: int) -> dict[str, Any]:
-    try:
-        response = httpx.get(
-            url,
-            headers={"User-Agent": USER_AGENT, "Accept": "text/html,text/plain,*/*"},
-            follow_redirects=True,
-            timeout=httpx.Timeout(timeout_sec),
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc), "url": url}
-    parsed = _extract_readable_text(response.text, response.headers.get("content-type", ""), max_chars=max_chars)
-    return {
-        "ok": 200 <= response.status_code < 400,
-        "status_code": response.status_code,
-        "final_url": str(response.url),
-        "content_type": response.headers.get("content-type", ""),
-        "title": parsed.get("title", ""),
-        "text_preview": parsed.get("text", "")[:max_chars],
-    }
 
 
 def _npm_info(package: str) -> dict[str, Any]:
@@ -448,16 +369,6 @@ def _validate_public_url(url: str) -> dict[str, Any] | None:
     return None
 
 
-def _validate_browser_url(url: str) -> dict[str, Any] | None:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return {"ok": False, "error": "url must be an absolute http(s) URL", "url": url}
-    host = parsed.hostname or ""
-    if _host_is_private(host) and not _is_loopback_host(host) and os.environ.get("JARVIS_BROWSER_CHECK_ALLOW_PRIVATE", "0") != "1":
-        return {"ok": False, "error": "browser_check allows public and loopback URLs by default; set JARVIS_BROWSER_CHECK_ALLOW_PRIVATE=1 for LAN/private hosts.", "url": url}
-    return None
-
-
 def _host_is_private(host: str) -> bool:
     host = host.strip().strip("[]").lower()
     if not host:
@@ -528,47 +439,3 @@ def _parse_github_repo(value: str) -> tuple[str, str] | None:
     if not match:
         return None
     return match.group(1), match.group(2).removesuffix(".git")
-
-
-def _find_browser_executable() -> str | None:
-    env_path = os.environ.get("JARVIS_BROWSER_PATH", "").strip()
-    if env_path and Path(env_path).exists():
-        return env_path
-
-    candidates: list[Path] = []
-    if os.name == "nt":
-        for root in [os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.environ.get("LocalAppData")]:
-            if not root:
-                continue
-            candidates.extend(
-                [
-                    Path(root) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
-                    Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe",
-                    Path(root) / "Chromium" / "Application" / "chrome.exe",
-                ]
-            )
-    candidates.extend(
-        [
-            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
-            Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
-            Path("/usr/bin/google-chrome"),
-            Path("/usr/bin/chromium"),
-            Path("/usr/bin/chromium-browser"),
-            Path("/usr/bin/microsoft-edge"),
-        ]
-    )
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    for name in ["msedge", "chrome", "google-chrome", "chromium", "chromium-browser", "microsoft-edge"]:
-        resolved = shutil_which(name)
-        if resolved:
-            return resolved
-    return None
-
-
-def shutil_which(name: str) -> str | None:
-    from shutil import which
-
-    return which(name)

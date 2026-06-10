@@ -72,8 +72,8 @@
 		"thinkingOff": "darkGray",
 		"thinkingMinimal": "#0066cc",
 		"thinkingLow": "#0088ff",
-		"thinkingMedium": "#3399ff",
-		"thinkingHigh": "#66aaff",
+		"thinkingMedium": "#00a86b",
+		"thinkingHigh": "#f0c674",
 		"thinkingXhigh": "#99bbff",
 
 		"bashMode": "green"

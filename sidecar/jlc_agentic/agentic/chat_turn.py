@@ -10,7 +10,7 @@ import time
 import threading
 from typing import Any
 
-from jlc_agentic.providers import get_llm
+from jlc_agentic.providers import get_llm, turn_context
 
 from .loop import AgenticLoop, _count_messages_tokens, _count_tokens, _msg_text
 
@@ -129,10 +129,14 @@ class ChatTurn:
         project_path: str | None = None,
         recall_block: str = "",
         prior_history: list[dict[str, Any]] | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         """Run one chat turn.
 
         prior_history contains prior assistant/tool/system history from older turns.
+        reasoning_effort is the route-derived effort (see turn_context.route_to_effort);
+        it is carried on turn_context so the chat provider can spend the right amount
+        of thinking for this turn. None leaves the provider/SDK default untouched.
         jhb prepend is applied once at the chat-turn boundary before loop execution.
         Encoder is invoked at chat-turn end ONLY when the turn completed cleanly
         (halt_reason in {final, max_iter}). timeout/swap/cancelled skips encoder
@@ -215,7 +219,21 @@ class ChatTurn:
                 conv_id=conv_id,
                 recall_block=recall_block,
             )
-            result = self.loop.run(prepared)
+            # Per-turn context for the Agent SDK adapter (anthropic-agent-sdk):
+            # set on THIS worker thread so the adapter (running inside loop.run on
+            # the same thread) can read cwd/conv_id/retriever and capture them into
+            # its MCP closures. No-op for every other provider. Cleared in finally
+            # so it never leaks across turns. (2026-06-15)
+            turn_context.set(
+                conv_id=conv_id,
+                project_root=project_path,
+                retriever=getattr(self.slim, "retriever", None),
+                reasoning_effort=reasoning_effort,
+            )
+            try:
+                result = self.loop.run(prepared)
+            finally:
+                turn_context.clear()
             result["turn_chat_in_tokens"] = max(
                 0,
                 int(result.get("cumulative_in_tokens") or getattr(self.loop, "cumulative_in_tokens", 0) or 0) - turn_chat_in_before,

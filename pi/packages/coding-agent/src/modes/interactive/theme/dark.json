@@ -24,7 +24,7 @@
 		"borderAccent": "cyan",
 		"borderMuted": "darkGray",
 		"success": "green",
-		"error": "red",
+		"error": "#e74856",
 		"warning": "yellow",
 		"muted": "gray",
 		"dim": "dimGray",
@@ -71,8 +71,8 @@
 		"thinkingOff": "darkGray",
 		"thinkingMinimal": "#6e6e6e",
 		"thinkingLow": "#5f87af",
-		"thinkingMedium": "#81a2be",
-		"thinkingHigh": "#b294bb",
+		"thinkingMedium": "#00a86b",
+		"thinkingHigh": "#f0c674",
 		"thinkingXhigh": "#d183e8",
 
 		"bashMode": "green"

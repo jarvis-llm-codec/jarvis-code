@@ -113,6 +113,17 @@ function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention 
 	return "short";
 }
 
+const OPENROUTER_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+
+function normalizeOpenRouterReasoningEffort(value: string | null | undefined): string | undefined {
+	if (value === null || value === undefined) return undefined;
+	const normalized = value.trim().toLowerCase();
+	if (!normalized) return undefined;
+	if (normalized === "off") return "none";
+	if (normalized === "max" || normalized === "maximum") return "xhigh";
+	return OPENROUTER_REASONING_EFFORTS.has(normalized) ? normalized : undefined;
+}
+
 export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenAICompletionsOptions> = (
 	model: Model<"openai-completions">,
 	context: Context,
@@ -366,6 +377,15 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 					if (choice?.delta?.tool_calls) {
 						for (const toolCall of choice.delta.tool_calls) {
 							const block = ensureToolCallBlock(toolCall);
+							// Pre-resolved native tool (regime-B / JLC sidecar ONLY): result rides
+							// custom sibling fields on the tool_call delta -> attach to the block so
+							// the agent loop renders the widget WITHOUT executing. OpenAI/regime-A
+							// streams never carry these -> undefined -> no effect.
+							const presolved = (toolCall as { jarvis_result?: unknown }).jarvis_result;
+							if (presolved !== undefined) {
+								block.presolvedResult = String(presolved);
+								block.presolvedIsError = (toolCall as { jarvis_is_error?: unknown }).jarvis_is_error === true;
+							}
 							if (!block.id && toolCall.id) {
 								block.id = toolCall.id;
 								toolCallBlocksById.set(toolCall.id, block);
@@ -603,11 +623,17 @@ function buildParams(
 		// OpenRouter normalizes reasoning across providers via a nested reasoning object.
 		const openRouterParams = params as typeof params & { reasoning?: { effort?: string } };
 		if (options?.reasoningEffort) {
-			openRouterParams.reasoning = {
-				effort: model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort,
-			};
+			const effort = normalizeOpenRouterReasoningEffort(
+				model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort,
+			);
+			if (effort) {
+				openRouterParams.reasoning = { effort };
+			}
 		} else if (model.thinkingLevelMap?.off !== null) {
-			openRouterParams.reasoning = { effort: model.thinkingLevelMap?.off ?? "none" };
+			const effort = normalizeOpenRouterReasoningEffort(model.thinkingLevelMap?.off ?? "none");
+			if (effort) {
+				openRouterParams.reasoning = { effort };
+			}
 		}
 	} else if (compat.thinkingFormat === "together" && model.reasoning) {
 		const togetherParams = params as Omit<typeof params, "reasoning_effort"> & {

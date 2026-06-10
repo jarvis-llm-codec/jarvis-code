@@ -4,11 +4,13 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from .config import get_effective_project_root, internal_memory_root, is_protected_path
+from .file_locks import cross_process_file_lock
 
 
 @dataclass
@@ -21,6 +23,10 @@ class WorkspaceProject:
 
 
 class RegistryCorruptError(RuntimeError):
+    pass
+
+
+class InvalidProjectNameError(ValueError):
     pass
 
 
@@ -55,15 +61,43 @@ class WorkspaceRegistry:
             self._stat_sig = None
             return
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            # utf-8-sig: PowerShell-created files carry a BOM by default on
+            # Windows; strict utf-8 made the registry unreadable and blocked
+            # register_project until manual repair (live, 2026-06-12).
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
             if not isinstance(raw, dict):
                 raise ValueError("registry root must be a JSON object")
-            self._data = raw
+            self._data = self._dedupe_loaded_data(raw)
             self._load_error = None
         except Exception as exc:
             self._data = {}
             self._load_error = f"{type(exc).__name__}: {exc}"
         self._stat_sig = self._current_stat_sig()
+
+    def _dedupe_loaded_data(self, raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        deduped: dict[str, dict[str, Any]] = {}
+        index: dict[tuple[str, str], str] = {}
+        project_keys: dict[str, set[tuple[str, str]]] = {}
+        for project_id, payload in raw.items():
+            if not isinstance(project_id, str) or not isinstance(payload, dict):
+                continue
+            project = self._project_from_raw(project_id, payload)
+            if project is None:
+                continue
+            keys = _dedupe_keys(project)
+            for key in keys:
+                existing_id = index.get(key)
+                if not existing_id or existing_id == project_id:
+                    continue
+                deduped.pop(existing_id, None)
+                for existing_key in project_keys.pop(existing_id, set()):
+                    if index.get(existing_key) == existing_id:
+                        index.pop(existing_key, None)
+            deduped[project_id] = asdict(project)
+            project_keys[project_id] = keys
+            for key in keys:
+                index[key] = project_id
+        return deduped
 
     def _maybe_reload(self) -> None:
         if self._current_stat_sig() != self._stat_sig:
@@ -87,29 +121,53 @@ class WorkspaceRegistry:
         }
 
     def save(self) -> None:
-        self._assert_writable()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with cross_process_file_lock(self.path):
+            if self._current_stat_sig() != self._stat_sig:
+                self._load()
+            self._raise_if_corrupt()
+            self._save_unlocked()
+
+    def _save_unlocked(self) -> None:
         text = json.dumps(self._data, ensure_ascii=False, indent=2)
         json.loads(text)
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(text + "\n", encoding="utf-8")
-        tmp_path.replace(self.path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(self.path.parent), prefix=f".{self.path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", errors="replace", newline="") as fh:
+                fh.write(text + "\n")
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp_name, str(self.path))
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
         self._stat_sig = self._current_stat_sig()
 
-    def _assert_writable(self) -> None:
-        self._maybe_reload()
+    def _raise_if_corrupt(self) -> None:
         if self.is_corrupt:
             raise RegistryCorruptError(
                 f"workspace registry is corrupt; refusing to overwrite {self.path}: {self._load_error}"
             )
 
+    def _assert_writable(self) -> None:
+        self._maybe_reload()
+        self._raise_if_corrupt()
+
     def remove_project(self, project_id: str) -> bool:
-        self._assert_writable()
-        if project_id not in self._data:
-            return False
-        self._data.pop(project_id, None)
-        self.save()
-        return True
+        with cross_process_file_lock(self.path):
+            self._load()
+            self._raise_if_corrupt()
+            if project_id not in self._data:
+                return False
+            self._data.pop(project_id, None)
+            self._save_unlocked()
+            return True
 
     def all(self) -> list[WorkspaceProject]:
         self._maybe_reload()
@@ -186,50 +244,96 @@ class WorkspaceRegistry:
         for project in self.all():
             name = project.name.casefold()
             slug = project.slug.casefold()
-            slug_pat = rf"(?<![\w-]){re.escape(slug)}(?![\w-])"
-            name_pat = rf"(?<![\w-]){re.escape(name)}(?![\w-])"
-            if (
-                project.project_id.casefold() in text
-                or re.search(slug_pat, text, re.ASCII)
-                or (name != slug and re.search(name_pat, text, re.ASCII))
-            ):
+            matched = project.project_id.casefold() in text
+            if not matched and _is_matchable_project_token(slug):
+                slug_pat = rf"(?<![\w-]){re.escape(slug)}(?![\w-])"
+                matched = re.search(slug_pat, text, re.ASCII) is not None
+            if not matched and name != slug and _is_matchable_project_token(name):
+                name_pat = rf"(?<![\w-]){re.escape(name)}(?![\w-])"
+                matched = re.search(name_pat, text, re.ASCII) is not None
+            if matched:
                 hits.append(project)
         return hits
 
     def create_or_get(self, name: str, *, code_path: str | None = None) -> WorkspaceProject:
-        self._assert_writable()
-        slug = slugify(name)
-        resolved_code_path = code_path
-        if resolved_code_path is None:
-            resolved_code_path, _warnings = resolve_code_path(name)
-        elif is_protected_path(resolved_code_path):
-            redirected, _warnings = resolve_code_path(name, explicit=resolved_code_path)
-            resolved_code_path = redirected
-        project_id = self._project_id_for(slug, resolved_code_path)
-        existing = self._data.get(project_id)
-        if existing:
-            project = self.get_by_id(project_id)
-            if project is None:
-                self._data.pop(project_id, None)
-            else:
-                if resolved_code_path and project.code_path != resolved_code_path:
-                    project.code_path = resolved_code_path
-                    self._data[project_id] = asdict(project)
-                    self.save()
-                return project
+        with cross_process_file_lock(self.path):
+            self._load()
+            self._raise_if_corrupt()
+            slug = slugify(name)
+            _raise_if_degenerate_project_slug(slug, name)
+            resolved_code_path = code_path
+            if resolved_code_path is None:
+                resolved_code_path, _warnings = resolve_code_path(name)
+            elif is_protected_path(resolved_code_path):
+                redirected, _warnings = resolve_code_path(name, explicit=resolved_code_path)
+                resolved_code_path = redirected
+            existing_project_id, existing_project = self._find_existing_by_slug_or_path(slug, resolved_code_path)
+            if existing_project is not None and existing_project_id is not None:
+                if resolved_code_path and not existing_project.code_path:
+                    existing_project.path = resolved_code_path
+                    existing_project.code_path = resolved_code_path
+                    self._data[existing_project_id] = asdict(existing_project)
+                    self._save_unlocked()
+                return existing_project
+            project_id = self._project_id_for(slug, resolved_code_path)
+            existing = self._data.get(project_id)
+            if existing:
+                project = self._project_from_raw(project_id, existing)
+                if project is None:
+                    self._data.pop(project_id, None)
+                else:
+                    if resolved_code_path and project.code_path != resolved_code_path:
+                        project.code_path = resolved_code_path
+                        self._data[project_id] = asdict(project)
+                        self._save_unlocked()
+                    return project
 
-        if resolved_code_path:
-            Path(resolved_code_path).mkdir(parents=True, exist_ok=True)
-        project = WorkspaceProject(
-            project_id=project_id,
-            name=name,
-            slug=slug,
-            path=resolved_code_path or str(self.root / slug),
-            code_path=resolved_code_path,
-        )
-        self._data[project_id] = asdict(project)
-        self.save()
-        return project
+            if resolved_code_path:
+                Path(resolved_code_path).mkdir(parents=True, exist_ok=True)
+            project = WorkspaceProject(
+                project_id=project_id,
+                name=name,
+                slug=slug,
+                path=resolved_code_path or str(self.root / slug),
+                code_path=resolved_code_path,
+            )
+            self._data[project_id] = asdict(project)
+            self._save_unlocked()
+            return project
+
+    def _find_existing_by_slug_or_path(
+        self,
+        slug: str,
+        code_path: str | None,
+    ) -> tuple[str | None, WorkspaceProject | None]:
+        requested_path = _resolve_path_str(code_path)
+        slug_key = slug.casefold()
+        for project_id, raw in list(self._data.items()):
+            if not isinstance(raw, dict):
+                continue
+            project = self._project_from_raw(project_id, raw)
+            if project is None:
+                continue
+            if project.slug.casefold() == slug_key:
+                return project_id, project
+            if requested_path and requested_path in {
+                _resolve_path_str(project.code_path),
+                _resolve_path_str(project.path),
+            }:
+                return project_id, project
+        return None, None
+
+    def _project_from_raw(self, project_id: str, raw: dict[str, Any]) -> WorkspaceProject | None:
+        try:
+            return WorkspaceProject(
+                project_id=project_id,
+                name=str(raw.get("name") or project_id),
+                slug=str(raw.get("slug") or project_id),
+                path=str(raw.get("path") or ""),
+                code_path=raw.get("code_path"),
+            )
+        except Exception:
+            return None
 
     def _project_id_for(self, slug: str, code_path: str | None) -> str:
         base = f"{slug}-{hashlib.sha1(slug.encode('utf-8')).hexdigest()[:6]}"
@@ -329,6 +433,55 @@ def slugify(name: str) -> str:
         return slug[:60]
     digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
     return f"project-{digest}"
+
+
+_COMMON_DEGENERATE_SLUGS = frozenset({
+    "app",
+    "web",
+})
+
+
+def _is_degenerate_project_slug(slug: str) -> bool:
+    value = str(slug or "").strip().casefold()
+    if not value:
+        return True
+    if value in _COMMON_DEGENERATE_SLUGS:
+        return True
+    if value.isdigit():
+        return True
+    if len(value) < 3:
+        return True
+    return False
+
+
+def _raise_if_degenerate_project_slug(slug: str, name: str) -> None:
+    if _is_degenerate_project_slug(slug):
+        raise InvalidProjectNameError(
+            f"project name {name!r} is too ambiguous; use a more specific project name"
+        )
+
+
+def _is_matchable_project_token(value: str) -> bool:
+    token = str(value or "").strip().casefold()
+    if _is_degenerate_project_slug(token):
+        return False
+    # Single-token generic names create false project matches in normal prose.
+    # Compound slugs like "web-game" or "3d-tetris" remain matchable.
+    if re.fullmatch(r"[a-z]+", token) and token in _COMMON_DEGENERATE_SLUGS:
+        return False
+    return True
+
+
+def _dedupe_keys(project: WorkspaceProject) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    slug = str(project.slug or "").strip().casefold()
+    if slug:
+        keys.add(("slug", slug))
+    for path in (project.code_path, project.path):
+        resolved = _resolve_path_str(path)
+        if resolved:
+            keys.add(("path", resolved))
+    return keys
 
 
 def _resolve_path_str(path: str | None) -> str | None:

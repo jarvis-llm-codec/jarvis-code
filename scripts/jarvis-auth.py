@@ -12,6 +12,8 @@ import argparse
 import getpass
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -25,8 +27,10 @@ PI_AGENT_DIR_DEFAULT = ROOT / "pi-agent"
 OPENAI_CODEX_PROVIDER = "openai-codex"
 OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.5"
 OPENAI_CODEX_ENCODER_MODEL = "gpt-5.4-mini"
+CLAUDE_CODE_OAUTH_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
 NO_CREDENTIAL_EXIT = 42
 MODEL_SETTING_EXIT = 43
+ADD_CUSTOM_PROVIDER = "__add_custom_provider__"
 
 BUILT_IN_MODEL_PROVIDERS = {
     "amazon-bedrock",
@@ -70,6 +74,7 @@ if str(SIDECAR_ROOT) not in sys.path:
 @dataclass
 class AuthState:
     oauth_configured: bool
+    claude_agent_sdk_configured: bool
     api_key_envs: list[str]
     roles: dict[str, str | None]
     chat_usable: bool
@@ -78,7 +83,7 @@ class AuthState:
 
     @property
     def has_any_llm_credential(self) -> bool:
-        return self.oauth_configured or bool(self.api_key_envs)
+        return self.oauth_configured or self.claude_agent_sdk_configured or bool(self.api_key_envs)
 
     @property
     def ready(self) -> bool:
@@ -169,10 +174,14 @@ def _load_credentials_into_env() -> None:
 
 
 def configured_api_key_envs(catalog: dict[str, Any] | None = None) -> list[str]:
+    from jarvis_sidecar.llm_setting import provider_supports_model_setting
+
     _load_credentials_into_env()
     cat = catalog or _load_catalog()
     envs: list[str] = []
     for cfg in cat.get("providers", {}).values():
+        if not isinstance(cfg, dict) or not provider_supports_model_setting(cfg):
+            continue
         env_name = cfg.get("auth_env")
         if isinstance(env_name, str) and env_name.strip() and os.environ.get(env_name, "").strip():
             envs.append(env_name)
@@ -219,6 +228,21 @@ def launchable_for_pi(provider: str, model: str) -> bool:
     return provider in BUILT_IN_MODEL_PROVIDERS or model_registered_in_pi_models(provider, model)
 
 
+def _agent_sdk_auth_available() -> bool:
+    """Claude Agent SDK auth: a headless CLAUDE_CODE_OAUTH_TOKEN, or an interactive
+    Claude Code login stored at ~/.claude/.credentials.json. 2026-06-20: expired
+    access-token-only files are not usable by headless workers."""
+    from jlc_agentic.claude_auth import agent_sdk_auth_available
+
+    return agent_sdk_auth_available()
+
+
+def _inspect_agent_sdk_auth():
+    from jlc_agentic.claude_auth import inspect_agent_sdk_auth
+
+    return inspect_agent_sdk_auth()
+
+
 def role_usable(role_value: str | None, *, catalog: dict[str, Any], oauth_configured: bool) -> tuple[bool, str]:
     role = split_role(role_value)
     if role is None:
@@ -232,6 +256,13 @@ def role_usable(role_value: str | None, *, catalog: dict[str, Any], oauth_config
         return True, "ok"
 
     provider_cfg = catalog.get("providers", {}).get(provider)
+    if isinstance(provider_cfg, dict) and provider_cfg.get("auth_kind") == "agent-sdk":
+        # Sidecar-routed (Claude Agent SDK): the JLC sidecar drives chat, so this
+        # is NOT a Pi-registered model. Gated on the Claude Code CLI login, not on
+        # pi-agent/models.json. (2026-06-15)
+        if not _agent_sdk_auth_available():
+            return False, "Claude Code OAuth token required (run `jarvis claude-login`)"
+        return True, "ok"
     env_name = provider_cfg.get("auth_env") if isinstance(provider_cfg, dict) else None
     if isinstance(env_name, str) and env_name.strip() and not os.environ.get(env_name, "").strip():
         return False, f"{env_name} is not configured"
@@ -241,11 +272,13 @@ def role_usable(role_value: str | None, *, catalog: dict[str, Any], oauth_config
 
 
 def inspect_auth_state(*, source_python_auth_path: Path | None = None) -> AuthState:
+    _load_credentials_into_env()
     catalog = _load_catalog()
     python_auth = source_python_auth_path or python_auth_path()
     oauth_configured = has_python_chatgpt_auth(python_auth)
     if oauth_configured:
         sync_python_chatgpt_auth_to_pi_auth(source_python_auth_path=python_auth)
+    claude_agent_sdk_configured = _agent_sdk_auth_available()
     api_envs = configured_api_key_envs(catalog)
     roles = current_roles()
     chat_ok, chat_reason = role_usable(roles.get("chat"), catalog=catalog, oauth_configured=oauth_configured)
@@ -253,6 +286,7 @@ def inspect_auth_state(*, source_python_auth_path: Path | None = None) -> AuthSt
     reason = "ok" if chat_ok and encoder_ok else f"chat: {chat_reason}; encoder: {encoder_reason}"
     return AuthState(
         oauth_configured=oauth_configured,
+        claude_agent_sdk_configured=claude_agent_sdk_configured,
         api_key_envs=api_envs,
         roles=roles,
         chat_usable=chat_ok,
@@ -280,6 +314,9 @@ def print_no_credentials_guidance() -> None:
     print("    jarvis gpt-login")
     print("    # if browser callback fails:")
     print("    jarvis gpt-login-device")
+    print()
+    print("  Claude OAuth subscription:")
+    print("    jarvis claude-login")
     print()
     print("  API key:")
     print("    jarvis api-key")
@@ -386,8 +423,231 @@ def cmd_gpt_logout(_args: argparse.Namespace) -> int:
     return code
 
 
+def claude_setup_token_command(*, prefer_npx: bool = False) -> list[str] | None:
+    if not prefer_npx:
+        claude = shutil.which("claude")
+        if claude:
+            return [claude, "setup-token"]
+    npx = shutil.which("npx")
+    if npx:
+        return [npx, "-y", "@anthropic-ai/claude-code", "setup-token"]
+    claude = shutil.which("claude")
+    if claude:
+        return [claude, "setup-token"]
+    return None
+
+
+def save_claude_oauth_token(token: str) -> Path:
+    from jarvis_sidecar.config import save_credential_env
+
+    path = save_credential_env(CLAUDE_CODE_OAUTH_ENV, token)
+    sync_claude_oauth_token_to_user_env(token)
+    return path
+
+
+def _env_flag_enabled(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def sync_claude_oauth_token_to_user_env(token: str) -> bool:
+    if not _env_flag_enabled("JARVIS_CLAUDE_LOGIN_SYNC_USER_ENV", True):
+        return False
+    return set_user_environment_variable(CLAUDE_CODE_OAUTH_ENV, token)
+
+
+def remove_claude_oauth_token_from_user_env() -> bool:
+    if not _env_flag_enabled("JARVIS_CLAUDE_LOGIN_SYNC_USER_ENV", True):
+        return False
+    return remove_user_environment_variable(CLAUDE_CODE_OAUTH_ENV)
+
+
+def set_user_environment_variable(name: str, value: str) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import winreg  # type: ignore[import-not-found]  # noqa: PLC0415
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            "Environment",
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as key:
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+        _broadcast_windows_environment_change()
+        return True
+    except Exception as exc:  # noqa: BLE001 - best-effort persistence
+        print(f"Warning: could not persist {name} to the Windows user environment: {exc}", file=sys.stderr)
+        return False
+
+
+def remove_user_environment_variable(name: str) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import winreg  # type: ignore[import-not-found]  # noqa: PLC0415
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            "Environment",
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as key:
+            try:
+                winreg.DeleteValue(key, name)
+            except FileNotFoundError:
+                pass
+        _broadcast_windows_environment_change()
+        return True
+    except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+        print(f"Warning: could not remove {name} from the Windows user environment: {exc}", file=sys.stderr)
+        return False
+
+
+def _broadcast_windows_environment_change() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes  # noqa: PLC0415
+
+        hwnd_broadcast = 0xFFFF
+        wm_settingchange = 0x001A
+        smto_abortifhung = 0x0002
+        ctypes.windll.user32.SendMessageTimeoutW(
+            hwnd_broadcast,
+            wm_settingchange,
+            0,
+            "Environment",
+            smto_abortifhung,
+            5000,
+            None,
+        )
+    except Exception:
+        pass
+
+
+def extract_claude_oauth_token(text: str) -> str | None:
+    match = re.search(r"\bsk-ant-oat[0-9A-Za-z_-]+\b", text)
+    return match.group(0) if match else None
+
+
+def redact_claude_oauth_tokens(text: str) -> str:
+    return re.sub(r"\bsk-ant-oat[0-9A-Za-z_-]+\b", "<CLAUDE_CODE_OAUTH_TOKEN>", text)
+
+
+def run_claude_setup_token_command(command: list[str]) -> tuple[int, str]:
+    try:
+        completed = subprocess.run(command, cwd=str(ROOT), text=True, capture_output=True)
+    except FileNotFoundError as exc:
+        print(f"Claude setup-token runner was not found: {exc.filename}", file=sys.stderr)
+        return 127, ""
+
+    combined = (completed.stdout or "") + (completed.stderr or "")
+    sanitized_stdout = redact_claude_oauth_tokens(completed.stdout or "")
+    sanitized_stderr = redact_claude_oauth_tokens(completed.stderr or "")
+    if sanitized_stdout:
+        print(sanitized_stdout, end="" if sanitized_stdout.endswith("\n") else "\n")
+    if sanitized_stderr:
+        print(sanitized_stderr, end="" if sanitized_stderr.endswith("\n") else "\n", file=sys.stderr)
+    return int(completed.returncode), combined
+
+
+def prompt_and_save_claude_token() -> bool:
+    token = getpass.getpass("Paste Claude Code OAuth token (hidden, leave empty to cancel): ").strip()
+    if not token:
+        return False
+    path = save_claude_oauth_token(token)
+    print(f"Saved {CLAUDE_CODE_OAUTH_ENV} to {path}.")
+    print("Synced it to the user environment for Claude Code CLI where supported.")
+    return True
+
+
+def cmd_claude_login(args: argparse.Namespace) -> int:
+    _load_credentials_into_env()
+    if args.token:
+        path = save_claude_oauth_token(args.token)
+        print(f"Saved {CLAUDE_CODE_OAUTH_ENV} to {path}.")
+        print("Synced it to the user environment for Claude Code CLI where supported.")
+        print("Next: restart JARVIS, then pick or spawn an anthropic-agent-sdk model.")
+        return 0
+
+    status = _inspect_agent_sdk_auth()
+    if status.available and not args.refresh:
+        print(f"Claude Agent SDK OAuth already available ({status.source}: {status.reason}).")
+        print("Use --refresh to run Claude setup-token anyway.")
+        return 0
+
+    if not args.no_setup_token:
+        command = claude_setup_token_command(prefer_npx=args.npx)
+        if command is None:
+            print("Claude Code setup-token runner was not found.", file=sys.stderr)
+            print("Install Node.js/npm for npx, or install Claude Code CLI, then retry.", file=sys.stderr)
+            return 2
+        print("Starting Claude Code setup-token...")
+        print("JARVIS will capture and save the token automatically; token text is redacted from this output.")
+        code, output = run_claude_setup_token_command(command)
+        if code != 0:
+            return code
+        token = extract_claude_oauth_token(output)
+        if token:
+            path = save_claude_oauth_token(token)
+            print(f"Saved {CLAUDE_CODE_OAUTH_ENV} to {path}.")
+            print("Synced it to the user environment for Claude Code CLI where supported.")
+            print("Claude Agent SDK OAuth is ready.")
+            print("Next: restart JARVIS, then pick or spawn an anthropic-agent-sdk model.")
+            return 0
+        _load_credentials_into_env()
+        status = _inspect_agent_sdk_auth()
+        if status.available:
+            print(f"Claude Agent SDK OAuth is ready ({status.source}: {status.reason}).")
+            return 0
+
+    print("JARVIS still does not see a usable Claude Agent SDK OAuth token.")
+    print("Reason:", _inspect_agent_sdk_auth().reason)
+    print("Automatic token capture did not find a token in setup-token output.")
+    if prompt_and_save_claude_token():
+        status = _inspect_agent_sdk_auth()
+        if status.available:
+            print("Claude Agent SDK OAuth is ready.")
+            print("Next: restart JARVIS, then pick or spawn an anthropic-agent-sdk model.")
+            return 0
+    print("Claude OAuth token was not saved.", file=sys.stderr)
+    return 2
+
+
+def cmd_claude_status(_args: argparse.Namespace) -> int:
+    _load_credentials_into_env()
+    status = _inspect_agent_sdk_auth()
+    print("Claude Agent SDK OAuth:")
+    print(f"  available: {status.available}")
+    print(f"  source: {status.source}")
+    print(f"  reason: {status.reason}")
+    if status.credentials_path:
+        print(f"  credentials: {status.credentials_path}")
+    if status.has_refresh_token is not None:
+        print(f"  refresh token: {'yes' if status.has_refresh_token else 'no'}")
+    return 0 if status.available else 1
+
+
+def cmd_claude_logout(_args: argparse.Namespace) -> int:
+    from jarvis_sidecar.config import remove_credential_env
+
+    path = remove_credential_env(CLAUDE_CODE_OAUTH_ENV)
+    remove_claude_oauth_token_from_user_env()
+    print(f"Removed saved {CLAUDE_CODE_OAUTH_ENV} from {path}.")
+    print(f"Removed {CLAUDE_CODE_OAUTH_ENV} from the user environment where supported.")
+    print("Claude Code CLI credentials under ~/.claude were left untouched.")
+    return 0
+
+
 def api_key_targets(catalog: dict[str, Any] | None = None) -> list[tuple[str, dict[str, Any]]]:
     cat = catalog or _load_catalog()
+    from jarvis_sidecar.llm_setting import load_repo_providers
+
+    repo_provider_ids = set(load_repo_providers())
     targets: list[tuple[str, dict[str, Any]]] = []
     for provider_id, cfg in cat.get("providers", {}).items():
         if cfg.get("enabled") is False or cfg.get("auth_kind") == "oauth":
@@ -395,8 +655,11 @@ def api_key_targets(catalog: dict[str, Any] | None = None) -> list[tuple[str, di
         env_name = cfg.get("auth_env")
         if not isinstance(env_name, str) or not env_name.strip():
             continue
-        targets.append((provider_id, cfg))
-    targets.sort(key=lambda item: str(item[1].get("label", item[0])).lower())
+        entry = dict(cfg)
+        source = "bundled" if provider_id in repo_provider_ids else "custom"
+        entry["source"] = source
+        entry["custom"] = source == "custom"
+        targets.append((provider_id, entry))
     return targets
 
 
@@ -411,13 +674,14 @@ def select_api_key_target(provider: str | None) -> tuple[str, dict[str, Any]] | 
         print(f"Unknown API-key provider/env: {provider}", file=sys.stderr)
         return None
 
-    print("JARVIS API key setup")
+    print("API key setup — select a provider:")
     print()
     for idx, (provider_id, cfg) in enumerate(targets, start=1):
         label = cfg.get("label", provider_id)
-        env_name = cfg.get("auth_env")
-        configured = " configured" if os.environ.get(str(env_name), "").strip() else ""
-        print(f"  {idx}. {label} ({env_name}){configured}")
+        print(f"  {idx}. {api_key_target_label(provider_id, cfg)}")
+    add_idx = len(targets) + 1
+    print("  " + "─" * 29)
+    print(f"  {add_idx}. [+] Add custom provider...")
     print()
     raw = input("Choose provider number: ").strip()
     try:
@@ -425,10 +689,21 @@ def select_api_key_target(provider: str | None) -> tuple[str, dict[str, Any]] | 
     except ValueError:
         print("Invalid provider number.", file=sys.stderr)
         return None
+    if choice == add_idx:
+        return ADD_CUSTOM_PROVIDER, {}
     if choice < 1 or choice > len(targets):
         print("Provider number out of range.", file=sys.stderr)
         return None
     return targets[choice - 1]
+
+
+def api_key_target_label(provider_id: str, cfg: dict[str, Any]) -> str:
+    is_custom = bool(cfg.get("custom") or cfg.get("source") == "custom")
+    configured = bool(os.environ.get(str(cfg.get("auth_env", "")), "").strip())
+    marker = "[*]" if is_custom and configured else "[v]" if configured else "[ ]"
+    custom = "  (custom)" if is_custom else ""
+    status = "key set" if configured else "no key"
+    return f"{marker} {cfg.get('label', provider_id)}{custom}   {status}"
 
 
 def cmd_api_key(args: argparse.Namespace) -> int:
@@ -437,25 +712,103 @@ def cmd_api_key(args: argparse.Namespace) -> int:
     if target is None:
         return 2
     provider_id, cfg = target
+    if provider_id == ADD_CUSTOM_PROVIDER:
+        return cmd_api_key_add_custom(args)
+    if cfg.get("custom") and args.provider is None:
+        action = input("Choose action: [1] Change key  [2] Remove: ").strip()
+        if action == "2":
+            return cmd_api_key_remove_custom(provider_id, cfg)
+        if action not in {"", "1"}:
+            print("Invalid action.", file=sys.stderr)
+            return 2
+    return save_api_key_for_target(provider_id, cfg, args.value)
+
+
+def save_api_key_for_target(provider_id: str, cfg: dict[str, Any], value_arg: str | None) -> int:
     env_name = str(cfg["auth_env"])
     label = str(cfg.get("label", provider_id))
-    value = args.value or getpass.getpass(f"Enter {label} API key ({env_name}): ").strip()
+    value = value_arg or getpass.getpass(f"Enter {label} API key ({env_name}): ").strip()
     if not value:
         print("API key was empty; nothing saved.", file=sys.stderr)
         return 2
 
     from jarvis_sidecar.config import save_credential_env
-    from jarvis_sidecar.llm_setting import fetch_models
+    from jarvis_sidecar.llm_setting import fetch_models, provider_supports_model_setting
 
     path = save_credential_env(env_name, value)
-    models = fetch_models(provider_id, cfg)
-    if models:
+    if not provider_supports_model_setting(cfg):
+        print(f"Saved {env_name} to {path}. Live model validation skipped for this provider.")
+    elif models := fetch_models(provider_id, cfg):
         print(f"Saved {env_name} to {path}. Validation ok ({len(models)} models).")
     else:
         print(f"Saved {env_name} to {path}. Live model validation did not return models.")
     print()
     print("Next:")
     print("    jarvis model-setting")
+    return 0
+
+
+def cmd_api_key_add_custom(args: argparse.Namespace) -> int:
+    from jarvis_sidecar.llm_setting import (
+        custom_provider_auth_env,
+        custom_provider_id_from_label,
+        find_provider_duplicate,
+        upsert_user_provider,
+    )
+
+    base_url = input("Custom provider base URL: ").strip().rstrip("/")
+    if not base_url:
+        print("Base URL was empty; nothing saved.", file=sys.stderr)
+        return 2
+    label = input("Custom provider display name: ").strip()
+    if not label:
+        print("Provider label was empty; nothing saved.", file=sys.stderr)
+        return 2
+    provider_id = custom_provider_id_from_label(label)
+    duplicate = find_provider_duplicate(provider_id, base_url)
+    if duplicate is not None:
+        existing_id, existing_cfg = duplicate
+        answer = input("already exists — change its key? [y/N]: ").strip().lower()
+        if answer not in {"y", "yes"}:
+            return 0
+        return save_api_key_for_target(existing_id, existing_cfg, args.value)
+
+    env_name = custom_provider_auth_env(provider_id)
+    cfg = {
+        "label": label,
+        "auth_env": env_name,
+        "base_url": base_url,
+        "api_format": "openai-completions",
+        "models_endpoint": "/models",
+    }
+    value = args.value or getpass.getpass(f"Enter {label} API key: ").strip()
+    if not value:
+        print("API key was empty; nothing saved.", file=sys.stderr)
+        return 2
+    try:
+        upsert_user_provider(provider_id, cfg)
+    except (OSError, ValueError) as exc:
+        print(f"Custom provider save failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    return save_api_key_for_target(provider_id, cfg, value)
+
+
+def cmd_api_key_remove_custom(provider_id: str, cfg: dict[str, Any]) -> int:
+    answer = input(f"Remove {cfg.get('label', provider_id)} and its saved API key? [y/N]: ").strip().lower()
+    if answer not in {"y", "yes"}:
+        return 0
+    from jarvis_sidecar.config import remove_credential_env
+    from jarvis_sidecar.llm_setting import remove_user_provider
+
+    try:
+        _path, removed = remove_user_provider(provider_id)
+        env_name = removed.get("auth_env") if isinstance(removed, dict) else cfg.get("auth_env")
+        if isinstance(env_name, str) and env_name.strip():
+            remove_credential_env(env_name)
+    except (OSError, ValueError) as exc:
+        print(f"Custom provider remove failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    print(f"Removed {cfg.get('label', provider_id)}. Pick models with /model-setting.")
     return 0
 
 
@@ -487,6 +840,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     gpt_logout = sub.add_parser("gpt-logout")
     gpt_logout.set_defaults(func=cmd_gpt_logout)
+
+    claude_login = sub.add_parser("claude-login")
+    claude_login.add_argument("--token", help=f"save an existing {CLAUDE_CODE_OAUTH_ENV} without running setup-token")
+    claude_login.add_argument("--refresh", action="store_true", help="run setup-token even if Claude auth already looks usable")
+    claude_login.add_argument("--no-setup-token", action="store_true", help="skip running setup-token and prompt for a token")
+    claude_login.add_argument("--npx", action="store_true", help="prefer npx @anthropic-ai/claude-code over an installed claude command")
+    claude_login.set_defaults(func=cmd_claude_login)
+
+    anthropic_login = sub.add_parser("anthropic-login")
+    anthropic_login.add_argument("--token", help=f"save an existing {CLAUDE_CODE_OAUTH_ENV} without running setup-token")
+    anthropic_login.add_argument("--refresh", action="store_true", help="run setup-token even if Claude auth already looks usable")
+    anthropic_login.add_argument("--no-setup-token", action="store_true", help="skip running setup-token and prompt for a token")
+    anthropic_login.add_argument("--npx", action="store_true", help="prefer npx @anthropic-ai/claude-code over an installed claude command")
+    anthropic_login.set_defaults(func=cmd_claude_login)
+
+    claude_status = sub.add_parser("claude-auth-status")
+    claude_status.set_defaults(func=cmd_claude_status)
+
+    claude_logout = sub.add_parser("claude-logout")
+    claude_logout.set_defaults(func=cmd_claude_logout)
 
     api_key = sub.add_parser("api-key")
     api_key.add_argument("provider", nargs="?", help="provider id or env name, e.g. openai or OPENAI_API_KEY")

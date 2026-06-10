@@ -1,8 +1,8 @@
 JARVIS Code release manifest
-Generated: 2026-06-10T02:57:24Z
-Source root: C:\jarvis-code_v1.01
-Source root commit: a68fe8e13b5bef8ffafa68e1a157a48bdb889a52
-Pi engine commit: 6f09490175f7298a3e7176b6cce5ed64dbdc3126
+Generated: 2026-06-29T06:49:14Z
+Source root: (development checkout)
+Source root commit: 76144df4a9903eda98e065d7ff4f9a821bd1310d
+Pi engine commit: 3ae8efa3383c5038dbf14f9ac45c4b29e34e5f26
 GitHub repo: jarvis-llm-codec/jarvis-code
 Branch: main
 
@@ -22,6 +22,7 @@ Excluded:
 - data runtime state
 - pi-agent local auth/settings/models/sessions/copied resources
 - pi/node_modules and sidecar/.venv
-- caches, logs, tests, and generated build output
+- caches, logs, tests, and uncommitted generated build output
+- release builds require clean root and pi source worktrees
 
 This folder is generated. Update the development checkout, then rebuild.

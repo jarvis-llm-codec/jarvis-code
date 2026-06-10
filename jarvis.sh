@@ -1,7 +1,17 @@
 #!/usr/bin/env sh
 set -eu
 
-ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Resolve symlinks so an installed `jarvis` shim (e.g. ~/.local/bin/jarvis ->
+# .../jarvis.sh, as created by install.sh) still locates the real repo root.
+SCRIPT_PATH=$0
+while [ -h "$SCRIPT_PATH" ]; do
+  link=$(readlink "$SCRIPT_PATH")
+  case $link in
+    /*) SCRIPT_PATH=$link ;;
+    *) SCRIPT_PATH=$(dirname -- "$SCRIPT_PATH")/$link ;;
+  esac
+done
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
 
 if command -v python3 >/dev/null 2>&1; then
   PYTHON_BIN=python3

@@ -39,6 +39,10 @@ export class ToolExecutionComponent extends Container {
 	};
 	private convertedImages: Map<number, { data: string; mimeType: string }> = new Map();
 	private hideComponent = false;
+	// regime-B (anthropic-agent-sdk) presolved: the tool already ran upstream and
+	// the disk is at its post-edit state. Exposed via ToolRenderContext.alreadyApplied
+	// so the edit renderer diffs args directly instead of re-reading the file.
+	private alreadyApplied = false;
 
 	constructor(
 		toolName: string,
@@ -125,6 +129,7 @@ export class ToolExecutionComponent extends Container {
 			cwd: this.cwd,
 			executionStarted: this.executionStarted,
 			argsComplete: this.argsComplete,
+			alreadyApplied: this.alreadyApplied,
 			isPartial: this.isPartial,
 			expanded: this.expanded,
 			showImages: this.showImages,
@@ -157,6 +162,16 @@ export class ToolExecutionComponent extends Container {
 
 	setArgsComplete(): void {
 		this.argsComplete = true;
+		this.updateDisplay();
+		this.ui.requestRender();
+	}
+
+	/**
+	 * regime-B (presolved): mark that this tool was already executed upstream so
+	 * the edit renderer diffs args directly (no file re-read). Idempotent.
+	 */
+	markPresolved(): void {
+		this.alreadyApplied = true;
 		this.updateDisplay();
 		this.ui.requestRender();
 	}

@@ -24,7 +24,7 @@ The Python sidecar lives under `sidecar/`. It provides:
 - project switch and creation support
 - raw turn storage
 - JHB/JLC memory retrieval
-- web fetch, official-doc search, package metadata, and browser smoke-check helpers
+- web search, web fetch, official-doc search, and package metadata helpers
 - provider role configuration
 - `/context`, `/turn`, and related endpoints
 
@@ -34,8 +34,10 @@ External-information tools are split by job:
 - `web_fetch`: read a specific public URL after search or when the user gives a link
 - `docs_search`: search official documentation domains and optionally fetch top results
 - `package_info`: read npm, PyPI, or GitHub release metadata in structured form
-- `browser_check`: smoke-check a public or localhost URL; uses a local headless
-  Chrome/Edge/Chromium when available and falls back to HTTP checks otherwise
+
+Rendered browser inspection is not exposed in this JLC build. There is no
+`browser_check` helper, and routine localhost, screenshot, canvas, Puppeteer, or
+headless-browser verification should not be reintroduced as a replacement path.
 
 The launcher starts the sidecar before starting the terminal agent.
 

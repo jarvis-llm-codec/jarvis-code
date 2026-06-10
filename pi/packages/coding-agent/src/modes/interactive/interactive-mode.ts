@@ -305,6 +305,11 @@ export class InteractiveMode {
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
 
+	// regime-B (presolved) tool calls whose inline result has already been attached
+	// to the card during streaming (message_update). Prevents re-attaching on every
+	// streaming tick; cleared at agent_end (turn boundary).
+	private streamedPresolvedResults = new Set<string>();
+
 	// Tool output expansion state
 	private toolOutputExpanded = false;
 
@@ -2804,6 +2809,7 @@ export class InteractiveMode {
 		switch (event.type) {
 			case "agent_start":
 				this.pendingTools.clear();
+				this.streamedPresolvedResults.clear();
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
 				}
@@ -2881,8 +2887,9 @@ export class InteractiveMode {
 					for (const content of this.streamingMessage.content) {
 						if (content.type === "toolCall") {
 							if (this.shouldHideToolFromTranscript(content.name)) continue;
-							if (!this.pendingTools.has(content.id)) {
-								const component = new ToolExecutionComponent(
+							let component = this.pendingTools.get(content.id);
+							if (!component) {
+								component = new ToolExecutionComponent(
 									content.name,
 									content.id,
 									content.arguments,
@@ -2898,10 +2905,38 @@ export class InteractiveMode {
 								this.chatContainer.addChild(component);
 								this.pendingTools.set(content.id, component);
 							} else {
-								const component = this.pendingTools.get(content.id);
-								if (component) {
-									component.updateArgs(content.arguments);
-								}
+								component.updateArgs(content.arguments);
+							}
+							// regime-B (anthropic-agent-sdk): the SDK already executed this
+							// tool upstream and the sidecar shipped the result inline on the
+							// tool_call block (presolvedResult). Attach it NOW so the card
+							// expands as it streams in, instead of popping open in a batch
+							// after the turn (when tool_execution_end fires post-stream for
+							// the immediate/presolved outcome). Gated on presolvedResult, a
+							// sidecar-only field -> regime-A tool calls never carry it, so
+							// their rendering is byte-identical. The Set keeps this to one
+							// attach per card; the later tool_execution_end re-sets the same
+							// result idempotently (same content + isError -> same display).
+							if (content.presolvedResult !== undefined && !this.streamedPresolvedResults.has(content.id)) {
+								this.streamedPresolvedResults.add(content.id);
+								component.updateResult({
+									content: [{ type: "text", text: content.presolvedResult }],
+									isError: content.presolvedIsError ?? false,
+								});
+								// regime-B (presolved): args arrive complete in one chunk and the
+								// SDK already executed the tool (disk is at its final state), so
+								// mark args complete NOW. This unblocks edit's argsComplete-gated
+								// computeEditsDiff (edit.ts:450) immediately instead of letting it
+								// fire in a batch at message_end (the "뿅" all-cards-expand). read/
+								// bash render result text directly (no argsComplete gate) so they
+								// were already live; this brings edit's diff to parity. The
+								// message_end setArgsComplete (safety net) stays; edit.ts's
+								// !preview && !previewPending guard makes the recompute idempotent.
+								// markPresolved BEFORE setArgsComplete so alreadyApplied is set
+								// when setArgsComplete's updateDisplay runs the edit renderCall ->
+								// it takes the args-diff path (no file re-read = no false red error).
+								component.markPresolved();
+								component.setArgsComplete();
 							}
 						}
 					}
@@ -2929,7 +2964,11 @@ export class InteractiveMode {
 					}
 					this.streamingComponent.setFinalized(true);
 					this.streamingComponent.setShowFinalizedThinking(true);
-					this.streamingComponent.updateContent(this.streamingMessage);
+					if (this.assistantMessageHasPresolvedToolCall(this.streamingMessage)) {
+						this.finalizeRegimeBMessageLayout(this.streamingComponent, this.streamingMessage);
+					} else {
+						this.streamingComponent.updateContent(this.streamingMessage);
+					}
 
 					if (this.streamingMessage.stopReason === "aborted" || this.streamingMessage.stopReason === "error") {
 						if (!errorMessage) {
@@ -3160,6 +3199,15 @@ export class InteractiveMode {
 		return textBlocks.map((c) => (c as { text: string }).text).join("");
 	}
 
+	private shouldHideInternalJarvisUserMessage(text: string): boolean {
+		const trimmed = text.trimStart();
+		return (
+			trimmed.startsWith("[JLC WORKER-TOOLS RETRY]") ||
+			trimmed.startsWith("[JLC ROUTE-SKILL RETRY]") ||
+			trimmed.startsWith("[JLC NO-ACTION RETRY]")
+		);
+	}
+
 	/**
 	 * Show a status message in the chat.
 	 *
@@ -3230,6 +3278,9 @@ export class InteractiveMode {
 			}
 			case "user": {
 				const textContent = this.getUserMessageText(message);
+				if (this.shouldHideInternalJarvisUserMessage(textContent)) {
+					break;
+				}
 				if (textContent) {
 					if (this.chatContainer.children.length > 0) {
 						this.chatContainer.addChild(new Spacer(1));
@@ -3280,6 +3331,53 @@ export class InteractiveMode {
 			default: {
 				const _exhaustive: never = message;
 			}
+		}
+	}
+
+	/**
+	 * regime-B (anthropic-agent-sdk) detector: the SDK runs its own loop and ships
+	 * already-executed tool results inline on the tool_call blocks (presolvedResult).
+	 * regime-A / pi-native providers never carry this -> false -> existing path.
+	 */
+	private assistantMessageHasPresolvedToolCall(message: AssistantMessage): boolean {
+		return message.content.some((c) => c.type === "toolCall" && c.presolvedResult !== undefined);
+	}
+
+	/**
+	 * regime-B layout fix (T#2): the SDK packs thinking, tool calls, AND the final
+	 * conclusion text into ONE assistant message. The default streaming path renders
+	 * all of that text in a single component placed ABOVE the tool widgets, so the
+	 * conclusion floats over the widgets. Split the message at the LAST tool call:
+	 * pre-tool blocks (thinking + any pre-amble) stay in the top component; the text
+	 * the SDK emitted AFTER its tools (the conclusion) moves to a new component
+	 * appended BELOW the already-rendered tool widgets — matching regime-A, where the
+	 * conclusion is a separate, later message.
+	 */
+	private finalizeRegimeBMessageLayout(component: AssistantMessageComponent, message: AssistantMessage): void {
+		let lastToolIndex = -1;
+		for (let i = 0; i < message.content.length; i++) {
+			if (message.content[i].type === "toolCall") lastToolIndex = i;
+		}
+		if (lastToolIndex === -1) {
+			component.updateContent(message);
+			return;
+		}
+		const preBlocks = message.content.slice(0, lastToolIndex + 1);
+		const postBlocks = message.content.slice(lastToolIndex + 1);
+		// toolCall blocks inside preBlocks are ignored by updateContent (rendered as
+		// separate widgets); this keeps thinking + any pre-tool text up top.
+		component.updateContent({ ...message, content: preBlocks });
+		const hasConclusion = postBlocks.some((c) => c.type === "text" && c.text.trim());
+		if (hasConclusion) {
+			const conclusion = new AssistantMessageComponent(
+				{ ...message, content: postBlocks },
+				this.hideThinkingBlock,
+				this.getMarkdownThemeWithSettings(),
+				this.hiddenThinkingLabel,
+				true,
+				true,
+			);
+			this.chatContainer.addChild(conclusion);
 		}
 	}
 
@@ -3633,8 +3731,7 @@ export class InteractiveMode {
 		if (this.isBashMode) {
 			this.editor.borderColor = theme.getBashModeBorderColor();
 		} else {
-			const level = this.session.thinkingLevel || "off";
-			this.editor.borderColor = theme.getThinkingBorderColor(level);
+			this.editor.borderColor = (text: string) => theme.fg("borderMuted", text);
 		}
 		this.ui.requestRender();
 	}
@@ -3867,13 +3964,19 @@ export class InteractiveMode {
 	private updatePendingMessagesDisplay(): void {
 		this.pendingMessagesContainer.clear();
 		const { steering: steeringMessages, followUp: followUpMessages } = this.getAllQueuedMessages();
-		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
+		const visibleSteeringMessages = steeringMessages.filter(
+			(message) => !this.shouldHideInternalJarvisUserMessage(message),
+		);
+		const visibleFollowUpMessages = followUpMessages.filter(
+			(message) => !this.shouldHideInternalJarvisUserMessage(message),
+		);
+		if (visibleSteeringMessages.length > 0 || visibleFollowUpMessages.length > 0) {
 			this.pendingMessagesContainer.addChild(new Spacer(1));
-			for (const message of steeringMessages) {
+			for (const message of visibleSteeringMessages) {
 				const text = theme.fg("dim", `Steering: ${message}`);
 				this.pendingMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
-			for (const message of followUpMessages) {
+			for (const message of visibleFollowUpMessages) {
 				const text = theme.fg("dim", `Follow-up: ${message}`);
 				this.pendingMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}

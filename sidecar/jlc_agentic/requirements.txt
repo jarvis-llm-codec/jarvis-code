@@ -9,3 +9,11 @@ setuptools<82
 rank-bm25>=0.2.2
 fastapi
 uvicorn[standard]
+
+# Optional: Claude subscription credit backend (roles.chat = anthropic-agent-sdk/...).
+# Not installed by default — heavy (pulls mcp, cryptography) and only needed when
+# delegating the chat turn to the Claude Agent SDK. Install on demand:
+#   pip install claude-agent-sdk
+# Also requires the Claude Code CLI on PATH + `claude setup-token`. The adapter
+# (providers/anthropic_agent_sdk.py) fails loud if the package/token is missing.
+# claude-agent-sdk

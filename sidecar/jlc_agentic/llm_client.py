@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from .config import ProviderConfig
+from .user_agent import with_jarvis_user_agent
 
 
 class LLMClient:
@@ -141,7 +142,7 @@ class LLMClient:
         raise RuntimeError(f"{provider.name} exhausted {max_attempts} attempts")
 
     async def _post_chat_completion(self, provider: ProviderConfig, system: str, user: str, max_tokens: int, on_chunk: Any = None) -> str:
-        headers: dict[str, str] = {"Content-Type": "application/json"}
+        headers: dict[str, str] = with_jarvis_user_agent({"Content-Type": "application/json"})
         if provider.api_key:
             headers["Authorization"] = f"Bearer {provider.api_key}"
 

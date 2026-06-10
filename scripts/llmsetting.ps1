@@ -4,7 +4,10 @@
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
-$ConfigPath = if ($env:JARVIS_CODE_CONFIG) { $env:JARVIS_CODE_CONFIG } else { Join-Path $repoRoot "data\config.yaml" }
+$UserProfileDir = [Environment]::GetFolderPath("UserProfile")
+if (-not $UserProfileDir) { $UserProfileDir = $HOME }
+$DefaultConfigPath = Join-Path (Join-Path $UserProfileDir ".jarvis-code") "config.yaml"
+$ConfigPath = if ($env:JARVIS_CODE_CONFIG) { $env:JARVIS_CODE_CONFIG } else { $DefaultConfigPath }
 $env:JARVIS_CODE_CONFIG = $ConfigPath
 $venvPython = Join-Path $repoRoot "sidecar\.venv\Scripts\python.exe"
 

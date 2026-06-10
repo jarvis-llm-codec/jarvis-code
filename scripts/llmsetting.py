@@ -3,7 +3,7 @@
 Reads scripts/llm_catalog.yaml manifest, fetches live model lists from each
 provider that has an API key in env, asks the user (via arrow keys + Enter)
 to pick chat and encoder, then writes:
-    - data/config.yaml     -> roles.chat, roles.subagent, roles.encoder
+    - active config.yaml   -> roles.chat, roles.subagent, roles.encoder
     - pi-agent/models.json -> provider/model entries (so Pi's resolver finds them)
 
 Invoked via scripts/llmsetting.ps1, but works standalone too. All the
@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "sidecar"))
 
 try:
-    from jarvis_sidecar.llm_setting import apply_picks, fetch_models, load_catalog
+    from jarvis_sidecar.llm_setting import apply_picks, fetch_models, load_catalog, provider_supports_model_setting
     from jarvis_sidecar.config import load_credentials_into_env
 except ImportError as e:
     print(f"ERROR: cannot import jarvis_sidecar.llm_setting ({e}). Run sidecar bootstrap first.", file=sys.stderr)
@@ -264,6 +264,10 @@ def main() -> int:
     _clear_screen()
     print("== JARVIS Code LLM setting ==")
     catalog = load_catalog()
+    catalog["providers"] = {
+        pid: cfg for pid, cfg in catalog["providers"].items()
+        if provider_supports_model_setting(cfg)
+    }
     load_credentials_into_env()
 
     print("\nFetching available models from providers with keys present...")

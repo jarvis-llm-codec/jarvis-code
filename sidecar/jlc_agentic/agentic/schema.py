@@ -1,10 +1,8 @@
 """Tool schemas and dispatcher wiring."""
 from __future__ import annotations
 
-from jlc_agentic.providers import get_llm
-
 from . import subagent as _subagent
-from .dispatcher import ToolDispatcher
+from .dispatcher import READ_ONLY_TOOLS, ToolDispatcher
 from .tools import (
     bash,
     edit,
@@ -46,6 +44,11 @@ _BASE_HANDLERS = {
 
 ALL_TOOLS = [*_BASE_SCHEMAS, _subagent.SCHEMA]
 SUBAGENT_TOOLS = list(_BASE_SCHEMAS)
+READ_ONLY_SUBAGENT_TOOLS = [
+    schema
+    for schema in _BASE_SCHEMAS
+    if ((schema.get("function") or {}).get("name") in READ_ONLY_TOOLS)
+]
 
 
 def get_dispatcher(
@@ -78,9 +81,8 @@ def get_dispatcher(
     new folder so the LLM forgetting register_project does not strand the
     session.
     """
-    effective = subagent_llm_client if subagent_llm_client is not None else get_llm("subagent")
     delegate_handler = _subagent.make_handler(
-        llm_client=effective,
+        llm_client=subagent_llm_client,
         on_token=subagent_on_token,
         conv_id=conv_id,
         storage_root=storage_root,
@@ -102,6 +104,8 @@ def get_subagent_dispatcher(
     storage_root: str | None = None,
     project_root: str | None = None,
     retriever: object | None = None,
+    read_only: bool = False,
+    allowed_tools: set[str] | None = None,
 ) -> ToolDispatcher:
     """Build a dispatcher for use INSIDE a subagent.
 
@@ -113,6 +117,18 @@ def get_subagent_dispatcher(
     """
     handlers = _bind_recall_turn(dict(_BASE_HANDLERS), conv_id, storage_root, retriever)
     handlers = _bind_path_tools(handlers, project_root)
+    if read_only:
+        handlers = {
+            name: handler
+            for name, handler in handlers.items()
+            if name in READ_ONLY_TOOLS
+        }
+    if allowed_tools is not None:
+        handlers = {
+            name: handler
+            for name, handler in handlers.items()
+            if name in allowed_tools
+        }
     return ToolDispatcher(handlers, active_project_path=project_root)
 
 

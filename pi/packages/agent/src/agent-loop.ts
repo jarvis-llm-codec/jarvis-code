@@ -556,6 +556,24 @@ async function prepareToolCall(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
+	// Pre-resolved tool call (regime-B / anthropic-agent-sdk): the SDK already
+	// executed this tool upstream and the sidecar shipped the result inline. Render
+	// it via the existing `immediate` path WITHOUT executing, and set terminate:true
+	// so shouldTerminateToolBatch ends the turn (hasMoreToolCalls=false) instead of
+	// issuing a SECOND provider request = a double SDK turn. Fires ONLY when
+	// presolvedResult is present (a sidecar-only field) -> regime-A/OpenAI tool calls
+	// never take this branch, so their execution + loop behavior is byte-identical.
+	if (toolCall.presolvedResult !== undefined) {
+		return {
+			kind: "immediate",
+			result: {
+				content: [{ type: "text", text: toolCall.presolvedResult }],
+				details: {},
+				terminate: true,
+			},
+			isError: toolCall.presolvedIsError ?? false,
+		};
+	}
 	const tool = currentContext.tools?.find((t) => t.name === toolCall.name);
 	if (!tool) {
 		return {

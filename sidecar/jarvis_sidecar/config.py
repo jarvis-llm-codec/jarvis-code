@@ -16,6 +16,7 @@ DEFAULT_ROLE_CONFIG: dict[str, Any] = {
     "roles": {
         "chat": "ollama-cloud/glm-5-ollama",
         "subagent": "ollama-cloud/glm-5-ollama",
+        "router": "ollama-cloud/glm-5-ollama",
         "encoder": "ollama-cloud/devstral-small-2-24b-cloud",
     },
     "encoder": {
@@ -467,6 +468,19 @@ def save_credential_env(env_name: str, value: str) -> Path:
     return credentials_path()
 
 
+def remove_credential_env(env_name: str) -> Path:
+    env_name = env_name.strip()
+    if not env_name:
+        raise ValueError("env_name is required")
+    raw = load_credentials()
+    env_map = raw.get("env")
+    if isinstance(env_map, dict):
+        env_map.pop(env_name, None)
+    write_credentials(raw)
+    os.environ.pop(env_name, None)
+    return credentials_path()
+
+
 def write_sidecar_config(raw: dict[str, Any]) -> None:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -582,4 +596,10 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
 def _atomic_write_text(path: Path, content: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content, encoding="utf-8")
+    # Owner-only (0o600) so credential files (credentials.yaml holds provider API
+    # keys) are not world-readable on shared POSIX hosts; best-effort on Windows.
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
     tmp.replace(path)

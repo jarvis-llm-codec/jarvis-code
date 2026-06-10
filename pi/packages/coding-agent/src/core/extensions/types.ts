@@ -410,6 +410,13 @@ export interface ToolRenderContext<TState = any, TArgs = any> {
 	executionStarted: boolean;
 	/** Whether the tool call arguments are complete. */
 	argsComplete: boolean;
+	/**
+	 * Whether the tool was already executed upstream before pi rendered it
+	 * (regime-B / anthropic-agent-sdk presolved tool calls). When true, the edit
+	 * renderer diffs the args directly instead of re-reading the file (which is
+	 * already at its post-edit state). Default false -> regime-A file-based path.
+	 */
+	alreadyApplied: boolean;
 	/** Whether the tool result is partial/streaming. */
 	isPartial: boolean;
 	/** Whether the result view is expanded. */

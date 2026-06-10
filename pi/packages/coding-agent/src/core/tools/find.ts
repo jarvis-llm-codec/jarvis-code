@@ -3,6 +3,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
 import { spawn } from "child_process";
 import { existsSync } from "fs";
+import { minimatch } from "minimatch";
 import path from "path";
 import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
@@ -15,6 +16,38 @@ import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } fr
 
 function toPosixPath(value: string): string {
 	return value.split(path.sep).join("/");
+}
+
+function normalizeGlobPattern(value: string): string {
+	return value.replaceAll("\\", "/");
+}
+
+function patternContainsPath(value: string): boolean {
+	return value.includes("/") || value.includes("\\");
+}
+
+function candidateBasenameGlob(value: string): string {
+	const normalized = normalizeGlobPattern(value);
+	const segment = normalized
+		.split("/")
+		.filter((part) => part.length > 0)
+		.at(-1);
+	if (!segment || segment === "**") return "*";
+	return segment;
+}
+
+function relativizeFdOutputLine(rawLine: string, searchPath: string): string | undefined {
+	const line = rawLine.replace(/\r$/, "").trim();
+	if (!line) return undefined;
+	const hadTrailingSlash = line.endsWith("/") || line.endsWith("\\");
+	let relativePath = line;
+	if (line.startsWith(searchPath)) {
+		relativePath = line.slice(searchPath.length + 1);
+	} else {
+		relativePath = path.relative(searchPath, line);
+	}
+	if (hadTrailingSlash && !relativePath.endsWith("/") && !relativePath.endsWith("\\")) relativePath += "/";
+	return toPosixPath(relativePath);
 }
 
 const findSchema = Type.Object({
@@ -227,31 +260,23 @@ export function createFindToolDefinition(
 						// Build fd arguments. --no-require-git makes fd apply hierarchical .gitignore
 						// semantics whether or not the search path is inside a git repository, without
 						// leaking sibling-directory rules the way --ignore-file (a global source) would.
-						const args: string[] = [
-							"--glob",
-							"--color=never",
-							"--hidden",
-							"--no-require-git",
-							"--max-results",
-							String(effectiveLimit),
-						];
-
-						// fd --glob matches against the basename unless --full-path is set; in --full-path
-						// mode it matches against the absolute candidate path, so a path-containing
-						// pattern like 'src/**/*.spec.ts' needs a leading '**/' to match anything.
-						let effectivePattern = pattern;
-						if (pattern.includes("/")) {
-							args.push("--full-path");
-							if (!pattern.startsWith("/") && !pattern.startsWith("**/") && pattern !== "**") {
-								effectivePattern = `**/${pattern}`;
-							}
+						const pathGlobPattern = patternContainsPath(pattern) ? normalizeGlobPattern(pattern) : undefined;
+						const args: string[] = ["--glob", "--color=never", "--hidden", "--no-require-git"];
+						if (!pathGlobPattern) {
+							args.push("--max-results", String(effectiveLimit));
 						}
+
+						// fd's --full-path glob handling is inconsistent for path-containing patterns
+						// on Windows. Use fd to collect ignore-aware candidates, then match normalized
+						// relative POSIX paths in JS for stable cross-platform semantics.
+						const effectivePattern = pathGlobPattern ? candidateBasenameGlob(pathGlobPattern) : pattern;
 						args.push("--", effectivePattern, searchPath);
 
 						const child = spawn(fdPath, args, { stdio: ["ignore", "pipe", "pipe"] });
 						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
-						const lines: string[] = [];
+						const relativized: string[] = [];
+						let limitReachedDuringStream = false;
 
 						stopChild = () => {
 							if (!child.killed) {
@@ -268,7 +293,22 @@ export function createFindToolDefinition(
 						});
 
 						rl.on("line", (line) => {
-							lines.push(line);
+							const relativePath = relativizeFdOutputLine(line, searchPath);
+							if (!relativePath) return;
+							if (
+								pathGlobPattern &&
+								!minimatch(relativePath, pathGlobPattern, {
+									dot: true,
+									nocase: process.platform === "win32",
+								})
+							) {
+								return;
+							}
+							relativized.push(relativePath);
+							if (pathGlobPattern && relativized.length >= effectiveLimit) {
+								limitReachedDuringStream = true;
+								stopChild?.();
+							}
 						});
 
 						child.on("error", (error) => {
@@ -282,7 +322,7 @@ export function createFindToolDefinition(
 								settle(() => reject(new Error("Operation aborted")));
 								return;
 							}
-							const output = lines.join("\n");
+							const output = relativized.join("\n");
 							if (code !== 0) {
 								const errorMsg = stderr.trim() || `fd exited with code ${code}`;
 								if (!output) {
@@ -300,22 +340,7 @@ export function createFindToolDefinition(
 								return;
 							}
 
-							const relativized: string[] = [];
-							for (const rawLine of lines) {
-								const line = rawLine.replace(/\r$/, "").trim();
-								if (!line) continue;
-								const hadTrailingSlash = line.endsWith("/") || line.endsWith("\\");
-								let relativePath = line;
-								if (line.startsWith(searchPath)) {
-									relativePath = line.slice(searchPath.length + 1);
-								} else {
-									relativePath = path.relative(searchPath, line);
-								}
-								if (hadTrailingSlash && !relativePath.endsWith("/")) relativePath += "/";
-								relativized.push(toPosixPath(relativePath));
-							}
-
-							const resultLimitReached = relativized.length >= effectiveLimit;
+							const resultLimitReached = relativized.length >= effectiveLimit || limitReachedDuringStream;
 							const rawOutput = relativized.join("\n");
 							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
 							let resultOutput = truncation.content;

@@ -11,6 +11,7 @@ PATH_AWARE_TOOLS = {"read", "edit", "write_file", "grep", "bash"}
 PROJECT_ROOT_TOOLS = PATH_AWARE_TOOLS | {"delegate_subagent"}
 
 READ_ONLY_TOOLS = {"read", "grep", "web_search", "recall_turns", "jre_search"}
+LEAN_READ_ONLY_TOOLS = {"read", "grep"}
 SEQUENTIAL_TOOLS = {"edit", "bash"}
 MAX_INLINE_BYTES = 50 * 1024
 

@@ -20,6 +20,12 @@ function Write-PiTestLog {
 	}
 }
 
+function Format-PiTestExitCode {
+	param([int] $ExitCode)
+	$unsigned = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$ExitCode), 0)
+	return "$ExitCode (0x$($unsigned.ToString('X8')))"
+}
+
 foreach ($arg in $args) {
 	if ($arg -eq "--no-env") {
 		$noEnv = $true
@@ -89,7 +95,9 @@ $cliPath = Join-Path $scriptDir "packages/coding-agent/src/cli.ts"
 Write-PiTestLog "pi-test start args=$($forwardArgs -join ' ')"
 & $tsxBin $cliPath @forwardArgs
 $exitCode = $LASTEXITCODE
-Write-PiTestLog "pi-test child exitCode=$exitCode"
+Write-PiTestLog "pi-test child exitCode=$(Format-PiTestExitCode -ExitCode $exitCode)"
 if ($exitCode -ne 0) {
+	Write-Host "[jarvis-error] Pi child exited with code $(Format-PiTestExitCode -ExitCode $exitCode)" -ForegroundColor Red
+	Write-Host "[jarvis-error] Command: $tsxBin $cliPath $($forwardArgs -join ' ')" -ForegroundColor DarkGray
 	exit $exitCode
 }

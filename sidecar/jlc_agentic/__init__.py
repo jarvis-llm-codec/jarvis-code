@@ -10,7 +10,9 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-__version__ = "0.0.0"
+from .user_agent import JARVIS_CODE_VERSION
+
+__version__ = JARVIS_CODE_VERSION
 
 _slim_singleton: Any | None = None
 _slim_lock = threading.Lock()

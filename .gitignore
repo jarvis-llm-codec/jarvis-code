@@ -61,3 +61,6 @@ pi/tmp-auto-prompts-*/
 *.swp
 *.swo
 *~
+
+# Sidecar debug / runtime logs (never commit)
+sidecar/logs/

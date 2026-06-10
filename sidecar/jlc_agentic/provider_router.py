@@ -15,11 +15,7 @@ import httpx
 
 from jlc_agentic.key_pool import AllKeysDisabledError, KeyPool
 from jlc_agentic.openai_oauth import TokenManager
-
-try:
-    from jlc_agentic import __version__ as _JARVIS_CODE_VERSION
-except ImportError:
-    _JARVIS_CODE_VERSION = "0.0.0"
+from jlc_agentic.user_agent import with_jarvis_user_agent
 
 
 class OAuthTokenError(RuntimeError):
@@ -33,6 +29,30 @@ _FALLBACK_RED = "\033[91m"
 _FALLBACK_RESET = "\033[0m"
 _LITELLM: Any | None = None
 _DEFAULT_CODEX_STREAM_TIMEOUT_SEC = 120.0
+
+# OpenAI Responses reasoning.effort tops out at "high"; the JLC route vocabulary
+# goes up to "xhigh"/"max" (which the Claude Agent SDK accepts natively). Clamp
+# the high end so a heavy_deepdive route does not send the Responses API an
+# effort it rejects. "none" is JLC's non-reasoning sentinel (handled specially by
+# the callers) and passes through unchanged.
+_OPENAI_EFFORT_CLAMP = {"xhigh": "high", "max": "high"}
+
+
+def _codex_reasoning_effort(kwargs: dict[str, Any]) -> str:
+    """Effective reasoning effort for a Codex (OpenAI Responses) call.
+
+    Precedence: explicit ``reasoning_effort`` kwarg > the per-turn route effort
+    parked on ``turn_context`` (set by ChatTurn.run, read on this same worker
+    thread) > "high" (the historical default). Clamped to the Responses enum's
+    ceiling so heavier JLC efforts degrade gracefully.
+    """
+    raw = kwargs.get("reasoning_effort")
+    if not raw:
+        from jlc_agentic.providers import turn_context  # noqa: PLC0415
+
+        raw = turn_context.get().get("reasoning_effort")
+    eff = str(raw or "high").strip().lower()
+    return _OPENAI_EFFORT_CLAMP.get(eff, eff)
 
 
 class _LiteLLMProxy:
@@ -133,7 +153,7 @@ class ProviderRouter:
                     bare_model = resolved.litellm_id.split("/", 1)[-1]
                     instructions, non_system = split_instructions_and_input(messages)
                     response_tools = chat_tools_to_responses_tools(kwargs.get("tools"))
-                    reasoning_effort = str(kwargs.get("reasoning_effort") or "high")
+                    reasoning_effort = _codex_reasoning_effort(kwargs)
                     response_body = {
                         "input": chat_messages_to_responses_input(non_system),
                         "instructions": instructions,
@@ -337,7 +357,7 @@ class ProviderRouter:
             bare_model = resolved.litellm_id.split("/", 1)[-1]
             instructions, non_system = split_instructions_and_input(messages)
             response_tools = chat_tools_to_responses_tools(kwargs.get("tools"))
-            reasoning_effort = str(kwargs.get("reasoning_effort") or "high")
+            reasoning_effort = _codex_reasoning_effort(kwargs)
             response_body = {
                 "input": chat_messages_to_responses_input(non_system),
                 "instructions": instructions,
@@ -407,6 +427,7 @@ class ProviderRouter:
             "Accept": "text/event-stream",
         }
         headers.update(resolved.extra_headers)
+        headers = with_jarvis_user_agent(headers)
         with httpx.stream(
             "POST", url, headers=headers, json=body, timeout=timeout_sec
         ) as resp:
@@ -446,6 +467,7 @@ class ProviderRouter:
             "Accept": "application/json",
         }
         headers.update(resolved.extra_headers)
+        headers = with_jarvis_user_agent(headers)
         resp = httpx.post(url, headers=headers, json=body, timeout=timeout_sec)
         if resp.status_code >= 400:
             detail = resp.content[:500]
@@ -483,6 +505,7 @@ class ProviderRouter:
             headers["Authorization"] = f"Bearer {resolved.api_key}"
         if resolved.extra_headers:
             headers.update(resolved.extra_headers)
+        headers = with_jarvis_user_agent(headers)
         # Strip the litellm `openai/` prefix so the wire model name matches
         # what the upstream provider expects (e.g. 'kimi-k2.5:cloud').
         bare_model = resolved.litellm_id.split("/", 1)[-1]
@@ -623,7 +646,7 @@ class ProviderRouter:
             api_base=model.get("api_base") or provider.get("api_base"),
             cost_in_per_1m=float(model.get("cost_in_per_1m", 0.0)),
             cost_out_per_1m=float(model.get("cost_out_per_1m", 0.0)),
-            extra_headers={str(key): str(value) for key, value in extra_headers.items()},
+            extra_headers=with_jarvis_user_agent(extra_headers),
         )
 
     def _build_resolved_oauth(
@@ -643,15 +666,12 @@ class ProviderRouter:
             raise OAuthTokenError(str(exc)) from exc
         account_id = mgr.get_account_id() or ""
 
-        from jlc_agentic.codex_responses_adapter import build_codex_user_agent
-
         extra_headers: dict[str, Any] = {}
         extra_headers.update(provider.get("extra_headers") or {})
         extra_headers.update(model.get("extra_headers") or {})
         extra_headers["Authorization"] = f"Bearer {access_token}"
         extra_headers["ChatGPT-Account-Id"] = account_id
         extra_headers["originator"] = "jarvis-code"
-        extra_headers["User-Agent"] = build_codex_user_agent(_JARVIS_CODE_VERSION)
         extra_headers["session_id"] = self._oauth_session_id
 
         return ResolvedModel(
@@ -662,7 +682,7 @@ class ProviderRouter:
             api_base=provider.get("api_base"),
             cost_in_per_1m=float(model.get("cost_in_per_1m", 0.0)),
             cost_out_per_1m=float(model.get("cost_out_per_1m", 0.0)),
-            extra_headers={str(key): str(value) for key, value in extra_headers.items()},
+            extra_headers=with_jarvis_user_agent(extra_headers),
             is_oauth=True,
             oauth_provider=provider.get("oauth_provider"),
         )

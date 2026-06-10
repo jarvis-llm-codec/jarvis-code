@@ -74,6 +74,35 @@ find_python() {
   return 1
 }
 
+ensure_python_venv() {
+  # On Debian/Ubuntu the venv module (ensurepip) ships in a separate package;
+  # without it `python -m venv` yields a pip-less, broken environment and the
+  # rest of the install silently produces a non-working tree. Auto-install it,
+  # the same way install_git bootstraps git.
+  py=$1
+  if "$py" -c 'import ensurepip' >/dev/null 2>&1; then
+    return 0
+  fi
+  pyver=$("$py" -c 'import sys; print("python%d.%d" % sys.version_info[:2])' 2>/dev/null || printf 'python3')
+  log "Python venv/ensurepip not available; attempting automatic install of ${pyver}-venv"
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y "${pyver}-venv" || sudo apt-get install -y python3-venv
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y python3 python3-pip
+  elif command -v yum >/dev/null 2>&1; then
+    sudo yum install -y python3 python3-pip
+  elif command -v pacman >/dev/null 2>&1; then
+    : # Arch's python package already includes venv and ensurepip
+  elif command -v brew >/dev/null 2>&1; then
+    : # Homebrew's python includes venv and ensurepip
+  fi
+  if ! "$py" -c 'import ensurepip' >/dev/null 2>&1; then
+    printf 'JARVIS Code requires the Python venv module with ensurepip. Install %s-venv (Debian/Ubuntu) or the equivalent and retry.\n' "$pyver" >&2
+    exit 1
+  fi
+}
+
 script_dir() {
   # This works for local script execution. When piped through sh, the installer
   # falls back to downloading the release archive.
@@ -172,8 +201,15 @@ install_sidecar_venv() {
   venv="$sidecar/.venv"
   venv_py="$venv/bin/python"
   if [ ! -x "$venv_py" ]; then
+    ensure_python_venv "$py"
     log "creating sidecar venv"
     "$py" -m venv "$venv"
+  fi
+  # A venv built without ensurepip leaves no pip and the dependency install below
+  # would fail confusingly; surface it as a clear, fatal error instead.
+  if [ ! -x "$venv_py" ] || ! "$venv_py" -m pip --version >/dev/null 2>&1; then
+    printf 'Sidecar venv has no working pip at %s. Install the Python venv package (e.g. python3-venv) and retry.\n' "$venv_py" >&2
+    exit 1
   fi
   log "installing sidecar Python dependencies"
   "$venv_py" -m pip install --disable-pip-version-check --quiet --upgrade pip 'setuptools<82' wheel

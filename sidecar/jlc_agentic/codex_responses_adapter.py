@@ -12,10 +12,11 @@ mapping so it does not require the optional LiteLLM/Aider runtime.
 from __future__ import annotations
 
 import os
-import platform
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
+
+from jlc_agentic.user_agent import jarvis_code_user_agent
 
 def chat_tools_to_responses_tools(
     tools: list[dict[str, Any]] | None,
@@ -498,9 +499,4 @@ def iter_responses_stream_chunks(
 
 
 def build_codex_user_agent(version: str) -> str:
-    sys_name = platform.system().lower()
-    if sys_name == "windows":
-        sys_name = "win32"
-    release = platform.release() or "0"
-    arch = platform.machine() or "x64"
-    return f"jarvis-code/{version} ({sys_name} {release}; {arch})"
+    return jarvis_code_user_agent(version)

@@ -90,6 +90,31 @@ function isJlcDeepdiveStatus(value: string): boolean {
 	return /\bJLC:(?:heavy deepdive|deepdive)\b/.test(value);
 }
 
+/**
+ * Map a reasoning effort level to a footer color function. The mapping is by
+ * effort tier (cost), not by which source reported the level:
+ *   minimal/low -> green (success), medium -> deep green (thinkingMedium),
+ *   high -> yellow (warning),
+ *   xhigh -> red (error). off/undefined stays uncolored (dim).
+ */
+function thinkingLevelColor(
+	level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | undefined,
+): ((text: string) => string) | undefined {
+	switch (level) {
+		case "minimal":
+		case "low":
+			return (text: string) => theme.fg("success", text);
+		case "medium":
+			return (text: string) => theme.fg("thinkingMedium", text);
+		case "high":
+			return (text: string) => theme.fg("warning", text);
+		case "xhigh":
+			return (text: string) => theme.fg("error", text);
+		default:
+			return undefined;
+	}
+}
+
 function calculateJlcMeterTotals(entries: unknown[]): { found: boolean; jlcTotal: number; rawProjectedTotal: number } {
 	let startIndex = -1;
 	for (let i = entries.length - 1; i >= 0; i--) {
@@ -156,7 +181,6 @@ export class FooterComponent implements Component {
 		// Raw projection uses the intended prefix model:
 		// turn1 = t1, turn2 = t1+t2, turn3 = t1+t2+t3.
 		// If no JLC meter has been installed, fall back to message-derived stats.
-		let totalCost = 0;
 		let jlcTotal = 0;
 		let rawProjectedTotal = 0;
 		let completedTranscriptTokens = 0;
@@ -170,7 +194,6 @@ export class FooterComponent implements Component {
 
 			if (entry.message.role === "assistant") {
 				const u = entry.message.usage;
-				totalCost += u.cost.total;
 				const turnTotal = u.totalTokens ?? u.input + u.output + u.cacheRead + u.cacheWrite;
 				jlcTotal += turnTotal;
 				rawProjectedTotal += completedTranscriptTokens + turnTotal;
@@ -188,15 +211,9 @@ export class FooterComponent implements Component {
 			rawProjectedTotal = jlcMeterTotals.rawProjectedTotal;
 		}
 
-		// Build stats line
+		// Build stats line. No $-cost figure here: provider-list prices are
+		// unreliable for JARVIS-managed models and read as billed spend.
 		const statsParts = [];
-
-		// OAuth subscription usage is not an itemized charge. Avoid showing an
-		// API-price equivalent as if it were billed spend.
-		const usingSubscription = state.model ? this.session.modelRegistry.isUsingOAuth(state.model) : false;
-		if (totalCost && !usingSubscription) {
-			statsParts.push(`$${totalCost.toFixed(3)}`);
-		}
 
 		// JLC vs legacy cumulative token comparison.
 		const ratio = jlcTotal > 0 && rawProjectedTotal > jlcTotal ? Math.round(rawProjectedTotal / jlcTotal) : 0;
@@ -206,8 +223,12 @@ export class FooterComponent implements Component {
 		let statsLeft = statsParts.join(" ");
 		const extensionStatuses = this.footerData.getExtensionStatuses();
 
-		// Add model name on the right side
-		const modelName = state.model?.id || "no-model";
+		// Add model name on the right side. JARVIS sidecar proxies are registered
+		// as Pi providers, so normal/proxied turns should show state.model. The
+		// jlc-chat-model override is only for a future runtime that bypasses Pi's
+		// provider registry entirely.
+		const jlcChatModel = sanitizeStatusText(extensionStatuses.get("jlc-chat-model") ?? "");
+		const modelName = jlcChatModel || state.model?.id || "no-model";
 		const jarvisStatus = sanitizeStatusText(extensionStatuses.get("jarvis") ?? "");
 		const savedDeepdiveThinkingLevel = isJlcDeepdiveStatus(jarvisStatus)
 			? loadSavedDeepdiveThinkingLevel()
@@ -220,12 +241,9 @@ export class FooterComponent implements Component {
 			savedDeepdiveThinkingLevel ??
 			(state.model?.reasoning && state.thinkingLevel !== "off" ? state.thinkingLevel : undefined);
 		const rightSideBody = thinkingLevel ? `${modelName} ${thinkingLevel}` : modelName;
-		const rightSideColor =
-			jlcThinkingLevel || savedDeepdiveThinkingLevel || thinkingLevel === "xhigh"
-				? (text: string) => theme.fg("error", text)
-				: thinkingLevel
-					? (text: string) => theme.fg("warning", text)
-					: undefined;
+		// Color by the resolved effort level, not by which source set it.
+		// Medium uses a deeper green than generic success so it does not read yellow.
+		const rightSideColor = thinkingLevelColor(thinkingLevel);
 
 		let statsLeftWidth = visibleWidth(statsLeft);
 
@@ -242,7 +260,8 @@ export class FooterComponent implements Component {
 
 		// Prepend the provider in parentheses if there are multiple providers and there's enough room
 		let rightSide = rightSideWithoutProvider;
-		if (this.footerData.getAvailableProviderCount() > 1 && state.model) {
+		// jlcChatModel already carries its own "(provider) model" label.
+		if (!jlcChatModel && this.footerData.getAvailableProviderCount() > 1 && state.model) {
 			rightSide = `(${state.model.provider}) ${rightSideWithoutProvider}`;
 			if (statsLeftWidth + minPadding + visibleWidth(rightSide) > width) {
 				// Too wide, fall back
@@ -294,6 +313,7 @@ export class FooterComponent implements Component {
 								key !== "jlc-work" &&
 								key !== "jlc-enc" &&
 								key !== "jlc-enc-model" &&
+								key !== "jlc-chat-model" &&
 								key !== JLC_CHAT_THINKING_STATUS_KEY,
 						)
 						.sort(([a], [b]) => a.localeCompare(b))

@@ -1,9 +1,6 @@
 """ChatGPT Plus/Pro OAuth -- PKCE + Device Code flows.
 
 Ports the opencode (codex.ts) auth pattern to Python stdlib.
-References:
-  - opencode codex.ts: C:/JJUN_DEV/_tmp_opencode_repo/packages/opencode/src/plugin/codex.ts
-  - Gemini analysis: C:/JJUN_DEV/_tmp_opencode_oauth_analysis.md
 
 No third-party HTTP libs -- uses urllib.request + http.server.
 """
@@ -26,6 +23,8 @@ import webbrowser
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+from jlc_agentic.user_agent import with_jarvis_user_agent
 
 # === Constants ===
 OAUTH_ISSUER = "https://auth.openai.com"
@@ -196,7 +195,7 @@ def exchange_code_for_token(
     req = urllib.request.Request(
         f"{OAUTH_ISSUER}/oauth/token",
         data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers=with_jarvis_user_agent({"Content-Type": "application/x-www-form-urlencoded"}),
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -216,7 +215,7 @@ def refresh_access_token(refresh_token: str) -> dict[str, Any]:
     req = urllib.request.Request(
         f"{OAUTH_ISSUER}/oauth/token",
         data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers=with_jarvis_user_agent({"Content-Type": "application/x-www-form-urlencoded"}),
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -245,7 +244,7 @@ def start_device_code_flow() -> DeviceCodeChallenge:
     req = urllib.request.Request(
         f"{OAUTH_ISSUER}/api/accounts/deviceauth/usercode",
         data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers=with_jarvis_user_agent({"Content-Type": "application/x-www-form-urlencoded"}),
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -275,7 +274,7 @@ def poll_device_code(device_code: str, interval_secs: int, timeout_secs: int = 6
         req = urllib.request.Request(
             f"{OAUTH_ISSUER}/api/accounts/deviceauth/token",
             data=body,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers=with_jarvis_user_agent({"Content-Type": "application/x-www-form-urlencoded"}),
             method="POST",
         )
         try:

@@ -433,6 +433,21 @@ export async function computeEditsDiff(
 }
 
 /**
+ * Compute a diff straight from the edit ARGS (oldText -> newText) without touching
+ * the file. For regime-B (anthropic-agent-sdk), the SDK applies the edit to disk
+ * FIRST and ships the result inline, so the file-based computeEditsDiff would
+ * re-read the file and re-search the now-replaced oldText -> a false "Could not
+ * find the exact text" error (or a bogus re-apply diff when oldText still occurs).
+ * The args themselves are the source of truth for what changed, so diff them
+ * directly. Synchronous, no file IO. Never throws (no match step).
+ */
+export function computeArgsDiff(edits: Edit[]): EditDiffResult {
+	const oldBlock = edits.map((e) => normalizeToLF(e.oldText)).join("\n");
+	const newBlock = edits.map((e) => normalizeToLF(e.newText)).join("\n");
+	return generateDiffString(oldBlock, newBlock);
+}
+
+/**
  * Compute the diff for a single edit operation without applying it.
  * Kept as a convenience wrapper for single-edit callers.
  */

@@ -6,11 +6,15 @@ from pathlib import Path
 from typing import Any
 from datetime import UTC, datetime
 
+from .file_locks import locked_atomic_write_text
+
 # CANONICAL — DO NOT MODIFY. Per Jun's original epistemic design.
 # Each section answers a *different* question, not a temporal slice.
-# Adding/removing/renaming sections silently breaks update_jarvis_md
+# Adding/removing/renaming canonical sections silently breaks update_jarvis_md
 # routing, the encoder pipeline, and re-entry semantics.
-VALID_SECTIONS = ("NOW", "MAP", "LAW", "BAN", "HABIT", "WHY", "OMM", "RAW")
+CANONICAL_SECTIONS = ("NOW", "MAP", "LAW", "BAN", "HABIT", "WHY", "OMM", "RAW")
+DESIGN_BRIEF_SECTION = "DESIGN_BRIEF"
+VALID_SECTIONS = (*CANONICAL_SECTIONS, DESIGN_BRIEF_SECTION)
 INTERRUPT_CHECKPOINT_BEGIN = "<!-- JARVIS_INTERRUPT_CHECKPOINT_BEGIN -->"
 INTERRUPT_CHECKPOINT_END = "<!-- JARVIS_INTERRUPT_CHECKPOINT_END -->"
 
@@ -23,6 +27,7 @@ SECTION_HEADERS = {
     "WHY":   "## WHY — Why History Yells (Decision Rationale)",
     "OMM":   "## OMM — Oh My Mistake (Failure Retrospectives)",
     "RAW":   "## RAW — Raw Evidence Pointers",
+    DESIGN_BRIEF_SECTION: "## Design Brief",
 }
 
 SECTION_STARTERS = {
@@ -69,7 +74,7 @@ SECTION_STARTERS = {
 
 def _default_jarvis_md(name: str) -> str:
     now = datetime.now(UTC).replace(microsecond=0).isoformat()
-    sections = "\n\n".join(f"{SECTION_HEADERS[k]}\n{SECTION_STARTERS[k]}" for k in VALID_SECTIONS)
+    sections = "\n\n".join(f"{SECTION_HEADERS[k]}\n{SECTION_STARTERS[k]}" for k in CANONICAL_SECTIONS)
     return f"""---
 project: {name}
 updated: {now}
@@ -102,7 +107,7 @@ def ensure_workspace_memory(project_path: str | None) -> dict[str, str]:
     if jarvis_md.exists():
         return {"JARVIS.md": "existing"}
 
-    jarvis_md.write_text(_default_jarvis_md(root.name or "project"), encoding="utf-8")
+    locked_atomic_write_text(jarvis_md, _default_jarvis_md(root.name or "project"))
     return {"JARVIS.md": "created"}
 
 def read_project_memory(project_path: str | None, max_chars: int = 60000) -> tuple[str, list[str]]:
@@ -151,7 +156,7 @@ def update_jarvis_md_batch(project_path: str | None, *, updates: list[dict[str, 
     seen: set[str] = set()
     for item in updates:
         field = item.get("field") if isinstance(item, dict) else None
-        field_upper = str(field).strip().upper()
+        field_upper = _normalize_section_field(field)
         if field_upper not in VALID_SECTIONS:
             return {
                 "ok": False,
@@ -168,7 +173,7 @@ def update_jarvis_md_batch(project_path: str | None, *, updates: list[dict[str, 
         return {"ok": False, "error": f"project_path does not exist: {root}"}
     p = root / "JARVIS.md"
     if not p.exists():
-        p.write_text(_default_jarvis_md(root.name or "project"), encoding="utf-8")
+        locked_atomic_write_text(p, _default_jarvis_md(root.name or "project"))
 
     content = p.read_text(encoding="utf-8")
     new_content = content
@@ -178,10 +183,7 @@ def update_jarvis_md_batch(project_path: str | None, *, updates: list[dict[str, 
         # Replace the named section's body. A section runs from its `## NAME`
         # header line (with optional `— Description` suffix) to the next `## `
         # header or end of file.
-        section_re = re.compile(
-            rf"(^## {field_upper}(?:[ \t]+—[^\n]*)?[ \t]*\n)([\s\S]*?)(?=^## |\Z)",
-            re.MULTILINE,
-        )
+        section_re = _section_regex(field_upper)
         if section_re.search(new_content):
             # lambda replacement so backslashes inside `value` (e.g. Windows
             # paths like C:\jarvis_workspace\tetris) are not interpreted as
@@ -204,7 +206,7 @@ def update_jarvis_md_batch(project_path: str | None, *, updates: list[dict[str, 
         flags=re.MULTILINE,
     )
 
-    p.write_text(new_content, encoding="utf-8")
+    locked_atomic_write_text(p, new_content)
     return {
         "ok": True,
         "fields": [field for field, _value in normalized],
@@ -274,13 +276,32 @@ def clear_interrupt_checkpoint(project_path: str | None) -> dict[str, Any]:
     return update_jarvis_md(str(root), field="NOW", value=cleaned_now)
 
 def _section_body(content: str, field: str) -> str:
-    field_upper = str(field).strip().upper()
+    field_upper = _normalize_section_field(field)
+    heading = _section_heading_pattern(field_upper)
     section_re = re.compile(
-        rf"^## {field_upper}(?:[ \t]+—[^\n]*)?[ \t]*\n([\s\S]*?)(?=^## |\Z)",
-        re.MULTILINE,
+        rf"^## {heading}(?:[ \t]+—[^\n]*)?[ \t]*\n([\s\S]*?)(?=^## |\Z)",
+        re.MULTILINE | re.IGNORECASE,
     )
     match = section_re.search(content)
     return match.group(1) if match else ""
+
+
+def _normalize_section_field(field: Any) -> str:
+    return re.sub(r"[\s-]+", "_", str(field).strip().upper())
+
+
+def _section_heading_pattern(field_upper: str) -> str:
+    if field_upper == DESIGN_BRIEF_SECTION:
+        return r"Design[ \t_-]+Brief"
+    return re.escape(field_upper)
+
+
+def _section_regex(field_upper: str) -> re.Pattern[str]:
+    heading = _section_heading_pattern(field_upper)
+    return re.compile(
+        rf"(^## {heading}(?:[ \t]+—[^\n]*)?[ \t]*\n)([\s\S]*?)(?=^## |\Z)",
+        re.MULTILINE | re.IGNORECASE,
+    )
 
 def _remove_interrupt_checkpoint(text: str) -> str:
     checkpoint_re = re.compile(

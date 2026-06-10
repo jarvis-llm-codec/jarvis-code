@@ -7,6 +7,8 @@ import time
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from jlc_agentic.user_agent import with_jarvis_user_agent
+
 SCHEMA = {
     "type": "function",
     "function": {
@@ -42,10 +44,12 @@ def handler(query: str, top_k: int = 5) -> dict:
     params = urlencode({"q": query, "count": max(1, min(int(top_k), 20))})
     req = Request(
         f"{BRAVE_ENDPOINT}?{params}",
-        headers={
-            "Accept": "application/json",
-            "X-Subscription-Token": key,
-        },
+        headers=with_jarvis_user_agent(
+            {
+                "Accept": "application/json",
+                "X-Subscription-Token": key,
+            }
+        ),
     )
     last_exc: Exception | None = None
     for attempt in (1, 2):
