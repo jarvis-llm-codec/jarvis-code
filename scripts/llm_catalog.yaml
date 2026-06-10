@@ -73,6 +73,15 @@ providers:
       - kimi-k2.5
       - minimax-M2.5
 
+  nvidia-nim:
+    label: "NVIDIA NIM (image generation)"
+    auth_env: NVIDIA_API_KEY
+    base_url: "https://ai.api.nvidia.com/v1/genai"
+    api_format: openai-completions
+    models_endpoint: "/models"
+    roles:
+      - image
+
 recommended:
   chat:
     provider: openai-codex

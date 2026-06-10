@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -26,6 +27,7 @@ KNOWN_API_FORMATS = {
     "google-generative-ai",
     "openai-codex-responses",
 }
+MODEL_SETTING_ROLES = {"chat", "subagent", "encoder", "llm"}
 
 
 def _config_path() -> Path:
@@ -36,6 +38,38 @@ def _config_path() -> Path:
 
 def user_catalog_path() -> Path:
     return _config_path().with_name("llm_catalog.user.yaml")
+
+
+def custom_provider_id_from_label(label: str) -> str:
+    provider_id = re.sub(r"[^a-z0-9]+", "-", label.strip().lower()).strip("-")
+    provider_id = re.sub(r"-+", "-", provider_id)
+    if not provider_id:
+        raise ValueError("label must contain at least one letter or digit")
+    return provider_id
+
+
+def custom_provider_auth_env(provider_id: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9]+", "_", provider_id).strip("_").upper()
+    if not token:
+        raise ValueError("provider_id must contain at least one letter or digit")
+    return f"{token}_API_KEY"
+
+
+def provider_roles(cfg: dict[str, Any]) -> set[str]:
+    raw = cfg.get("roles")
+    if raw is None:
+        return set(MODEL_SETTING_ROLES)
+    if isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, list):
+        values = raw
+    else:
+        return set(MODEL_SETTING_ROLES)
+    return {str(value).strip().lower() for value in values if str(value).strip()}
+
+
+def provider_supports_model_setting(cfg: dict[str, Any]) -> bool:
+    return bool(provider_roles(cfg) & MODEL_SETTING_ROLES)
 
 
 def _models_json_path() -> Path:
@@ -73,6 +107,91 @@ def catalog_overlay_summary() -> dict[str, Any]:
         "user_path": str(overlay_path.expanduser()),
         "user_exists": overlay_path.exists(),
     }
+
+
+def load_repo_providers() -> dict[str, Any]:
+    catalog = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8")) or {}
+    providers = catalog.get("providers") if isinstance(catalog, dict) else {}
+    return providers if isinstance(providers, dict) else {}
+
+
+def load_raw_user_catalog() -> dict[str, Any]:
+    path = user_catalog_path()
+    if not path.exists():
+        return {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("user catalog must be a mapping")
+    return raw
+
+
+def load_raw_user_providers() -> dict[str, Any]:
+    raw = load_raw_user_catalog()
+    providers = raw.get("providers")
+    if providers is None:
+        return {}
+    if not isinstance(providers, dict):
+        raise ValueError("user catalog providers must be a mapping")
+    return providers
+
+
+def provider_source(provider_id: str) -> str:
+    return "bundled" if provider_id in load_repo_providers() else "custom"
+
+
+def find_provider_duplicate(provider_id: str, base_url: str) -> tuple[str, dict[str, Any]] | None:
+    normalized_base = _normalize_base_url(base_url)
+    catalog = load_catalog()
+    providers = catalog.get("providers", {})
+    if not isinstance(providers, dict):
+        return None
+    for existing_id, cfg in providers.items():
+        if not isinstance(existing_id, str) or not isinstance(cfg, dict):
+            continue
+        if existing_id == provider_id:
+            return existing_id, cfg
+        existing_base = str(cfg.get("base_url") or "")
+        if existing_base and _normalize_base_url(existing_base) == normalized_base:
+            return existing_id, cfg
+    return None
+
+
+def upsert_user_provider(provider_id: str, cfg: dict[str, Any]) -> Path:
+    if provider_id in load_repo_providers():
+        raise ValueError(f"cannot write bundled provider {provider_id!r} to user catalog")
+    required = {
+        "label": str(cfg.get("label") or provider_id).strip(),
+        "auth_env": str(cfg.get("auth_env") or custom_provider_auth_env(provider_id)).strip(),
+        "base_url": str(cfg.get("base_url") or "").strip(),
+        "api_format": str(cfg.get("api_format") or "openai-completions").strip(),
+        "models_endpoint": str(cfg.get("models_endpoint") or "/models").strip(),
+    }
+    if not required["label"]:
+        raise ValueError("label is required")
+    _validate_base_url(required["base_url"])
+    if required["api_format"] not in KNOWN_API_FORMATS:
+        raise ValueError(f"unknown api_format {required['api_format']!r}")
+
+    path = user_catalog_path()
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    content = _upsert_provider_block(text, provider_id, required)
+    _write_user_catalog_text(path, content)
+    return path
+
+
+def remove_user_provider(provider_id: str) -> tuple[Path, dict[str, Any] | None]:
+    if provider_id in load_repo_providers():
+        raise ValueError(f"cannot remove bundled provider {provider_id!r}")
+    path = user_catalog_path()
+    if not path.exists():
+        return path, None
+    raw_providers = load_raw_user_providers()
+    removed = raw_providers.get(provider_id)
+    text = path.read_text(encoding="utf-8")
+    content, did_remove = _remove_provider_block(text, provider_id)
+    if did_remove:
+        _write_user_catalog_text(path, content)
+    return path, removed if isinstance(removed, dict) else None
 
 
 def _load_valid_user_providers(
@@ -135,6 +254,97 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 def _catalog_warning(message: str) -> None:
     print(f"[jarvis-llm-catalog] {message}", file=sys.stderr)
+
+
+def _normalize_base_url(base_url: str) -> str:
+    return base_url.strip().rstrip("/")
+
+
+def _validate_base_url(base_url: str) -> None:
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("base_url must be an http or https URL")
+
+
+def _write_user_catalog_text(path: Path, content: str) -> None:
+    from .config import _atomic_write_text
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(path, content)
+
+
+def _provider_block(provider_id: str, cfg: dict[str, Any]) -> str:
+    dumped = yaml.safe_dump({provider_id: cfg}, sort_keys=False, allow_unicode=True)
+    return "".join(f"  {line}" if line.strip() else line for line in dumped.splitlines(keepends=True))
+
+
+def _find_providers_section(lines: list[str]) -> tuple[int | None, int]:
+    start: int | None = None
+    end = len(lines)
+    for idx, line in enumerate(lines):
+        if re.match(r"^providers:\s*(?:#.*)?$", line.rstrip("\r\n")):
+            start = idx
+            break
+    if start is None:
+        return None, end
+    for idx in range(start + 1, len(lines)):
+        raw = lines[idx].rstrip("\r\n")
+        if raw and not raw.startswith((" ", "\t")) and not raw.lstrip().startswith("#"):
+            end = idx
+            break
+    return start, end
+
+
+def _find_provider_block(lines: list[str], section_start: int, section_end: int, provider_id: str) -> tuple[int, int] | None:
+    key_re = re.compile(rf"^  {re.escape(provider_id)}:\s*(?:#.*)?$")
+    next_key_re = re.compile(r"^  [A-Za-z0-9_-]+:\s*(?:#.*)?$")
+    start: int | None = None
+    for idx in range(section_start + 1, section_end):
+        raw = lines[idx].rstrip("\r\n")
+        if start is None:
+            if key_re.match(raw):
+                start = idx
+            continue
+        if next_key_re.match(raw):
+            return start, idx
+    if start is not None:
+        return start, section_end
+    return None
+
+
+def _upsert_provider_block(text: str, provider_id: str, cfg: dict[str, Any]) -> str:
+    lines = text.splitlines(keepends=True)
+    block = _provider_block(provider_id, cfg)
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] += "\n"
+    section_start, section_end = _find_providers_section(lines)
+    if section_start is None:
+        prefix = "".join(lines)
+        if prefix and not prefix.endswith("\n"):
+            prefix += "\n"
+        return f"{prefix}providers:\n{block}"
+    existing = _find_provider_block(lines, section_start, section_end, provider_id)
+    if existing is not None:
+        start, end = existing
+        return "".join(lines[:start]) + block + "".join(lines[end:])
+    insert_at = section_end
+    before = "".join(lines[:insert_at])
+    after = "".join(lines[insert_at:])
+    if before and not before.endswith("\n"):
+        before += "\n"
+    return before + block + after
+
+
+def _remove_provider_block(text: str, provider_id: str) -> tuple[str, bool]:
+    lines = text.splitlines(keepends=True)
+    section_start, section_end = _find_providers_section(lines)
+    if section_start is None:
+        return text, False
+    existing = _find_provider_block(lines, section_start, section_end, provider_id)
+    if existing is None:
+        return text, False
+    start, end = existing
+    return "".join(lines[:start]) + "".join(lines[end:]), True
 
 
 def fetch_models(provider_id: str, cfg: dict[str, Any]) -> list[str] | None:

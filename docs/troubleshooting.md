@@ -96,6 +96,14 @@ then run `jarvis model-setting` again. For providers without a working
 
 See [Providers](providers.md) for overlay examples.
 
+## Custom Provider Saved But Fetch Failed
+
+`/api-key` saves a custom provider before it tests `/models`. If it prints
+`saved, but could not reach /models`, the overlay entry and key were still
+written. Start the local server, fix the base URL or key with `/api-key`, or add
+`models_static` manually for providers that do not expose a compatible
+`/models` endpoint.
+
 ## Remove Local Runtime State
 
 Only do this when you intentionally want a fresh local install:

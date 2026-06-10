@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "sidecar"))
 
 try:
-    from jarvis_sidecar.llm_setting import apply_picks, fetch_models, load_catalog
+    from jarvis_sidecar.llm_setting import apply_picks, fetch_models, load_catalog, provider_supports_model_setting
     from jarvis_sidecar.config import load_credentials_into_env
 except ImportError as e:
     print(f"ERROR: cannot import jarvis_sidecar.llm_setting ({e}). Run sidecar bootstrap first.", file=sys.stderr)
@@ -264,6 +264,10 @@ def main() -> int:
     _clear_screen()
     print("== JARVIS Code LLM setting ==")
     catalog = load_catalog()
+    catalog["providers"] = {
+        pid: cfg for pid, cfg in catalog["providers"].items()
+        if provider_supports_model_setting(cfg)
+    }
     load_credentials_into_env()
 
     print("\nFetching available models from providers with keys present...")

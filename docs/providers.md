@@ -5,7 +5,12 @@ JARVIS Code has a bundled provider catalog and an optional user overlay:
 - Bundled catalog: `scripts/llm_catalog.yaml`
 - User overlay: `~/.jarvis-code/llm_catalog.user.yaml`
 
-The overlay is read by both `/model-setting` in the terminal UI and
+Use `/api-key` as the main provider setup entrypoint. It can save keys for
+bundled providers, add OpenAI-compatible custom providers, change custom keys,
+and remove custom providers. After a provider is configured, use
+`/model-setting` to pick chat and encoder models.
+
+The overlay is read by both `/api-key`, `/model-setting` in the terminal UI, and
 `scripts/llmsetting.py`. It is only catalog metadata. After you choose chat and
 encoder models, JARVIS writes the active runtime routing to
 `~/.jarvis-code/config.yaml` and `~/.jarvis-code/providers.yaml`.
@@ -15,7 +20,8 @@ encoder models, JARVIS writes the active runtime routing to
 | Tier | Providers | Notes |
 | --- | --- | --- |
 | ✅ Tested and bundled | OpenAI OAuth, OpenAI API key, Anthropic, Google Gemini, DashScope, Ollama Cloud | Included in `scripts/llm_catalog.yaml`; use `jarvis gpt-login` for OAuth or `jarvis api-key` for API-key providers. |
-| 🟡 Custom OpenAI-compatible | GLM/Zhipu, Kimi/Moonshot, DeepSeek, Groq, OpenRouter, local Ollama, LM Studio, vLLM | Add entries to `~/.jarvis-code/llm_catalog.user.yaml` with `api_format: openai-completions`. |
+| ✅ Image generation | NVIDIA NIM | Add the NVIDIA key with `/api-key`; it enables `generate_image` and `edit_image`. |
+| 🟡 Custom OpenAI-compatible | GLM/Zhipu, Kimi/Moonshot, DeepSeek, Groq, OpenRouter, local Ollama, LM Studio, vLLM | Use `/api-key` → `Add custom provider...`; JARVIS writes `~/.jarvis-code/llm_catalog.user.yaml` for you. |
 | ⚪ Custom adapter work | Other wire formats or providers without OpenAI-compatible chat/model APIs | Not selectable from the overlay unless their `api_format` is one of JARVIS Code's known formats. |
 
 Known `api_format` values are `openai-completions`, `anthropic`,
@@ -32,7 +38,46 @@ instruction-following models from the bundled catalog. Do not use reasoning
 models as the encoder; the encoder should be predictable, inexpensive, and
 quiet, not a long-reasoning agent.
 
-## Overlay Format
+## Image Generation
+
+Add your NVIDIA key through `/api-key` -> `NVIDIA NIM (image generation)`.
+That enables `generate_image` and `edit_image`. Image generation stays on the
+fixed FLUX defaults; `/model-setting` only chooses chat and encoder models.
+
+## Add A Custom Provider
+
+In the terminal UI:
+
+```text
+/api-key
+```
+
+Choose `Add custom provider...`, then enter:
+
+- base URL, such as `https://api.example.com/v1`
+- display name, such as `DeepSeek` or `GLM / Zhipu`
+- API key
+
+JARVIS derives the provider id from the label, stores the key in the normal
+credentials file, writes the catalog entry to
+`~/.jarvis-code/llm_catalog.user.yaml`, and immediately tries the provider's
+`/models` endpoint. If the fetch fails, the provider is still saved; fix the URL
+or key and run `/api-key` again to change the key.
+
+Then run:
+
+```text
+/model-setting
+```
+
+For shell setup without the terminal UI, use:
+
+```bash
+jarvis api-key
+jarvis model-setting
+```
+
+## Advanced Overlay Format
 
 Create `~/.jarvis-code/llm_catalog.user.yaml`:
 
@@ -65,7 +110,7 @@ If the overlay YAML is broken, JARVIS prints a warning and uses the bundled
 catalog. If one provider entry is invalid, that entry is skipped and the rest of
 the catalog still loads.
 
-## Full Example
+## Advanced Full Example
 
 This example combines common OpenAI-compatible endpoints. Keep only the
 providers you use, and set the matching environment variables to `YOUR_KEY_HERE`

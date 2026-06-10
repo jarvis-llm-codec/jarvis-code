@@ -214,6 +214,10 @@ type SidecarCredentialTarget = {
 	env_name?: string;
 	kind?: string;
 	configured?: boolean;
+	source?: "bundled" | "custom";
+	custom?: boolean;
+	base_url?: string;
+	roles?: string[];
 };
 
 type SidecarCredentialCatalogResponse = {
@@ -236,6 +240,25 @@ type SidecarCredentialSetResponse = {
 		models?: number;
 		skipped?: boolean;
 	};
+};
+
+type SidecarCredentialCustomResponse = {
+	ok?: boolean;
+	error?: string;
+	provider_id?: string;
+	label?: string;
+	env_name?: string;
+	source?: "bundled" | "custom";
+	duplicate?: boolean;
+	validation?: SidecarCredentialSetResponse["validation"];
+};
+
+type SidecarCredentialRemoveResponse = {
+	ok?: boolean;
+	error?: string;
+	provider_id?: string;
+	env_name?: string | null;
+	removed_key?: boolean;
 };
 
 type ToolEventSummary = {
@@ -3601,33 +3624,137 @@ function runPythonLoginCli(
 }
 
 async function runApiKeySetting(ctx: ExtensionContext): Promise<void> {
-	const catalog = await postSidecar<SidecarCredentialCatalogResponse>("/credentials/catalog", undefined, "GET");
-	if (!catalog?.ok || !catalog.targets) {
-		ctx.ui.notify(`JARVIS api-key: credential catalog failed (${catalog?.error ?? "sidecar unavailable"})`, "error");
+	while (true) {
+		const catalog = await postSidecar<SidecarCredentialCatalogResponse>("/credentials/catalog", undefined, "GET");
+		if (!catalog?.ok || !catalog.targets) {
+			ctx.ui.notify(
+				`JARVIS api-key: credential catalog failed (${catalog?.error ?? "sidecar unavailable"})`,
+				"error",
+			);
+			return;
+		}
+		const entries = Object.entries(catalog.targets);
+		const labels = entries.map(([id, target]) => apiKeyProviderLabel(id, target));
+		const addLabel = "[+] Add custom provider…";
+		const separator = "─────────────────────────────";
+		const picked = await ctx.ui.select("API key setup — select a provider:", [...labels, separator, addLabel]);
+		if (picked === undefined) return;
+		if (picked === separator) continue;
+		if (picked === addLabel) {
+			await runApiKeyAddCustomProvider(ctx, entries);
+			continue;
+		}
+		const idx = labels.indexOf(picked);
+		if (idx < 0) continue;
+		const [providerId, target] = entries[idx]!;
+		const action = await pickApiKeyAction(ctx, target);
+		if (action === undefined) return;
+		if (action === "Change key") {
+			await changeApiKeyForTarget(ctx, providerId, target);
+			continue;
+		}
+		if (action === "Remove") {
+			await removeCustomApiKeyProvider(ctx, providerId, target);
+		}
+	}
+}
+
+function apiKeyProviderLabel(id: string, target: SidecarCredentialTarget): string {
+	const isCustom = target.custom === true || target.source === "custom";
+	const marker = isCustom && target.configured ? "[*]" : target.configured ? "[v]" : "[ ]";
+	const custom = isCustom ? "  (custom)" : "";
+	const status = target.configured ? "key set" : "no key";
+	return `${marker} ${target.label ?? id}${custom}   ${status}`;
+}
+
+async function pickApiKeyAction(ctx: ExtensionContext, target: SidecarCredentialTarget): Promise<string | undefined> {
+	const isCustom = target.custom === true || target.source === "custom";
+	const actions = isCustom ? ["Change key", "Remove"] : ["Change key"];
+	return ctx.ui.select(`${target.label ?? "Provider"} API key`, actions);
+}
+
+async function runApiKeyAddCustomProvider(
+	ctx: ExtensionContext,
+	entries: Array<[string, SidecarCredentialTarget]>,
+): Promise<void> {
+	const baseUrl = (await ctx.ui.input("Custom provider base URL", "https://api.example.com/v1"))?.trim();
+	if (baseUrl === undefined) return;
+	if (!baseUrl) {
+		ctx.ui.notify("Base URL was empty; nothing saved.", "warning");
 		return;
 	}
-	const entries = Object.entries(catalog.targets).sort((a, b) => {
-		const ac = a[1].configured ? 0 : 1;
-		const bc = b[1].configured ? 0 : 1;
-		if (ac !== bc) return ac - bc;
-		return (a[1].label ?? a[0]).localeCompare(b[1].label ?? b[0]);
+	const label = (await ctx.ui.input("Custom provider display name", "GLM / Zhipu"))?.trim();
+	if (label === undefined) return;
+	if (!label) {
+		ctx.ui.notify("Provider label was empty; nothing saved.", "warning");
+		return;
+	}
+	const duplicate = findApiKeyDuplicate(entries, label, baseUrl);
+	if (duplicate) {
+		const confirmed = await ctx.ui.confirm("Custom provider already exists", "already exists — change its key?");
+		if (!confirmed) return;
+		await changeApiKeyForTarget(ctx, duplicate[0], duplicate[1]);
+		return;
+	}
+	const apiKey = await ctx.ui.input(`Enter ${label} API key`, "API key");
+	if (apiKey === undefined) return;
+	if (!apiKey.trim()) {
+		ctx.ui.notify("API key was empty; nothing saved.", "warning");
+		return;
+	}
+	const result = await postSidecar<SidecarCredentialCustomResponse>("/credentials/custom", {
+		label,
+		base_url: baseUrl,
+		api_key: apiKey.trim(),
+		validate: true,
 	});
-	const labels = entries.map(([id, target]) => {
-		const status = target.configured ? "configured" : "missing";
-		const envName = target.env_name ? ` ${target.env_name}` : "";
-		return `${target.label ?? id} (${status})${envName}`;
+	if (!result?.ok) {
+		ctx.ui.notify(`JARVIS custom provider save failed: ${result?.error ?? "sidecar unavailable"}`, "error");
+		return;
+	}
+	refreshPiRuntimeAuth(ctx);
+	notifyApiKeyValidation(ctx, result.label ?? label, result.validation);
+	ctx.ui.notify("Pick models with /model-setting.", "info");
+}
+
+function findApiKeyDuplicate(
+	entries: Array<[string, SidecarCredentialTarget]>,
+	label: string,
+	baseUrl: string,
+): [string, SidecarCredentialTarget] | undefined {
+	const providerId = providerIdFromLabel(label);
+	const normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+	return entries.find(([id, target]) => {
+		if (id === providerId) return true;
+		return Boolean(target.base_url && normalizeBaseUrl(target.base_url) === normalizedBaseUrl);
 	});
-	const picked = await ctx.ui.select("Save API key for", labels);
-	if (picked === undefined) return;
-	const idx = labels.indexOf(picked);
-	if (idx < 0) return;
-	const [, target] = entries[idx];
+}
+
+function providerIdFromLabel(label: string): string {
+	return label
+		.trim()
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.replace(/-+/g, "-");
+}
+
+function normalizeBaseUrl(baseUrl: string): string {
+	return baseUrl.trim().replace(/\/+$/, "");
+}
+
+async function changeApiKeyForTarget(
+	ctx: ExtensionContext,
+	providerId: string,
+	target: SidecarCredentialTarget,
+): Promise<void> {
 	const envName = target.env_name;
 	if (!envName) {
 		ctx.ui.notify("Selected provider has no API-key environment variable.", "warning");
 		return;
 	}
-	const key = await ctx.ui.input(`Enter ${target.label ?? envName} API key`, envName);
+	const label = target.label ?? providerId;
+	const key = await ctx.ui.input(`Enter ${label} API key`, envName);
 	if (key === undefined) return;
 	if (!key.trim()) {
 		ctx.ui.notify("API key was empty; nothing saved.", "warning");
@@ -3638,14 +3765,58 @@ async function runApiKeySetting(ctx: ExtensionContext): Promise<void> {
 		value: key.trim(),
 		validate: true,
 	});
-	if (!result?.ok) {
-		const detail = result?.validation?.error ?? result?.error ?? "validation failed";
-		ctx.ui.notify(`JARVIS saved ${envName}, but validation failed: ${detail}`, "warning");
+	if (!result) {
+		ctx.ui.notify("JARVIS api-key: sidecar unavailable", "error");
 		return;
 	}
-	const validation = result.validation;
-	const suffix = validation?.models ? ` (${validation.models} models)` : "";
-	ctx.ui.notify(`JARVIS saved ${envName}${suffix}.`, "info");
+	refreshPiRuntimeAuth(ctx);
+	notifyApiKeyValidation(ctx, label, result.validation, result.error);
+}
+
+async function removeCustomApiKeyProvider(
+	ctx: ExtensionContext,
+	providerId: string,
+	target: SidecarCredentialTarget,
+): Promise<void> {
+	const confirmed = await ctx.ui.confirm(
+		`Remove ${target.label ?? providerId}`,
+		"Remove this custom provider and its saved API key?",
+	);
+	if (!confirmed) return;
+	const result = await postSidecar<SidecarCredentialRemoveResponse>("/credentials/custom/remove", {
+		provider_id: providerId,
+		remove_key: true,
+	});
+	if (!result?.ok) {
+		ctx.ui.notify(`JARVIS custom provider remove failed: ${result?.error ?? "sidecar unavailable"}`, "error");
+		return;
+	}
+	refreshPiRuntimeAuth(ctx);
+	ctx.ui.notify(`Removed ${target.label ?? providerId}. Pick models with /model-setting.`, "info");
+}
+
+function notifyApiKeyValidation(
+	ctx: ExtensionContext,
+	label: string,
+	validation?: SidecarCredentialSetResponse["validation"],
+	error?: string,
+): void {
+	if (validation?.ok) {
+		if (validation.skipped || validation.warning) {
+			const suffix = validation.warning ? ` — ${validation.warning}` : "";
+			ctx.ui.notify(`${label}: saved${suffix}`, "info");
+			return;
+		}
+		const suffix = typeof validation.models === "number" ? ` — ${validation.models} models` : "";
+		ctx.ui.notify(`${label}: connected${suffix}`, "info");
+		return;
+	}
+	const detail = validation?.error ?? error ?? "check URL or key";
+	if (/could not reach \/models/i.test(detail)) {
+		ctx.ui.notify(`${label}: saved, but could not reach /models — check URL or key`, "warning");
+		return;
+	}
+	ctx.ui.notify(`${label}: saved, but validation failed: ${detail}`, "warning");
 }
 
 async function runModelSetting(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {

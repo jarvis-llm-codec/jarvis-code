@@ -27,6 +27,7 @@ OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.5"
 OPENAI_CODEX_ENCODER_MODEL = "gpt-5.4-mini"
 NO_CREDENTIAL_EXIT = 42
 MODEL_SETTING_EXIT = 43
+ADD_CUSTOM_PROVIDER = "__add_custom_provider__"
 
 BUILT_IN_MODEL_PROVIDERS = {
     "amazon-bedrock",
@@ -169,10 +170,14 @@ def _load_credentials_into_env() -> None:
 
 
 def configured_api_key_envs(catalog: dict[str, Any] | None = None) -> list[str]:
+    from jarvis_sidecar.llm_setting import provider_supports_model_setting
+
     _load_credentials_into_env()
     cat = catalog or _load_catalog()
     envs: list[str] = []
     for cfg in cat.get("providers", {}).values():
+        if not isinstance(cfg, dict) or not provider_supports_model_setting(cfg):
+            continue
         env_name = cfg.get("auth_env")
         if isinstance(env_name, str) and env_name.strip() and os.environ.get(env_name, "").strip():
             envs.append(env_name)
@@ -388,6 +393,9 @@ def cmd_gpt_logout(_args: argparse.Namespace) -> int:
 
 def api_key_targets(catalog: dict[str, Any] | None = None) -> list[tuple[str, dict[str, Any]]]:
     cat = catalog or _load_catalog()
+    from jarvis_sidecar.llm_setting import load_repo_providers
+
+    repo_provider_ids = set(load_repo_providers())
     targets: list[tuple[str, dict[str, Any]]] = []
     for provider_id, cfg in cat.get("providers", {}).items():
         if cfg.get("enabled") is False or cfg.get("auth_kind") == "oauth":
@@ -395,8 +403,11 @@ def api_key_targets(catalog: dict[str, Any] | None = None) -> list[tuple[str, di
         env_name = cfg.get("auth_env")
         if not isinstance(env_name, str) or not env_name.strip():
             continue
-        targets.append((provider_id, cfg))
-    targets.sort(key=lambda item: str(item[1].get("label", item[0])).lower())
+        entry = dict(cfg)
+        source = "bundled" if provider_id in repo_provider_ids else "custom"
+        entry["source"] = source
+        entry["custom"] = source == "custom"
+        targets.append((provider_id, entry))
     return targets
 
 
@@ -411,13 +422,14 @@ def select_api_key_target(provider: str | None) -> tuple[str, dict[str, Any]] | 
         print(f"Unknown API-key provider/env: {provider}", file=sys.stderr)
         return None
 
-    print("JARVIS API key setup")
+    print("API key setup — select a provider:")
     print()
     for idx, (provider_id, cfg) in enumerate(targets, start=1):
         label = cfg.get("label", provider_id)
-        env_name = cfg.get("auth_env")
-        configured = " configured" if os.environ.get(str(env_name), "").strip() else ""
-        print(f"  {idx}. {label} ({env_name}){configured}")
+        print(f"  {idx}. {api_key_target_label(provider_id, cfg)}")
+    add_idx = len(targets) + 1
+    print("  " + "─" * 29)
+    print(f"  {add_idx}. [+] Add custom provider...")
     print()
     raw = input("Choose provider number: ").strip()
     try:
@@ -425,10 +437,21 @@ def select_api_key_target(provider: str | None) -> tuple[str, dict[str, Any]] | 
     except ValueError:
         print("Invalid provider number.", file=sys.stderr)
         return None
+    if choice == add_idx:
+        return ADD_CUSTOM_PROVIDER, {}
     if choice < 1 or choice > len(targets):
         print("Provider number out of range.", file=sys.stderr)
         return None
     return targets[choice - 1]
+
+
+def api_key_target_label(provider_id: str, cfg: dict[str, Any]) -> str:
+    is_custom = bool(cfg.get("custom") or cfg.get("source") == "custom")
+    configured = bool(os.environ.get(str(cfg.get("auth_env", "")), "").strip())
+    marker = "[*]" if is_custom and configured else "[v]" if configured else "[ ]"
+    custom = "  (custom)" if is_custom else ""
+    status = "key set" if configured else "no key"
+    return f"{marker} {cfg.get('label', provider_id)}{custom}   {status}"
 
 
 def cmd_api_key(args: argparse.Namespace) -> int:
@@ -437,25 +460,103 @@ def cmd_api_key(args: argparse.Namespace) -> int:
     if target is None:
         return 2
     provider_id, cfg = target
+    if provider_id == ADD_CUSTOM_PROVIDER:
+        return cmd_api_key_add_custom(args)
+    if cfg.get("custom") and args.provider is None:
+        action = input("Choose action: [1] Change key  [2] Remove: ").strip()
+        if action == "2":
+            return cmd_api_key_remove_custom(provider_id, cfg)
+        if action not in {"", "1"}:
+            print("Invalid action.", file=sys.stderr)
+            return 2
+    return save_api_key_for_target(provider_id, cfg, args.value)
+
+
+def save_api_key_for_target(provider_id: str, cfg: dict[str, Any], value_arg: str | None) -> int:
     env_name = str(cfg["auth_env"])
     label = str(cfg.get("label", provider_id))
-    value = args.value or getpass.getpass(f"Enter {label} API key ({env_name}): ").strip()
+    value = value_arg or getpass.getpass(f"Enter {label} API key ({env_name}): ").strip()
     if not value:
         print("API key was empty; nothing saved.", file=sys.stderr)
         return 2
 
     from jarvis_sidecar.config import save_credential_env
-    from jarvis_sidecar.llm_setting import fetch_models
+    from jarvis_sidecar.llm_setting import fetch_models, provider_supports_model_setting
 
     path = save_credential_env(env_name, value)
-    models = fetch_models(provider_id, cfg)
-    if models:
+    if not provider_supports_model_setting(cfg):
+        print(f"Saved {env_name} to {path}. Live model validation skipped for this provider.")
+    elif models := fetch_models(provider_id, cfg):
         print(f"Saved {env_name} to {path}. Validation ok ({len(models)} models).")
     else:
         print(f"Saved {env_name} to {path}. Live model validation did not return models.")
     print()
     print("Next:")
     print("    jarvis model-setting")
+    return 0
+
+
+def cmd_api_key_add_custom(args: argparse.Namespace) -> int:
+    from jarvis_sidecar.llm_setting import (
+        custom_provider_auth_env,
+        custom_provider_id_from_label,
+        find_provider_duplicate,
+        upsert_user_provider,
+    )
+
+    base_url = input("Custom provider base URL: ").strip().rstrip("/")
+    if not base_url:
+        print("Base URL was empty; nothing saved.", file=sys.stderr)
+        return 2
+    label = input("Custom provider display name: ").strip()
+    if not label:
+        print("Provider label was empty; nothing saved.", file=sys.stderr)
+        return 2
+    provider_id = custom_provider_id_from_label(label)
+    duplicate = find_provider_duplicate(provider_id, base_url)
+    if duplicate is not None:
+        existing_id, existing_cfg = duplicate
+        answer = input("already exists — change its key? [y/N]: ").strip().lower()
+        if answer not in {"y", "yes"}:
+            return 0
+        return save_api_key_for_target(existing_id, existing_cfg, args.value)
+
+    env_name = custom_provider_auth_env(provider_id)
+    cfg = {
+        "label": label,
+        "auth_env": env_name,
+        "base_url": base_url,
+        "api_format": "openai-completions",
+        "models_endpoint": "/models",
+    }
+    value = args.value or getpass.getpass(f"Enter {label} API key: ").strip()
+    if not value:
+        print("API key was empty; nothing saved.", file=sys.stderr)
+        return 2
+    try:
+        upsert_user_provider(provider_id, cfg)
+    except (OSError, ValueError) as exc:
+        print(f"Custom provider save failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    return save_api_key_for_target(provider_id, cfg, value)
+
+
+def cmd_api_key_remove_custom(provider_id: str, cfg: dict[str, Any]) -> int:
+    answer = input(f"Remove {cfg.get('label', provider_id)} and its saved API key? [y/N]: ").strip().lower()
+    if answer not in {"y", "yes"}:
+        return 0
+    from jarvis_sidecar.config import remove_credential_env
+    from jarvis_sidecar.llm_setting import remove_user_provider
+
+    try:
+        _path, removed = remove_user_provider(provider_id)
+        env_name = removed.get("auth_env") if isinstance(removed, dict) else cfg.get("auth_env")
+        if isinstance(env_name, str) and env_name.strip():
+            remove_credential_env(env_name)
+    except (OSError, ValueError) as exc:
+        print(f"Custom provider remove failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    print(f"Removed {cfg.get('label', provider_id)}. Pick models with /model-setting.")
     return 0
 
 

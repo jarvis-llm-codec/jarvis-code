@@ -38,6 +38,8 @@ const ASSETS_URL = "https://api.nvcf.nvidia.com/v2/nvcf/assets";
 // 화려/고속이 필요하면 model 파라미터로 flux.2-klein-4b / flux.1-schnell 선택.
 const DEFAULT_MODEL = "black-forest-labs/flux.1-dev";
 const DEFAULT_EDIT_MODEL = "black-forest-labs/flux.1-kontext-dev";
+const MISSING_NVIDIA_KEY_MESSAGE =
+	"Image generation is off. Add your NVIDIA key: /api-key → NVIDIA NIM (free tier: build.nvidia.com)";
 
 // FLUX.1-dev가 허용하는 width/height 격자 — 그 밖의 값은 422. 가장 가까운 값으로 스냅.
 const ALLOWED_DIMS = [768, 832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344];
@@ -337,11 +339,7 @@ export const generateImageTool = defineTool({
 	async execute(_toolCallId, params, signal, onUpdate, ctx: ExtensionContext) {
 		const apiKey = resolveApiKey();
 		if (!apiKey) {
-			return errorResult(
-				"No NVIDIA API key found. Set NVIDIA_API_KEY (or NIM_API_KEY) in the environment, " +
-					"or add it under the `env:` block of your jarvis-code credentials.yaml.",
-				"missing_api_key",
-			);
+			return errorResult(MISSING_NVIDIA_KEY_MESSAGE, "missing_api_key");
 		}
 		const cwd = resolveCwd(ctx);
 		const model = (params.model || process.env.JLC_IMAGE_MODEL || DEFAULT_MODEL).trim();
@@ -422,11 +420,7 @@ export const editImageTool = defineTool({
 	async execute(_toolCallId, params, signal, onUpdate, ctx: ExtensionContext) {
 		const apiKey = resolveApiKey();
 		if (!apiKey) {
-			return errorResult(
-				"No NVIDIA API key found. Set NVIDIA_API_KEY (or NIM_API_KEY) in the environment, " +
-					"or add it under the `env:` block of your jarvis-code credentials.yaml.",
-				"missing_api_key",
-			);
+			return errorResult(MISSING_NVIDIA_KEY_MESSAGE, "missing_api_key");
 		}
 		const cwd = resolveCwd(ctx);
 		const model = (params.model || process.env.JLC_IMAGE_EDIT_MODEL || DEFAULT_EDIT_MODEL).trim();

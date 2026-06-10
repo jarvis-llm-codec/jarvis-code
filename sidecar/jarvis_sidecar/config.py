@@ -467,6 +467,19 @@ def save_credential_env(env_name: str, value: str) -> Path:
     return credentials_path()
 
 
+def remove_credential_env(env_name: str) -> Path:
+    env_name = env_name.strip()
+    if not env_name:
+        raise ValueError("env_name is required")
+    raw = load_credentials()
+    env_map = raw.get("env")
+    if isinstance(env_map, dict):
+        env_map.pop(env_name, None)
+    write_credentials(raw)
+    os.environ.pop(env_name, None)
+    return credentials_path()
+
+
 def write_sidecar_config(raw: dict[str, Any]) -> None:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)

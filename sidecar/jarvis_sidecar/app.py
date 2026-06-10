@@ -7,6 +7,7 @@ import re
 import sys
 import threading
 import traceback
+import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+import yaml
 
 from jlc_agentic.agentic.tools.web_search import handler as brave_web_search
 from jlc_agentic.providers import get_llm
@@ -34,14 +36,24 @@ from .config import (
     internal_memory_root,
     load_credentials_into_env,
     providers_path,
+    remove_credential_env,
     save_credential_env,
     setup_default_project_root,
 )
 from .evidence import EvidenceError, retrieve_evidence, run_evidence_gc, store_evidence
 from .llm_setting import apply_picks as llm_apply_picks
+from .llm_setting import custom_provider_auth_env as llm_custom_provider_auth_env
+from .llm_setting import custom_provider_id_from_label as llm_custom_provider_id_from_label
 from .llm_setting import current_roles as llm_current_roles
+from .llm_setting import find_provider_duplicate as llm_find_provider_duplicate
 from .llm_setting import fetch_all as llm_fetch_all
 from .llm_setting import load_catalog as llm_load_catalog
+from .llm_setting import load_repo_providers as llm_load_repo_providers
+from .llm_setting import provider_roles as llm_provider_roles
+from .llm_setting import provider_source as llm_provider_source
+from .llm_setting import provider_supports_model_setting as llm_provider_supports_model_setting
+from .llm_setting import remove_user_provider as llm_remove_user_provider
+from .llm_setting import upsert_user_provider as llm_upsert_user_provider
 from .memory_files import (
     clear_interrupt_checkpoint,
     ensure_workspace_memory,
@@ -485,6 +497,18 @@ class CredentialSetRequest(BaseModel):
     env_name: str
     value: str
     do_validate: bool = Field(default=True, alias="validate")
+
+
+class CredentialCustomProviderRequest(BaseModel):
+    label: str
+    base_url: str
+    api_key: str
+    do_validate: bool = Field(default=True, alias="validate")
+
+
+class CredentialCustomProviderRemoveRequest(BaseModel):
+    provider_id: str
+    remove_key: bool = True
 
 
 router = ProjectRouter()
@@ -2012,22 +2036,32 @@ def credentials_catalog() -> dict[str, Any]:
     """Credential targets used by the Pi /api-key command."""
     load_credentials_into_env()
     catalog = llm_load_catalog()
+    repo_providers = llm_load_repo_providers()
     targets: dict[str, dict[str, Any]] = {}
     for pid, cfg in catalog.get("providers", {}).items():
         env_name = cfg.get("auth_env")
         if not isinstance(env_name, str) or not env_name.strip():
             continue
+        source = "bundled" if pid in repo_providers else "custom"
+        roles = sorted(llm_provider_roles(cfg))
+        kind = "llm" if llm_provider_supports_model_setting(cfg) else ("image" if "image" in roles else "provider")
         targets[pid] = {
             "label": cfg.get("label", pid),
             "env_name": env_name,
-            "kind": "llm",
+            "kind": kind,
             "configured": bool(os.environ.get(env_name, "").strip()),
+            "source": source,
+            "custom": source == "custom",
+            "base_url": cfg.get("base_url"),
+            "roles": roles,
         }
     targets["brave-search"] = {
         "label": "Brave Search",
         "env_name": "BRAVE_SEARCH_API_KEY",
         "kind": "web_search",
         "configured": bool(os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()),
+        "source": "bundled",
+        "custom": False,
     }
     return {"ok": True, "targets": targets, "credentials_path": str(credentials_path())}
 
@@ -2057,6 +2091,111 @@ def credentials_set(req: CredentialSetRequest) -> dict[str, Any]:
     }
 
 
+@app.post("/credentials/custom")
+def credentials_custom_provider(req: CredentialCustomProviderRequest) -> dict[str, Any]:
+    label = req.label.strip()
+    base_url = req.base_url.strip().rstrip("/")
+    api_key = req.api_key.strip()
+    if not label:
+        return {"ok": False, "error": "label is required"}
+    if not _is_http_base_url(base_url):
+        return {"ok": False, "error": "base_url must be an http or https URL"}
+    if not api_key:
+        return {"ok": False, "error": "api_key is required"}
+
+    try:
+        provider_id = llm_custom_provider_id_from_label(label)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    duplicate = llm_find_provider_duplicate(provider_id, base_url)
+    duplicate_provider_id: str | None = None
+    if duplicate is not None:
+        duplicate_provider_id, duplicate_cfg = duplicate
+        env_name = duplicate_cfg.get("auth_env")
+        if not isinstance(env_name, str) or not env_name.strip():
+            return {"ok": False, "error": f"provider {duplicate_provider_id} does not accept API-key credentials"}
+        provider_id = duplicate_provider_id
+        cfg = dict(duplicate_cfg)
+        source = llm_provider_source(provider_id)
+        if source == "custom" and duplicate_provider_id == llm_custom_provider_id_from_label(label):
+            cfg.update(
+                {
+                    "label": label,
+                    "auth_env": env_name,
+                    "base_url": base_url,
+                    "api_format": "openai-completions",
+                    "models_endpoint": "/models",
+                }
+            )
+            try:
+                llm_upsert_user_provider(provider_id, cfg)
+            except (OSError, ValueError, yaml.YAMLError) as exc:
+                return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    else:
+        env_name = llm_custom_provider_auth_env(provider_id)
+        source = "custom"
+        cfg = {
+            "label": label,
+            "auth_env": env_name,
+            "base_url": base_url,
+            "api_format": "openai-completions",
+            "models_endpoint": "/models",
+        }
+        try:
+            llm_upsert_user_provider(provider_id, cfg)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    try:
+        credentials_file = save_credential_env(env_name, api_key)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    validation = _validate_provider_models(provider_id, cfg) if req.do_validate else {"ok": True, "skipped": True}
+    _refresh_provider_runtime()
+    return {
+        "ok": True,
+        "provider_id": provider_id,
+        "label": cfg.get("label", provider_id),
+        "env_name": env_name,
+        "source": source,
+        "duplicate": duplicate_provider_id is not None,
+        "credentials_path": str(credentials_file),
+        "validation": validation,
+    }
+
+
+@app.post("/credentials/custom/remove")
+def credentials_custom_provider_remove(req: CredentialCustomProviderRemoveRequest) -> dict[str, Any]:
+    provider_id = req.provider_id.strip()
+    if not provider_id:
+        return {"ok": False, "error": "provider_id is required"}
+    if provider_id in llm_load_repo_providers():
+        return {"ok": False, "error": "bundled providers cannot be removed"}
+    try:
+        _overlay_path, removed = llm_remove_user_provider(provider_id)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if removed is None:
+        return {"ok": False, "error": "custom provider not found"}
+    env_name = removed.get("auth_env")
+    credentials_file: str | None = None
+    if req.remove_key and isinstance(env_name, str) and env_name.strip():
+        try:
+            credentials_file = str(remove_credential_env(env_name))
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    _refresh_provider_runtime()
+    return {
+        "ok": True,
+        "provider_id": provider_id,
+        "removed_key": bool(req.remove_key and env_name),
+        "env_name": env_name if isinstance(env_name, str) else None,
+        "credentials_path": credentials_file,
+    }
+
+
 def _validate_credential_env(env_name: str) -> dict[str, Any]:
     if env_name == "BRAVE_SEARCH_API_KEY":
         result = brave_web_search("jarvis code", top_k=1)
@@ -2072,10 +2211,36 @@ def _validate_credential_env(env_name: str) -> dict[str, Any]:
     if not matched:
         return {"ok": True, "warning": "saved; no live validator for this env"}
     for pid in matched:
-        models = llm_fetch_all({"providers": {pid: catalog["providers"][pid]}}).get(pid)
+        cfg = catalog["providers"][pid]
+        if not llm_provider_supports_model_setting(cfg):
+            continue
+        models = llm_fetch_all({"providers": {pid: cfg}}).get(pid)
         if models:
             return {"ok": True, "provider": pid, "models": len(models)}
+    if all(not llm_provider_supports_model_setting(catalog["providers"][pid]) for pid in matched):
+        return {"ok": True, "provider": matched[0], "skipped": True, "warning": "saved; no live validator for image provider"}
     return {"ok": False, "error": f"saved, but validation failed for: {', '.join(matched)}"}
+
+
+def _is_http_base_url(base_url: str) -> bool:
+    parsed = urllib.parse.urlparse(base_url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _validate_provider_models(provider_id: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    load_credentials_into_env()
+    models = llm_fetch_all({"providers": {provider_id: cfg}}).get(provider_id)
+    if models is not None:
+        return {"ok": True, "provider": provider_id, "models": len(models)}
+    return {"ok": False, "provider": provider_id, "error": "saved, but could not reach /models"}
+
+
+def _refresh_provider_runtime() -> None:
+    try:
+        clear_cache()
+        _init_provider_router()
+    except Exception:
+        pass
 
 
 @app.post("/register_project")
@@ -2410,9 +2575,15 @@ def llmsetting_catalog() -> dict[str, Any]:
     roles. Consumed by the Pi /model-setting slash command."""
     load_credentials_into_env()
     catalog = llm_load_catalog()
+    providers = {
+        pid: cfg
+        for pid, cfg in catalog["providers"].items()
+        if llm_provider_supports_model_setting(cfg)
+    }
+    catalog = {**catalog, "providers": providers}
     fetched = llm_fetch_all(catalog)
     providers_out: dict[str, dict[str, Any]] = {}
-    for pid, cfg in catalog["providers"].items():
+    for pid, cfg in providers.items():
         models = fetched.get(pid)
         if cfg.get("enabled") is False:
             available = False
