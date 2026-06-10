@@ -54,7 +54,7 @@ def _paperlog_path(session_id: str | None) -> Path:
 
 _path_locks: "OrderedDict[str, threading.Lock]" = OrderedDict()
 _path_locks_guard = threading.Lock()
-_MAX_PATH_LOCKS = 100
+_MAX_PATH_LOCKS = 10_000
 
 
 def _get_path_lock(path_key: str) -> threading.Lock:

@@ -433,26 +433,26 @@ class JarvisAgentic:
                 return
             import os
             import sys
-        if os.environ.get("JARVIS_SKIP_EMBEDDER_WARMUP") == "1":
-            print("[jlc:embed] warmup skipped (JARVIS_SKIP_EMBEDDER_WARMUP=1)", file=sys.stderr, flush=True)
-            return
-        try:
-            print("[jlc:embed] Loading bge-m3 weights...", file=sys.stderr, flush=True)
-            embedder = self._get_embedder()  # build wrapper (cheap; weights load on first embed)
-            embedder.embed(["warmup"])  # force SentenceTransformer load before chat starts; without this, the first turn's retriever and the encoder's JRE race on _ensure_model and BOTH load weights
-            self._embedder_warmed = True
-            print(
-                f"[jlc:embed] Embedder ready (dim={embedder.dim}).",
-                file=sys.stderr,
-                flush=True,
-            )
-        except Exception as exc:
-            print(f"[jlc:warmup] embedder warmup deferred: {exc}", file=sys.stderr, flush=True)
-        except BaseException as exc:  # noqa: BLE001
-            # SentenceTransformer load can SystemExit / segfault via torch DLL conflicts
-            # (e.g., after partial SWE-bench install). Catch BaseException so the sidecar
-            # survives in light-memory mode instead of dying silently at startup.
-            print(f"[jlc:warmup] embedder warmup crashed (degraded mode): {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            if os.environ.get("JARVIS_SKIP_EMBEDDER_WARMUP") == "1":
+                print("[jlc:embed] warmup skipped (JARVIS_SKIP_EMBEDDER_WARMUP=1)", file=sys.stderr, flush=True)
+                return
+            try:
+                print("[jlc:embed] Loading bge-m3 weights...", file=sys.stderr, flush=True)
+                embedder = self._get_embedder()  # build wrapper (cheap; weights load on first embed)
+                embedder.embed(["warmup"])  # force SentenceTransformer load before chat starts; without this, the first turn's retriever and the encoder's JRE race on _ensure_model and BOTH load weights
+                self._embedder_warmed = True
+                print(
+                    f"[jlc:embed] Embedder ready (dim={embedder.dim}).",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[jlc:warmup] embedder warmup deferred: {exc}", file=sys.stderr, flush=True)
+            except BaseException as exc:  # noqa: BLE001
+                # SentenceTransformer load can SystemExit / segfault via torch DLL conflicts
+                # (e.g., after partial SWE-bench install). Catch BaseException so the sidecar
+                # survives in light-memory mode instead of dying silently at startup.
+                print(f"[jlc:warmup] embedder warmup crashed (degraded mode): {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
 
     def recall_for_query(
         self,

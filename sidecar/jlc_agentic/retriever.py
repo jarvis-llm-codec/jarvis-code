@@ -294,6 +294,74 @@ class JLCRetriever:
 
     # ── Index ──
 
+    def _index_jsonl_path(self, conv_id: str) -> Path:
+        return self._conv_dir(conv_id) / "index.jsonl"
+
+    def _legacy_index_json_path(self, conv_id: str) -> Path:
+        return self._conv_dir(conv_id) / "index.json"
+
+    @staticmethod
+    def _index_jsonl_text(index_data: list[dict[str, Any]]) -> str:
+        if not index_data:
+            return ""
+        return "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in index_data)
+
+    @staticmethod
+    def _next_migrated_index_path(legacy_path: Path) -> Path:
+        preferred = legacy_path.with_name(f"{legacy_path.name}.migrated")
+        if not preferred.exists():
+            return preferred
+        for suffix in range(1, 1000):
+            candidate = legacy_path.with_name(f"{legacy_path.name}.migrated.{suffix}")
+            if not candidate.exists():
+                return candidate
+        return legacy_path.with_name(f"{legacy_path.name}.migrated.{int(time.time())}")
+
+    def _migrate_legacy_index(self, conv_id: str) -> None:
+        legacy_path = self._legacy_index_json_path(conv_id)
+        if not legacy_path.exists():
+            return
+
+        index_data: list[dict[str, Any]] = []
+        try:
+            raw_index = json.loads(legacy_path.read_text(encoding="utf-8"))
+            if isinstance(raw_index, list):
+                index_data = [entry for entry in raw_index if isinstance(entry, dict)]
+            else:
+                print(f"[jlc:ret] legacy index.json for {conv_id} not a list, migrating as empty", file=sys.stderr)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[jlc:ret] legacy index.json migration failed for {conv_id}: {exc}", file=sys.stderr)
+
+        index_path = self._index_jsonl_path(conv_id)
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        if not index_path.exists():
+            _atomic_write_text(index_path, self._index_jsonl_text(index_data))
+
+        legacy_path.rename(self._next_migrated_index_path(legacy_path))
+
+    def _load_index_data(self, conv_id: str) -> list[dict[str, Any]] | None:
+        self._migrate_legacy_index(conv_id)
+        index_path = self._index_jsonl_path(conv_id)
+        if not index_path.exists():
+            return None
+
+        index_data: list[dict[str, Any]] = []
+        for line_number, line in enumerate(index_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                print(
+                    f"[jlc:ret] index.jsonl parse failed for {conv_id} line {line_number}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            if isinstance(entry, dict):
+                index_data.append(entry)
+        return index_data
+
     async def build_index(self, session_id: str | None = None) -> int:
         """Build/rebuild embedding index for a conversation. Returns indexed count."""
         conv_id = _normalize_session_id(session_id)
@@ -310,9 +378,15 @@ class JLCRetriever:
         for turn, emb in zip(turns, embeddings):
             index_data.append({"turn": turn.get("turn", 0), "embedding": emb})
 
-        index_path = self._conv_dir(conv_id) / "index.json"
-        index_path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(index_path, json.dumps(index_data, ensure_ascii=False))
+        lock = self._index_lock(conv_id)
+        await asyncio.to_thread(lock.acquire)
+        try:
+            self._migrate_legacy_index(conv_id)
+            index_path = self._index_jsonl_path(conv_id)
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(index_path, self._index_jsonl_text(index_data))
+        finally:
+            lock.release()
         return len(index_data)
 
     async def index_turn(self, turn_data: dict[str, Any], session_id: str | None = None) -> bool:
@@ -335,28 +409,17 @@ class JLCRetriever:
         lock = self._index_lock(conv_id)
         await asyncio.to_thread(lock.acquire)
         try:
-            index_path = self._conv_dir(conv_id) / "index.json"
-            if index_path.exists():
-                try:
-                    index_data = json.loads(index_path.read_text(encoding="utf-8"))
-                    if not isinstance(index_data, list):
-                        print(
-                            f"[jlc:ret] index.json for {conv_id} not a list, resetting",
-                            file=sys.stderr,
-                        )
-                        index_data = []
-                except (json.JSONDecodeError, Exception) as exc:
-                    print(
-                        f"[jlc:ret] index.json parse failed for {conv_id} ({exc}), resetting",
-                        file=sys.stderr,
-                    )
-                    index_data = []
-            else:
-                index_data = []
-
-            index_data.append({"turn": turn_data.get("turn", 0), "embedding": embeddings[0]})
+            self._migrate_legacy_index(conv_id)
+            index_path = self._index_jsonl_path(conv_id)
             index_path.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_text(index_path, json.dumps(index_data, ensure_ascii=False))
+            line = json.dumps({"turn": turn_data.get("turn", 0), "embedding": embeddings[0]}, ensure_ascii=False) + "\n"
+            with index_path.open("a", encoding="utf-8", newline="") as fh:
+                fh.write(line)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
         finally:
             lock.release()
         return True
@@ -376,19 +439,17 @@ class JLCRetriever:
     ) -> RetrieverSearchResult:
         """Search ONLY within a set of turn numbers (JRE-narrowed scope)."""
         conv_id = _normalize_session_id(session_id)
-        index_path = self._conv_dir(conv_id) / "index.json"
-        if not index_path.exists():
-            print(f"[jlc:ret] search_within: {conv_id} has no index.json", file=sys.stderr)
-            return {"confidence": "LOW", "fragments": []}
-
         try:
-            index_data = json.loads(index_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, Exception) as exc:
-            print(f"[jlc:ret] search_within: index.json parse failed for {conv_id}: {exc}", file=sys.stderr)
+            index_data = self._load_index_data(conv_id)
+        except OSError as exc:
+            print(f"[jlc:ret] search_within: index.jsonl load failed for {conv_id}: {exc}", file=sys.stderr)
+            return {"confidence": "LOW", "fragments": []}
+        if index_data is None:
+            print(f"[jlc:ret] search_within: {conv_id} has no index.jsonl", file=sys.stderr)
             return {"confidence": "LOW", "fragments": []}
 
         if not index_data:
-            print(f"[jlc:ret] search_within: {conv_id} index.json is empty", file=sys.stderr)
+            print(f"[jlc:ret] search_within: {conv_id} index.jsonl is empty", file=sys.stderr)
             return {"confidence": "LOW", "fragments": []}
 
         query_emb = await self._embed([query])
@@ -412,7 +473,7 @@ class JLCRetriever:
 
         scored.sort(reverse=True)
 
-        turns = self.load_turns()
+        turns = self.load_turns(conv_id)
         turn_map = {t["turn"]: t for t in turns}
         available_turns = set(turn_map)
 
@@ -482,18 +543,15 @@ class JLCRetriever:
             self._embedder = LocalEmbedder()
         if not self._embedder.is_degraded:
             try:
-                # Load cached embeddings from index.json (built at index_turn time)
+                # Load cached embeddings from index.jsonl (built at index_turn time)
                 index_lookup: dict[int, list[float]] = {}
-                index_path = self._conv_dir(conv_id) / "index.json"
-                if index_path.exists():
-                    try:
-                        raw_index = json.loads(index_path.read_text(encoding="utf-8"))
-                        if isinstance(raw_index, list):
-                            for entry in raw_index:
-                                if isinstance(entry, dict) and "turn" in entry and "embedding" in entry:
-                                    index_lookup[entry["turn"]] = entry["embedding"]
-                    except (json.JSONDecodeError, OSError) as exc:
-                        print(f"[jlc:ret] index.json load failed for {conv_id}: {exc}", file=sys.stderr)
+                try:
+                    raw_index = self._load_index_data(conv_id)
+                    for entry in raw_index or []:
+                        if "turn" in entry and "embedding" in entry:
+                            index_lookup[entry["turn"]] = entry["embedding"]
+                except OSError as exc:
+                    print(f"[jlc:ret] index.jsonl load failed for {conv_id}: {exc}", file=sys.stderr)
 
                 # Embed query (always 1 call)
                 q_emb = await self._embed([query])
@@ -699,19 +757,17 @@ class JLCRetriever:
     async def search(self, query: str, top_k: int = 5, session_id: str | None = None) -> RetrieverSearchResult:
         """Search for relevant turns by semantic similarity."""
         conv_id = _normalize_session_id(session_id)
-        index_path = self._conv_dir(conv_id) / "index.json"
-        if not index_path.exists():
-            print(f"[jlc:ret] search: {conv_id} has no index.json", file=sys.stderr)
-            return {"confidence": "LOW", "fragments": []}
-
         try:
-            index_data = json.loads(index_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, Exception) as exc:
-            print(f"[jlc:ret] search: index.json parse failed for {conv_id}: {exc}", file=sys.stderr)
+            index_data = self._load_index_data(conv_id)
+        except OSError as exc:
+            print(f"[jlc:ret] search: index.jsonl load failed for {conv_id}: {exc}", file=sys.stderr)
+            return {"confidence": "LOW", "fragments": []}
+        if index_data is None:
+            print(f"[jlc:ret] search: {conv_id} has no index.jsonl", file=sys.stderr)
             return {"confidence": "LOW", "fragments": []}
 
         if not index_data:
-            print(f"[jlc:ret] search: {conv_id} index.json is empty", file=sys.stderr)
+            print(f"[jlc:ret] search: {conv_id} index.jsonl is empty", file=sys.stderr)
             return {"confidence": "LOW", "fragments": []}
 
         query_emb = await self._embed([query])

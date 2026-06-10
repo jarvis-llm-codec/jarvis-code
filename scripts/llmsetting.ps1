@@ -4,6 +4,8 @@
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
+$ConfigPath = if ($env:JARVIS_CODE_CONFIG) { $env:JARVIS_CODE_CONFIG } else { Join-Path $repoRoot "data\config.yaml" }
+$env:JARVIS_CODE_CONFIG = $ConfigPath
 $venvPython = Join-Path $repoRoot "sidecar\.venv\Scripts\python.exe"
 
 if (Test-Path $venvPython) {

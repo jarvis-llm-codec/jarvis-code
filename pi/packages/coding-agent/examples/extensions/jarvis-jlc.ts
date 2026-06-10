@@ -127,6 +127,8 @@ type SidecarSetupResponse = {
 
 type SidecarTurnResponse = {
 	ok?: boolean;
+	error?: string;
+	body?: string;
 	memory_mode?: "light" | "full";
 	scheduled_encode?: boolean;
 	raw_saved?: boolean;
@@ -2796,7 +2798,10 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			bench_conv_id: benchConvId(pi),
 		});
 		recordFooterMeterEntry(pi, assistantMessage, lastContextResponse, turnUsage);
-		if (response?.warning) {
+		if (!response || response.ok === false) {
+			const reason = response?.error ?? response?.warning ?? "sidecar unavailable";
+			sendJarvisChatNotice(pi, `JLC 턴 저장 실패 — 이 턴은 장기기억에 기록되지 않았습니다: ${reason}`);
+		} else if (response.warning) {
 			sendJarvisChatNotice(pi, `JLC 인코더 시작 오류: ${response.warning}`);
 		}
 		let footerResetDeferred = false;
@@ -6699,7 +6704,14 @@ async function postSidecar<T = unknown>(
 					body: errorBody.slice(0, 1000),
 				} as T;
 			}
-			return (await response.json()) as T;
+			const parsed = await response.json().catch(() => null);
+			if (parsed === null) {
+				return {
+					ok: false,
+					error: "JARVIS sidecar returned malformed JSON",
+				} as T;
+			}
+			return parsed as T;
 		} catch {
 			// Try the next advertised sidecar URL. The launcher writes the current
 			// runtime URL, while env/default remain compatibility fallbacks.

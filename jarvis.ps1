@@ -18,6 +18,7 @@ $PiAgentDir = Join-Path $Root "pi-agent"
 $DefaultResourcesDir = Join-Path $Root "jarvis-resources"
 $ExtensionPath = Join-Path $PiRoot "packages\coding-agent\examples\extensions\jarvis-jlc.ts"
 $FaceExtensionPath = Join-Path $PiRoot "packages\coding-agent\examples\extensions\jarvis-face.ts"
+$ImageExtensionPath = Join-Path $PiRoot "packages\coding-agent\examples\extensions\jarvis-image.ts"
 $DataDir = Join-Path $Root "data"
 $SidecarRuntimePath = Join-Path $DataDir "sidecar-runtime.json"
 $WrapperLogPath = Join-Path $DataDir "jarvis-wrapper.log"
@@ -889,6 +890,7 @@ try {
     }
     $forwardArgs += @("--extension", $ExtensionPath)
     $forwardArgs += @("--extension", $FaceExtensionPath)
+    $forwardArgs += @("--extension", $ImageExtensionPath)
     $forwardArgs += $DefaultProviderArgs
     $forwardArgs += $NormalizedRemainingArgs
     if ($DryRun) {
@@ -901,6 +903,7 @@ try {
             enable_extension_discovery = $EnableExtensionDiscovery
             extension_path = $ExtensionPath
             face_extension_path = $FaceExtensionPath
+            image_extension_path = $ImageExtensionPath
             default_provider_args = $DefaultProviderArgs
             forward_args = $forwardArgs
         } | ConvertTo-Json -Depth 4
