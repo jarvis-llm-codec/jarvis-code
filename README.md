@@ -31,6 +31,8 @@ You think you're raising an AI — but every session, you meet a stranger. Most 
 
 Built on the open **pi-agent** harness (MIT, by Mario Zechner) with the **JLC** memory system grafted in and tuned — proven memory on a proven agent.
 
+Provider setup, supported tiers, and custom provider examples are in [Providers](docs/providers.md).
+
 ## 🔄 Every agent is stateless — JARVIS CODE is built for it
 
 **Did you know?** An LLM remembers nothing between turns — every agent is stateless underneath. Most hide it by **replaying the entire conversation on every turn**, fighting their own nature until the context fills and collapses into `/compact` and `/clear`.
@@ -110,6 +112,7 @@ Long session history is stored locally for recall, while the live engine keeps o
 
 - [Architecture](docs/architecture.md)
 - [Memory & Projects](docs/memory-and-projects.md)
+- [Providers](docs/providers.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
 ## 🗑️ Uninstall

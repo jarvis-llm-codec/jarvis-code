@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,12 +20,22 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CATALOG_PATH = REPO_ROOT / "scripts" / "llm_catalog.yaml"
 FETCH_TIMEOUT_S = 5
+KNOWN_API_FORMATS = {
+    "openai-completions",
+    "anthropic",
+    "google-generative-ai",
+    "openai-codex-responses",
+}
 
 
 def _config_path() -> Path:
     from .config import config_path
 
     return config_path()
+
+
+def user_catalog_path() -> Path:
+    return _config_path().with_name("llm_catalog.user.yaml")
 
 
 def _models_json_path() -> Path:
@@ -34,7 +45,96 @@ def _models_json_path() -> Path:
 
 
 def load_catalog() -> dict[str, Any]:
-    return yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))
+    catalog = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8")) or {}
+    if not isinstance(catalog, dict):
+        catalog = {}
+    catalog.setdefault("providers", {})
+    if not isinstance(catalog["providers"], dict):
+        catalog["providers"] = {}
+
+    overlay_path = user_catalog_path()
+    user_providers = _load_valid_user_providers(catalog["providers"], overlay_path)
+    if user_providers:
+        providers = dict(catalog["providers"])
+        providers.update(user_providers)
+        catalog["providers"] = providers
+    return catalog
+
+
+def catalog_overlay_summary() -> dict[str, Any]:
+    catalog = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8")) or {}
+    repo_providers = catalog.get("providers") if isinstance(catalog, dict) else {}
+    if not isinstance(repo_providers, dict):
+        repo_providers = {}
+    overlay_path = user_catalog_path()
+    return {
+        "repo_count": len(repo_providers),
+        "user_count": len(_load_valid_user_providers(repo_providers, overlay_path, warn=False)),
+        "user_path": str(overlay_path.expanduser()),
+        "user_exists": overlay_path.exists(),
+    }
+
+
+def _load_valid_user_providers(
+    repo_providers: dict[str, Any],
+    overlay_path: Path,
+    *,
+    warn: bool = True,
+) -> dict[str, Any]:
+    if not overlay_path.exists():
+        return {}
+    try:
+        raw = yaml.safe_load(overlay_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        if warn:
+            _catalog_warning(f"failed to read {overlay_path}: {exc}; using bundled catalog only")
+        return {}
+    if not isinstance(raw, dict):
+        if warn:
+            _catalog_warning(f"{overlay_path} must be a mapping with a providers section; ignoring overlay")
+        return {}
+    user_providers = raw.get("providers")
+    if not isinstance(user_providers, dict):
+        if warn:
+            _catalog_warning(f"{overlay_path} has no providers mapping; ignoring overlay")
+        return {}
+
+    merged: dict[str, Any] = {}
+    for provider_id, user_cfg in user_providers.items():
+        if not isinstance(provider_id, str) or not isinstance(user_cfg, dict):
+            if warn:
+                _catalog_warning(f"skipping invalid user catalog provider {provider_id!r}")
+            continue
+        base_cfg = repo_providers.get(provider_id)
+        if not isinstance(base_cfg, dict):
+            base_cfg = {}
+        cfg = _deep_merge(base_cfg, user_cfg)
+        base_url = str(cfg.get("base_url") or "").strip()
+        api_format = str(cfg.get("api_format") or "").strip()
+        if not base_url or not api_format:
+            if warn:
+                _catalog_warning(f"skipping user catalog provider {provider_id!r}: base_url and api_format are required")
+            continue
+        if api_format not in KNOWN_API_FORMATS:
+            if warn:
+                _catalog_warning(f"skipping user catalog provider {provider_id!r}: unknown api_format {api_format!r}")
+            continue
+        merged[provider_id] = cfg
+    return merged
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _catalog_warning(message: str) -> None:
+    print(f"[jarvis-llm-catalog] {message}", file=sys.stderr)
 
 
 def fetch_models(provider_id: str, cfg: dict[str, Any]) -> list[str] | None:

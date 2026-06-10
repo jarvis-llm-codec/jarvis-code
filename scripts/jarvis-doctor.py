@@ -33,6 +33,18 @@ def config_summary_line() -> str:
     return f"config: {config_path().resolve()} (env JARVIS_CODE_CONFIG {env_state})"
 
 
+def provider_catalog_summary_line() -> str:
+    if str(SIDECAR_ROOT) not in sys.path:
+        sys.path.insert(0, str(SIDECAR_ROOT))
+    from jarvis_sidecar.llm_setting import catalog_overlay_summary
+
+    summary = catalog_overlay_summary()
+    user_path = summary["user_path"]
+    if not summary["user_exists"]:
+        return f"user overlay: none ({user_path})"
+    return f"providers: catalog {summary['repo_count']} + user {summary['user_count']} ({user_path})"
+
+
 def configure_hf_public_download_env() -> None:
     has_hf_token = bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
     if not has_hf_token:
@@ -357,6 +369,7 @@ def check_sidecar(checks: list[Check]) -> None:
 def print_text(checks: list[Check]) -> None:
     labels = {"ok": "OK", "warn": "WARN", "fail": "FAIL"}
     print(config_summary_line())
+    print(provider_catalog_summary_line())
     print("JARVIS Code doctor")
     for check in checks:
         label = labels.get(check.status, check.status.upper())

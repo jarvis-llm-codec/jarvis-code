@@ -74,6 +74,28 @@ If `jarvis doctor` reports `agent_loaded=False` right after an install or
 update, an older sidecar process may still be serving port `8765`. Run `jarvis`
 once to let the wrapper restart the sidecar from the current install.
 
+## Provider Missing Or Unavailable In Model Setting
+
+Run:
+
+```bash
+jarvis doctor
+```
+
+If the provider is missing, check the catalog line. Without a user overlay it
+prints `user overlay: none (~/.jarvis-code/llm_catalog.user.yaml)`. With an
+overlay it prints the bundled provider count plus the number of valid user
+providers. Invalid overlay entries are skipped with a warning; each custom
+provider needs `base_url` and a known `api_format`.
+
+If the provider is visible but unavailable, set the provider's `auth_env`
+environment variable to `YOUR_KEY_HERE` in the terminal that launches JARVIS,
+then run `jarvis model-setting` again. For providers without a working
+`/models` endpoint, add `models_static` in
+`~/.jarvis-code/llm_catalog.user.yaml`.
+
+See [Providers](providers.md) for overlay examples.
+
 ## Remove Local Runtime State
 
 Only do this when you intentionally want a fresh local install:
