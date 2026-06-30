@@ -22,10 +22,10 @@ irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.
 |---|---|
 | 앱 + Node 의존성 | ~580 MB |
 | Python 사이드카 (PyTorch CPU 포함) | ~1.3 GB |
-| `bge-m3` 임베딩 모델 — *선택* | ~2.3 GB 다운로드 · 디스크 ~4.3 GB |
+| `bge-m3` 임베딩 모델 — **회상 담당 (필수)** | ~2.3 GB 다운로드 · 디스크 ~4.3 GB |
 | 전제조건 (Node 20+, Python 3.10+, Git, MSVC) — *없을 때만* | ~0.5 GB |
 
-**모델 없이 ≈ 2 GB, 모델 포함 ≈ 6 GB** (전제조건은 없을 때만 추가). 모델은 로컬 회상용이고 선택 — `JARVIS_CODE_NO_MODEL_PRELOAD=1`로 생략. 메모리 데이터(`~/.jarvis-code`)는 작게 시작해 천천히 늘어남.
+**총 ≈ 6 GB** (전제조건은 없을 때만 추가). 회상은 **BM25 + bge-m3** 하이브리드(키워드 + 시맨틱)라 모델은 선택이 아니라 **핵심** — `JARVIS_CODE_NO_MODEL_PRELOAD=1`은 다운로드를 첫 사용으로 **미룰 뿐** 의존성을 없애진 않음. 메모리 데이터(`~/.jarvis-code`)는 작게 시작해 천천히 늘어남.
 
 ---
 

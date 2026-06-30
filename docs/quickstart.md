@@ -22,10 +22,10 @@ Everything lands under `%LOCALAPPDATA%\JARVIS-Code`. Rough sizes on a fresh mach
 |---|---|
 | App + Node dependencies | ~580 MB |
 | Python sidecar (incl. PyTorch, CPU) | ~1.3 GB |
-| `bge-m3` embedding model — *optional* | ~2.3 GB download · ~4.3 GB on disk |
+| `bge-m3` embedding model — **powers recall (required)** | ~2.3 GB download · ~4.3 GB on disk |
 | Prerequisites (Node 20+, Python 3.10+, Git, MSVC) — *only if missing* | ~0.5 GB |
 
-**≈ 2 GB without the model, ≈ 6 GB with it** (plus prerequisites if you don't already have them). The model powers local recall and is optional — skip it with `JARVIS_CODE_NO_MODEL_PRELOAD=1`. Memory data under `~/.jarvis-code` starts small and grows slowly.
+**≈ 6 GB total** (plus prerequisites if missing). Recall is a **BM25 + bge-m3** hybrid — keyword + semantic — so the model is core, not optional; `JARVIS_CODE_NO_MODEL_PRELOAD=1` only defers its download to first use. Memory data under `~/.jarvis-code` starts small and grows slowly.
 
 ---
 

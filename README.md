@@ -84,10 +84,10 @@ Everything installs under `%LOCALAPPDATA%\JARVIS-Code`. Rough footprint on a fre
 | App — engine + sidecar + skills/theme | ~16 MB |
 | Node dependencies | ~560 MB |
 | Python sidecar (incl. PyTorch, CPU) | ~1.3 GB |
-| Local embedding model `bge-m3` — *optional* | ~2.3 GB download · ~4.3 GB on disk |
+| `bge-m3` embedding model — **powers recall (required)** | ~2.3 GB download · ~4.3 GB on disk |
 | Prerequisites — Node 20+, Python 3.10+, Git, MSVC — *only if missing* | ~0.5 GB |
 
-**≈ 2 GB without the model, ≈ 6 GB with it** (plus prerequisites if you don't already have them). The embedding model powers local recall and is optional — skip it with `JARVIS_CODE_NO_MODEL_PRELOAD=1`. Your memory data under `~/.jarvis-code` starts small and grows slowly with use.
+**Total ≈ 6 GB** (plus prerequisites if you don't already have them). Recall runs on a **BM25 + bge-m3** hybrid — keyword search plus semantic embeddings — so the model is core, not optional; `JARVIS_CODE_NO_MODEL_PRELOAD=1` only **defers** its download to first use. Your memory data under `~/.jarvis-code` starts small and grows slowly with use.
 
 ## ▶️ First run
 
