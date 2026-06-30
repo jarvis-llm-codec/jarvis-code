@@ -49,6 +49,18 @@ JHB가 뭔지는 [concepts.md](concepts.md), 조각들이 어떻게 맞물리는
 
 ---
 
+## 어떤 인코더를 쓸까
+
+원칙: **이미 쓰는 플랜이 주는 가장 빠르고 싼 모델을 쓰세요.** 인코더 때문에 두 번째 프로바이더나 별도 예산이 필요 없습니다 — 이미 결제 중인 경량 티어가 바로 그 자리입니다. 가진 구독에 맞추세요:
+
+| 이미 가진 것 | chat + subagent | encoder |
+|---|---|---|
+| **OpenAI / GPT** | GPT-5.5 | GPT-5.4 mini |
+| **Claude (Anthropic)** | Opus 4.8 | Haiku |
+| **Ollama Cloud** | 프론티어 모델 (예: GLM-5.2) | Devstral Small 24B |
+
+**크기 주의 한 가지.** 인코더는 추론이 아니라 압축이지만, 기억은 충실히 담아야 합니다. ~8B 모델은 부족 — 품질이 떨어집니다. **~20B 이상의 빠르고 똑똑한 모델**을 목표로 하세요. 그게 바닥선입니다.
+
 ## 정직한 숫자
 
 전부 측정값이고, [jlc-codec.org/evidence](https://jlc-codec.org/evidence/ko/) 의 공개 아티팩트로 재계산 가능합니다.

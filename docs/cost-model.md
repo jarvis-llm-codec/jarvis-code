@@ -49,6 +49,18 @@ Recommended encoder: a ~24B-class model such as `ollama-cloud/devstral-small-2:2
 
 ---
 
+## Which encoder to use
+
+Rule of thumb: **use the fastest, cheapest model your existing plan already gives you.** You don't need a second provider or a separate budget for the encoder — whatever lightweight tier you already pay for is the right seat for it. Match it to the subscription you have:
+
+| You already have | chat + subagent | encoder |
+|---|---|---|
+| **OpenAI / GPT** | GPT-5.5 | GPT-5.4 mini |
+| **Claude (Anthropic)** | Opus 4.8 | Haiku |
+| **Ollama Cloud** | a frontier model (e.g. GLM-5.2) | Devstral Small 24B |
+
+**One caveat on size.** The encoder compresses, it doesn't reason — but it still has to hold the memory faithfully. An ~8B model isn't enough; quality drops. Aim for a **fast, smart model of ~20B and up** — that's the floor.
+
 ## The honest numbers
 
 All measured, all recomputable from the public artifacts at [jlc-codec.org/evidence](https://jlc-codec.org/evidence).
