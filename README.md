@@ -69,6 +69,8 @@ The user-facing command is `jarvis`. (`pi/` is the internal engine folder, kept 
 irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
 ```
 
+> 🤖 **Already using an AI assistant?** Paste it the command above and just say *"install JARVIS CODE for me."*
+
 Missing prerequisites (Node.js, Python, Git, MSVC redistributable) are installed via `winget` when available. The installer also preloads the local `BAAI/bge-m3` embedding model (~2.3 GB) unless `JARVIS_CODE_NO_MODEL_PRELOAD=1` is set.
 
 > After install, **open a new terminal** so the `jarvis` command is on your PATH.

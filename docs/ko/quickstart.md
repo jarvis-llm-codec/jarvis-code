@@ -12,6 +12,8 @@
 irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
 ```
 
+> 🤖 **이미 AI 어시스턴트를 쓰고 있나요?** 위 명령을 붙여넣고 *"JARVIS CODE 설치해줘"* 라고 해보세요.
+
 **macOS · Linux** — 인스톨러 마무리 중 (**곧 지원 예정**). 그 전까지는 소스에서 설치 — [install.md](../install.md) 참고.
 
 ### 뭐가 설치되고 얼마나 큰가

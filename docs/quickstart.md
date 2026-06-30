@@ -12,6 +12,8 @@ This gets you from zero to a working coding session. For the full install refere
 irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
 ```
 
+> 🤖 **Already using an AI assistant?** Paste it the command above and just say *"install JARVIS CODE for me."*
+
 **macOS · Linux** — installer is being finalized (**coming soon**). Until then, install from source — see [install.md](install.md).
 
 ### What gets installed & how big
