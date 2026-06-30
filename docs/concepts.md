@@ -20,10 +20,10 @@ JARVIS CODE keeps memory in two places, and they do different jobs.
 | **MAP** | File & symbol map |
 | **LAW** | Rules that keep recurring |
 | **BAN** | What not to do |
-| **OMM** | A mistake → next run's guardrail (it learns from its own errors) |
+| **OMM** | *Oh My Mistake* — a mistake → next run's guardrail (it learns from its own errors) |
 | **RAW** | Pointers to verifiable evidence |
 
-**OMM** is the compounding one: a mistake made once becomes a guardrail, so the same mistake doesn't repeat — without you having to flag it.
+**OMM** (*Oh My Mistake*) is the compounding one: a mistake made once becomes a guardrail, so the same mistake doesn't repeat — without you having to flag it.
 
 ---
 
