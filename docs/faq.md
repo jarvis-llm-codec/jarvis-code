@@ -24,6 +24,10 @@ Depends on your provider. A Claude subscription works without a separate API key
 
 Your memory (JHB and JARVIS.md) lives **on your machine**. Model calls go to whatever provider you configure — same as any agent. The sidecar that does the encoding runs locally ([concepts.md](concepts.md)).
 
+### Does it phone home or send telemetry?
+
+No. No analytics, no usage tracking, no update checks — nothing pings a JLC server (there isn't one). Network calls go only to the LLM provider you configure, plus Brave Search if you enable it. The one exception is a one-time embedding-model download from HuggingFace during install, with HuggingFace's own telemetry disabled. Your memory is stored locally as plain-text JSONL in `~/.jarvis-code/` — readable and portable, not a locked binary DB.
+
 ### What encoder model should I use?
 
 A **~14–24B class model is the sweet spot** — e.g. `ollama-cloud/devstral-small-2:24b`. The encoder does bounded compression, not reasoning, so a small fast model is *correct*, not a compromise. But don't go too small: **8B isn't enough** (memory quality gets shaky) — aim for ~14B and up. See [cost-model.md](cost-model.md).
