@@ -1,15 +1,16 @@
 # Install jarvis-code — a guide for your AI
 
-**This page is written for an AI assistant.** If you are a human: you don't have to
-follow these steps yourself. Hand this whole page to an AI you already use that can
-run terminal commands on your computer — **Claude Code, Codex, Cursor, Windsurf**, or
-similar — and say:
+**This page is written for an AI assistant.** If you are a human: don't follow these
+steps yourself. Paste the line below to an AI that can run terminal commands on your
+computer — **Claude Code, Codex, Cursor, Windsurf**, or similar:
 
-> *"Install jarvis-code for me. Read and follow this guide exactly. Interview me
-> about which AI I already pay for, set it up the best way for that, and walk me
-> through the free API keys."*
+> *Install jarvis-code for me. Read the whole guide first, then follow it exactly:
+> https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/docs/ai-install.md
+> — ask me which AI I already use, set it up the best way for that, and get the free
+> API keys set up with me.*
 
-The AI does the work. You answer a few questions and click through two free signups.
+It fetches this guide and does the work. You answer a few questions and click through
+two free signups.
 
 ---
 

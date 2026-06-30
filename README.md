@@ -75,7 +75,7 @@ Missing prerequisites (Node.js, Python, Git, MSVC redistributable) are installed
 
 > 🤖 **Already using an AI assistant that can run terminal commands** (Claude Code, Codex, Cursor…)? Don't install by hand — let it do the whole thing and tailor the setup to the AI you already pay for. Paste it this:
 >
-> > Install jarvis-code for me by following https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/docs/ai-install.md — ask me which AI I already use, set it up the best way for that, and walk me through the free API keys.
+> > Install jarvis-code for me. Read the whole guide first, then follow it exactly: https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/docs/ai-install.md — ask me which AI I already use, set it up the best way for that, and get the free API keys set up with me.
 
 Manual / advanced install: [README-INSTALL.md](README-INSTALL.md).
 
