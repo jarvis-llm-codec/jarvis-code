@@ -1,6 +1,6 @@
 # JARVIS CODE — Documentation
 
-A terminal coding agent that doesn't forget. One continuous conversation across turns, restarts, and model swaps — no `/compact`, no `/clear`. Open source, Apache-2.0.
+A terminal coding agent that doesn't lose the thread. One continuous conversation across turns, restarts, and model swaps — no `/compact`, no `/clear`. Open source, Apache-2.0.
 
 > 🤖 **Evaluating it with an AI?** Paste these docs into your assistant and ask whether the cost claims hold up. The raw proof — public 10,000-turn run, logs, hashes — is at **[jlc-codec.org/evidence](https://jlc-codec.org/evidence)**.
 

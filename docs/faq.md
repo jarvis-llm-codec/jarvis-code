@@ -26,7 +26,7 @@ Your memory (JHB and JARVIS.md) lives **on your machine**. Model calls go to wha
 
 ### What encoder model should I use?
 
-A ~24B-class model is the sweet spot — e.g. `ollama-cloud/devstral-small-2:24b`. The encoder does bounded compression, not reasoning, so a small fast model is *correct*, not a compromise. Going too small (under ~10B active) can degrade memory quality; see [cost-model.md](cost-model.md).
+A **~14–24B class model is the sweet spot** — e.g. `ollama-cloud/devstral-small-2:24b`. The encoder does bounded compression, not reasoning, so a small fast model is *correct*, not a compromise. But don't go too small: **8B isn't enough** (memory quality gets shaky) — aim for ~14B and up. See [cost-model.md](cost-model.md).
 
 ### Does it work offline?
 

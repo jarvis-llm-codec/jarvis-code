@@ -55,7 +55,7 @@ Why the chat/encoder split lowers total cost: **[cost-model.md](cost-model.md)**
 
 - **Sidecar** — the local background process that *is* the JLC engine. The terminal front-end talks to it; it does the encoding, memory, and routing. It runs on your machine.
 - **Pair** — one paired session: the terminal UI front-end joined to its sidecar. (You normally never think about this; it matters when running multiple windows.)
-- **Ultracode** — fan-out mode: for a big task, the agent spins up **N parallel subagent workers** on fresh contexts, then verifies and synthesizes their results. The same "split the context to beat the long-context curse" idea as JLC, applied across *space* (many small contexts) instead of *time* (one session split across turns).
+- **Ultracode** — fan-out mode: for a big task, the agent spins up **N parallel subagent workers** on fresh contexts, then verifies and synthesizes their results. The same "split the context to beat the long-context curse" idea as JLC, applied across *space* (many small contexts) instead of *time* (one session split across turns). Note the trade: unlike JLC, ultracode **spends** tokens rather than saving them — N fresh contexts cost more, in exchange for higher quality on hard tasks. It's a quality lever, not a cost one.
 - **JLC** — *JARVIS LLM Codec*, the core that carries memory outside the context window. The thing the whole project is built around.
 
 ---

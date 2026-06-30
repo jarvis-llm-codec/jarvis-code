@@ -1,6 +1,6 @@
 # Overview — what JARVIS CODE is, and why it's different
 
-**JARVIS CODE is a terminal coding agent that doesn't forget.** It holds one continuous conversation — across turns, restarts, and model swaps — without ever running `/compact` or `/clear`. It does this by carrying memory **outside** the context window instead of replaying a transcript that grows every turn.
+**JARVIS CODE is a terminal coding agent that doesn't lose the thread.** It holds one continuous conversation — across turns, restarts, and model swaps — without ever running `/compact` or `/clear`. It does this by carrying a **compressed** memory **outside** the context window instead of replaying a transcript that grows every turn — forgetting the noise on purpose, keeping the thread.
 
 It's open source (Apache-2.0), built on the [pi-agent](https://github.com/earendil-works/pi) harness (MIT) with the JLC — **JARVIS LLM Codec** — embedded.
 
