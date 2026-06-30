@@ -9,7 +9,7 @@ The vocabulary JARVIS CODE uses, defined once. If a term in another doc is uncle
 JARVIS CODE keeps memory in two places, and they do different jobs.
 
 ### JHB — the carried conversation memory
-**JHB** (the *JARVIS Handbook*) is the running memory of the **current conversation**. It's a small Markdown document — capped near **~2,000 tokens** — that the [encoder](#the-four-roles) rewrites after every turn. The chat model never sees the raw transcript; it sees the JHB. That's what lets the conversation run forever without the context growing. The JHB stays roughly the same size whether you're on turn 10 or turn 10,000.
+**JHB** (the *JARVIS Handbook*) is the running memory of the **current conversation**. It's a small Markdown document — capped near **~2,000 tokens** — that the [encoder](#the-four-roles) rewrites after every turn. The chat model never sees the raw transcript; it sees the JHB. That's what lets the conversation run forever without the context growing. The JHB stays roughly the same size whether you're on turn 10 or turn 10,000. The mechanism — carrying a *regenerated* memory instead of replaying the transcript — is the subject of the JLC paper, *[Forgetting Is All You Need](https://doi.org/10.5281/zenodo.20266424)*.
 
 ### JARVIS.md — the per-project memory
 **JARVIS.md** is a file kept **per project** (per repository). It's where the agent records what it has learned about *your codebase* so it's still there next session. It has named sections:
@@ -24,6 +24,22 @@ JARVIS CODE keeps memory in two places, and they do different jobs.
 | **RAW** | Pointers to verifiable evidence |
 
 **OMM** is the compounding one: a mistake made once becomes a guardrail, so the same mistake doesn't repeat — without you having to flag it.
+
+---
+
+## Raw recall — handing over the diary, a page at a time
+
+The JHB is the *notes*. But notes can blur a detail you suddenly need 4,000 turns later. So JLC also keeps the full **raw transcript** on your disk — the *diary* — and hands the model the relevant pages when you reach back for them.
+
+Not the whole diary. Pasting the entire history back every turn is the brute-force move every other agent makes — and it's exactly what makes cost grow with the conversation. Instead, when your message reaches into the past — *"remember when…", "what did we decide about X?"* — JLC reconstructs the right pages on the fly:
+
+1. **BM25** narrows the raw turns to a candidate pool by keyword,
+2. **bge-m3 cosine similarity** reranks them by meaning,
+3. the **top 5** — plus the most recent raw turn, and small bonuses for recency and past corrections — are handed to the model.
+
+So the model runs on the *notes* by default, and gets *reconstructed pages of the diary* only when you actually reach for the past. (The model can also pull specific turns on demand via a recall tool.) The JHB carries the understanding; raw recall backs it with the exact words when they matter.
+
+Most agents never built this layer — they never had to, because they just paste the whole history in. This is the part that took the work.
 
 ---
 
