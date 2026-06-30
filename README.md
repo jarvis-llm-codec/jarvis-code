@@ -4,18 +4,18 @@
 
 # JARVIS CODE
 
-**Your coding companion that never forgets.**
+**Your coding companion that doesn't lose the thread.**
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-0088ff)](LICENSE)
 [![Built on](https://img.shields.io/badge/Built_on-Pi_MIT-ff8800)](NOTICE.md)
-[![Platform](https://img.shields.io/badge/Platform-Win_macOS_Linux-5b5b66)](#-install)
+[![Platform](https://img.shields.io/badge/Platform-Windows-5b5b66)](#-install)
 [![Web](https://img.shields.io/badge/web-jlc--codec.org-0088ff)](https://jlc-codec.org)
 
 </div>
 
 ---
 
-**JARVIS CODE** is an independent terminal coding agent with **durable, long-term project memory**. It remembers your codebase, your decisions, and your past conversations across sessions — so you never re-explain yourself to a blank context again.
+**JARVIS CODE** is an independent terminal coding agent with **durable, long-term project memory**. It carries your codebase, your decisions, and the thread of past sessions forward — so you never re-explain yourself to a blank context again.
 
 > The mark **◯ ~ ◯** is the two of you — **you** on the left, **your agent** on the right, and `~` the signal between. Two, standing side by side.
 
@@ -24,41 +24,36 @@
 You think you're raising an AI — but every session, you meet a stranger. Most agents drag a finite conversation until it's compacted or cleared. JARVIS CODE **carries memory instead of dragging the transcript**:
 
 - **Right where you left off** — context survives shutdown, restart, and even model swaps. No re-explaining.
-- **No `/compact`, no `/clear`** — one continuous session, proven over a public **10,000-turn** run.
-- **Linear cost, not O(n²)** — it never drags a giant prefix, so cost-per-turn stays flat as the work grows.
+- **No `/compact`, no `/clear`** — one continuous session, proven over a public **[10,000-turn run](https://jlc-codec.org/evidence)**.
+- **Linear cost, not O(n²)** — it never drags a giant prefix, so cost-per-turn stays flat as the work grows. ([the honest numbers, incl. where it *doesn't* win →](https://jlc-codec.org/docs/#cost-model))
 - **Zero handoff · switching · onboarding** — move across projects and machines, and grasp an unfamiliar codebase right away.
 - **`JARVIS.md` per project** — self-improving memory that gets smarter about your codebase the more you use it.
 
 Built on the open **pi-agent** harness (MIT, by Mario Zechner) with the **JLC** memory system grafted in and tuned — proven memory on a proven agent.
 
-Provider setup, supported tiers, and custom provider examples are in [Providers](docs/providers.md).
-
 ## 🔄 Every agent is stateless — JARVIS CODE is built for it
 
 **Did you know?** An LLM remembers nothing between turns — every agent is stateless underneath. Most hide it by **replaying the entire conversation on every turn**, fighting their own nature until the context fills and collapses into `/compact` and `/clear`.
 
-JARVIS CODE does the opposite. It is **designed for statelessness** — the context resets every turn, and memory is carried *outside* the window by the JLC codec.
+JARVIS CODE does the opposite. It is **designed for statelessness** — the context resets every turn, and memory is carried *outside* the window by the JLC codec. It forgets the noise on purpose and keeps the thread.
 
 ```text
   OTHER AGENTS                   JARVIS CODE
   ────────────                   ───────────
   context  ▁▃▅▇█▉  piles up      context  ▁▁▁▁▁▁   reset every turn
                    ↓             memory   ▁▂▃▅▆▇   carried outside ↑
-  → compact · clear · collapse   → linear · stable · never forgets
+  → compact · clear · collapse   → linear · stable · keeps the thread
 ```
 
-Working *with* the grain instead of against it, it never slows as it grows — and never forgets.
+Working *with* the grain instead of against it, it never slows as it grows — and never loses the thread.
 
 ## ✨ What's inside
 
 - 🧠 **JLC memory** — a bounded, self-organizing memory injected into every model turn; full history kept locally for recall
-- 🪟 **Multi-window orchestration** — spawn worker windows from chat, delegate builds as jobs with server-enforced review cycles, or let two windows argue to consensus in GAN rounds; all windows share one memory, so any window recalls what another did
-- 🧭 **Plan dialogue + design recon** — a vague "build me X" pops a quick dialog of choices (recommended defaults, Esc accepts all), then live web research distills current design trends into a per-project Design Brief before the first file is written
-- 🦙 **Local-first endpoints** — keyless presets for Ollama, LM Studio, and llama.cpp; your local models show up in `/model-setting` next to cloud providers and just work
-- ✋ **Tool lessons** — a failed shell command and the fix that followed are remembered machine-wide and offered the next time the same failure appears, at zero always-on token cost
-- 📜 **Scroll-lock pager** — read history while output streams; the view stays put (`Shift+PageUp` / `Ctrl+PageUp`, `Esc` back to live)
-- 🖥️ **Terminal-native engine** — a fast TUI coding agent (TypeScript, under `pi/`)
-- 🔌 **Python sidecar** — a FastAPI service for memory, project routing, and raw recall
+- 🪟 **Multi-window orchestration** — spawn worker windows, delegate builds as reviewed jobs, or let two windows argue to consensus; all windows share one memory
+- 🧭 **Plan dialogue + design recon** — a vague "build me X" pops a quick dialog of choices, then distills current design trends into a per-project brief before the first file is written
+- 🦙 **Local-first endpoints** — keyless presets for Ollama, LM Studio, and llama.cpp, right next to cloud providers in `/model-setting`
+- ✋ **Tool lessons** — a failed command and its fix are remembered and offered next time the same failure appears, at zero always-on token cost
 - 📁 **Per-project `JARVIS.md`** — project memory that lives with the repo, like `CLAUDE.md`
 - 🎨 Bundled skills and the signature orange-blue terminal theme
 
@@ -66,19 +61,15 @@ The user-facing command is `jarvis`. (`pi/` is the internal engine folder, kept 
 
 ## 🚀 Install
 
+> **Windows is first-class today. macOS / Linux are coming soon.**
+
 **Windows** (PowerShell):
 
 ```powershell
 irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
 ```
 
-**macOS / Linux:**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | sh
-```
-
-On Windows, missing prerequisites (Node.js, Python, Git, MSVC redistributable) are installed via `winget` when available. The installer also preloads the local `BAAI/bge-m3` embedding model (~2.3 GB) unless `JARVIS_CODE_NO_MODEL_PRELOAD=1` is set.
+Missing prerequisites (Node.js, Python, Git, MSVC redistributable) are installed via `winget` when available. The installer also preloads the local `BAAI/bge-m3` embedding model (~2.3 GB) unless `JARVIS_CODE_NO_MODEL_PRELOAD=1` is set.
 
 > After install, **open a new terminal** so the `jarvis` command is on your PATH.
 
@@ -103,35 +94,22 @@ jarvis model-setting
 jarvis
 ```
 
-Diagnostics anytime:
-
-```bash
-jarvis doctor
-```
-
-Running from a source checkout: `.\jarvis.ps1` (Windows) or `./jarvis.sh` (macOS/Linux).
+Diagnostics anytime: `jarvis doctor`
 
 ## 🧩 How it works
 
 Long session history is stored locally for recall, while the live engine keeps only a bounded recent-turn window. The model's context is assembled by JLC — it carries the **memory**, not the whole transcript.
 
-- [Architecture](docs/architecture.md)
-- [Memory & Projects](docs/memory-and-projects.md)
-- [Providers](docs/providers.md)
-- [Troubleshooting](docs/troubleshooting.md)
+- 📖 **Full docs & the honest cost model** — [jlc-codec.org/docs](https://jlc-codec.org/docs)
+- 🔬 **Proof: the public 10,000-turn run, raw** — [jlc-codec.org/evidence](https://jlc-codec.org/evidence)
+- 🧱 In-repo notes — [Architecture](docs/architecture.md) · [Memory & Projects](docs/memory-and-projects.md) · [Providers](docs/providers.md) · [Troubleshooting](docs/troubleshooting.md)
 
 ## 🗑️ Uninstall
 
-**Windows:**
+**Windows** (PowerShell):
 
 ```powershell
 irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/uninstall.ps1 | iex
-```
-
-**macOS / Linux:**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/uninstall.sh | sh
 ```
 
 Uninstall removes the install directory and command shim. User data under `~/.jarvis-code` and the model cache are kept unless explicit removal options are set.
