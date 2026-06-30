@@ -34,6 +34,13 @@ class OrchestrationBudget:
     max_calls: int | None = None
     max_tokens: int | None = None
     max_wallclock_sec: float | None = None
+    # Fraction of the call/token budget held back for the verifier so finder
+    # fan-out cannot starve synthesis. The verifier is the payoff of the whole
+    # orchestration (adversarial dedup + grounding); a budget spent entirely on
+    # finders yields raw, unverified findings and overshoots the cap when the
+    # verifier then runs unbudgeted (Finding 2). Finders gate against the reduced
+    # caps; the reserved slice is the verifier's guaranteed headroom. 0 disables.
+    verifier_reserve_frac: float = 0.2
 
 
 @dataclass
@@ -116,6 +123,30 @@ def cancel(orchestration_id: str) -> bool:
     return True
 
 
+def _clamp_reserve_frac(frac: float | None) -> float:
+    try:
+        value = float(frac if frac is not None else 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(max(value, 0.0), 0.9)
+
+
+def _reserve_for_verifier(value: int | None, frac: float) -> int | None:
+    """Reduce a finder-phase numeric cap so a slice is held back for the verifier.
+
+    Returns the cap finders gate against; the difference (the reserved slice) is
+    the verifier's guaranteed headroom. None (unbounded) stays None. Always leaves
+    finders at least 1 and reserves at least 1 when the budget allows.
+    """
+    if value is None:
+        return None
+    cap = int(value)
+    if cap <= 1 or frac <= 0.0:
+        return cap
+    reserve = max(1, round(cap * frac))
+    return max(1, cap - reserve)
+
+
 def run_orchestration(
     spec: OrchestrationSpec,
     *,
@@ -130,6 +161,9 @@ def run_orchestration(
         _CANCEL_EVENTS[orchestration_id] = ev
 
     dimensions = [str(dimension) for dimension in spec.dimensions]
+    reserve_frac = _clamp_reserve_frac(spec.budget.verifier_reserve_frac)
+    finder_max_calls = _reserve_for_verifier(spec.budget.max_calls, reserve_frac)
+    finder_max_tokens = _reserve_for_verifier(spec.budget.max_tokens, reserve_frac)
     outcomes: list[FinderOutcome] = []
     calls_used = 0
     tokens_used = 0
@@ -172,12 +206,15 @@ def run_orchestration(
             if time.monotonic() - started >= float(budget.max_wallclock_sec):
                 ev.set()
                 return mark_budget_exhausted("wallclock_sec", running)
-        if budget.max_calls is not None:
+        # Finders gate against the reserved (reduced) caps, not the raw budget, so
+        # synthesis always has guaranteed headroom (Finding 2: verifier budget
+        # pre-reservation). The verifier itself is not gated by this fan-out loop.
+        if finder_max_calls is not None:
             # Each submitted finder reserves one provider call. Actual completed
             # call counts may overshoot this soft cap by already in-flight work.
-            if calls_used + running >= int(budget.max_calls):
+            if calls_used + running >= finder_max_calls:
                 return mark_budget_exhausted("calls", running)
-        if budget.max_tokens is not None and tokens_used >= int(budget.max_tokens):
+        if finder_max_tokens is not None and tokens_used >= finder_max_tokens:
             return mark_budget_exhausted("tokens", running)
         return None
 
@@ -228,6 +265,9 @@ def run_orchestration(
         task=spec.task,
         dimensions=dimensions,
         budget=asdict(spec.budget),
+        verifier_reserve_frac=reserve_frac,
+        finder_max_calls=finder_max_calls,
+        finder_max_tokens=finder_max_tokens,
     )
     try:
         next_index = 0
@@ -297,7 +337,13 @@ def run_orchestration(
                 f"finders ran {finders_ran}/{len(dimensions)})"
             )
         else:
-            emit("verify_start")
+            emit(
+                "verify_start",
+                finder_calls_used=calls_used,
+                finder_tokens_used=tokens_used,
+                budget_max_calls=spec.budget.max_calls,
+                budget_max_tokens=spec.budget.max_tokens,
+            )
             try:
                 verifier_result = Subagent(
                     name="verifier",
