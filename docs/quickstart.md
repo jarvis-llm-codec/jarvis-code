@@ -14,6 +14,19 @@ irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.
 
 **macOS · Linux** — installer is being finalized (**coming soon**). Until then, install from source — see [install.md](install.md).
 
+### What gets installed & how big
+
+Everything lands under `%LOCALAPPDATA%\JARVIS-Code`. Rough sizes on a fresh machine:
+
+| Component | Size |
+|---|---|
+| App + Node dependencies | ~580 MB |
+| Python sidecar (incl. PyTorch, CPU) | ~1.3 GB |
+| `bge-m3` embedding model — *optional* | ~2.3 GB download · ~4.3 GB on disk |
+| Prerequisites (Node 20+, Python 3.10+, Git, MSVC) — *only if missing* | ~0.5 GB |
+
+**≈ 2 GB without the model, ≈ 6 GB with it** (plus prerequisites if you don't already have them). The model powers local recall and is optional — skip it with `JARVIS_CODE_NO_MODEL_PRELOAD=1`. Memory data under `~/.jarvis-code` starts small and grows slowly.
+
 ---
 
 ## 2. Launch

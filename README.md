@@ -75,6 +75,20 @@ Missing prerequisites (Node.js, Python, Git, MSVC redistributable) are installed
 
 Manual / advanced install: [README-INSTALL.md](README-INSTALL.md).
 
+## 💾 What gets installed & how big
+
+Everything installs under `%LOCALAPPDATA%\JARVIS-Code`. Rough footprint on a fresh machine:
+
+| Component | Size |
+|---|---|
+| App — engine + sidecar + skills/theme | ~16 MB |
+| Node dependencies | ~560 MB |
+| Python sidecar (incl. PyTorch, CPU) | ~1.3 GB |
+| Local embedding model `bge-m3` — *optional* | ~2.3 GB download · ~4.3 GB on disk |
+| Prerequisites — Node 20+, Python 3.10+, Git, MSVC — *only if missing* | ~0.5 GB |
+
+**≈ 2 GB without the model, ≈ 6 GB with it** (plus prerequisites if you don't already have them). The embedding model powers local recall and is optional — skip it with `JARVIS_CODE_NO_MODEL_PRELOAD=1`. Your memory data under `~/.jarvis-code` starts small and grows slowly with use.
+
 ## ▶️ First run
 
 JARVIS CODE needs one LLM credential before it opens.
