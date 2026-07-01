@@ -14,10 +14,10 @@ import yaml
 
 DEFAULT_ROLE_CONFIG: dict[str, Any] = {
     "roles": {
-        "chat": "ollama-cloud/glm-5-ollama",
-        "subagent": "ollama-cloud/glm-5-ollama",
-        "router": "ollama-cloud/glm-5-ollama",
-        "encoder": "ollama-cloud/devstral-small-2-24b-cloud",
+        "chat": "openai-codex/gpt-5.5",
+        "subagent": "openai-codex/gpt-5.5",
+        "router": "openai-codex/gpt-5.4-mini",
+        "encoder": "openai-codex/gpt-5.4-mini",
     },
     "encoder": {
         "providers": [
