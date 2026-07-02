@@ -59,6 +59,20 @@ Working *with* the grain instead of against it, it never slows as it grows — a
 
 The user-facing command is `jarvis`. (`pi/` is the internal engine folder, kept for fork compatibility.)
 
+## 📊 Benchmarks — the memory layer costs nothing
+
+Memory is JLC's job; these runs answer a different question: **does carrying it slow the model down?** July 2026, chat = GPT-5.5 (subscription route), encoder = gpt-5.4-mini, consumer laptop (i5-8500, 8 GB RAM). The agent never scores itself.
+
+| Benchmark | Score | Scoring |
+|---|---|---|
+| Aider Polyglot (Python + Go + JS subsets, 122 tasks) | **122/122 (100%)** | clean pytest / go test / npm test owned by the runner, single attempt |
+| HumanEval, base tests | **98.2%** pass@1 (161/164) | official `evalplus` harness |
+| HumanEval+ (80× extra tests) | **93.9%** pass@1 (154/164) | official `evalplus` harness |
+
+Run integrity: 0 timeouts · 0 modified test files (hash-checked) · 0 benchmark-data lookups. Runner code lives in [`bench/`](bench/).
+
+**Honest scope** — runs are agentic (one attempt; the agent may write its *own* scratch tests, never the benchmark's). HumanEval and Exercism are in every frontier model's training data, so these scores demonstrate *scaffold-neutrality, not model intelligence*. The Polyglot subset is the easiest slice of aider's 225-task six-language set — not comparable to full-set scores. Comparison table, roadmap, and caveats: [jlc-codec.org/benchmarks](https://jlc-codec.org/benchmarks/). SWE-bench is next on the campaign.
+
 ## 🚀 Install
 
 > **Windows is first-class today. macOS / Linux are coming soon.**
