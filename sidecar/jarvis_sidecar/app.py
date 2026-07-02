@@ -830,6 +830,35 @@ _subturn_debug_events: list[dict[str, Any]] = []
 _subturn_debug_next_id = 0
 _SUBTURN_DEBUG_MAX_EVENTS = 200
 _SUBTURN_DEBUG_TEXT_MAX_CHARS = 20000
+_JHB_REBUILD_WARNING = (
+    "Memory reorganization in progress after restart: recent memories may not be reflected yet "
+    "(self-heals next turn)."
+)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
+def _agent_jhb_rebuild_in_progress(agent: Any, session_id: str) -> bool:
+    probe = getattr(agent, "jhb_rebuild_in_progress", None)
+    if not callable(probe):
+        return False
+    try:
+        return bool(probe(session_id=session_id))
+    except TypeError:
+        try:
+            return bool(probe(session_id))
+        except Exception:
+            return False
+    except Exception:
+        return False
 
 
 def _init_provider_router() -> None:
@@ -1931,7 +1960,15 @@ def context(req: ContextRequest) -> dict[str, Any]:
         if agent is None:
             detail = f": {_agent_last_error}" if _agent_last_error else ""
             raise RuntimeError(f"JLC agent unavailable{detail}")
-        agent.wait_for_pending_encode(timeout=2.0, session_id=session_id)
+        rebuild_in_progress = _agent_jhb_rebuild_in_progress(agent, session_id)
+        wait_timeout = (
+            _env_float("JARVIS_JHB_REBUILD_FIRST_TURN_WAIT", 30.0)
+            if rebuild_in_progress
+            else 2.0
+        )
+        agent.wait_for_pending_encode(timeout=wait_timeout, session_id=session_id)
+        if rebuild_in_progress and _agent_jhb_rebuild_in_progress(agent, session_id):
+            warnings.append(_JHB_REBUILD_WARNING)
         jhb = agent.render_jhb(session_id=session_id)
         memory_mode = "full"
     except Exception as exc:  # noqa: BLE001

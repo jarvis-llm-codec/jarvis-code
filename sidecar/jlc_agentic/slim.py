@@ -589,6 +589,8 @@ class JarvisAgentic:
         # that touches thousands of conv_ids does not leak a Lock per id.
         self._encode_locks: OrderedDict[str, threading.Lock] = OrderedDict()
         self._encode_locks_guard = threading.Lock()
+        self._jhb_rebuild_in_progress: set[str] = set()
+        self._jhb_rebuild_guard = threading.Lock()
         # idea #12 step 4: per-conv in-flight encode counter for backlog
         # throttle. Guarded by _encode_locks_guard since increments/decrements
         # are O(1) and we want lock-coherence with _encode_locks.
@@ -889,13 +891,18 @@ class JarvisAgentic:
                     return  # no raw history to rebuild from
             except Exception:
                 return
+        self._mark_jhb_rebuild_in_progress(conv_id)
         thread = threading.Thread(
             target=self._run_jhb_rebuild_from_raw_thread,
             args=(conv_id,),
             name=f"jhb-rebuild-{self._pair8}",
             daemon=True,
         )
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            self._clear_jhb_rebuild_in_progress(conv_id)
+            raise
 
     def _run_jhb_rebuild_from_raw_thread(self, conv_id: str) -> None:
         try:
@@ -906,6 +913,8 @@ class JarvisAgentic:
                 file=__import__("sys").stderr,
                 flush=True,
             )
+        finally:
+            self._clear_jhb_rebuild_in_progress(conv_id)
 
     async def _rebuild_jhb_from_raw(self, conv_id: str) -> None:
         import sys as _sys
@@ -1448,7 +1457,7 @@ class JarvisAgentic:
         )
         return blocked_s
 
-    def wait_for_pending_encode(self, timeout: float = 600.0, session_id: str | None = None) -> None:
+    def wait_for_pending_encode(self, timeout: float = 600.0, session_id: str | None = None) -> bool:
         """Block until any in-flight encode for this conv_id finishes.
 
         Called from inject_pre_call so the next LLM call sees a fresh JHB.
@@ -1465,14 +1474,28 @@ class JarvisAgentic:
         """
         conv_id = _normalize_session_id(session_id)
         lock = self._get_encode_lock(conv_id)
-        if lock.acquire(timeout=timeout):
+        if lock.acquire(timeout=max(0.0, float(timeout))):
             lock.release()
+            return True
         else:
             import sys
             sys.stderr.write(
                 f"[wait_for_pending_encode] timed out after {timeout}s "
                 f"for conv_id={conv_id!r}, proceeding with possibly-stale JHB\n"
             )
+            return False
+
+    def _wait_for_encode_idle(self, conv_id: str, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if not self.wait_for_pending_encode(timeout=remaining, session_id=conv_id):
+                return False
+            if self.encode_in_flight(conv_id) <= 0:
+                return True
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
     def load_conversation_tail(self, conv_id: str) -> list[TailEntry]:
         path = self._tail_path(conv_id)
@@ -1587,6 +1610,30 @@ class JarvisAgentic:
         """
         with self._encode_locks_guard:
             return self._encode_in_flight.get(conv_id, 0)
+
+    def _ensure_jhb_rebuild_state(self) -> None:
+        if hasattr(self, "_jhb_rebuild_in_progress") and hasattr(self, "_jhb_rebuild_guard"):
+            return
+        import threading as _threading
+
+        self._jhb_rebuild_in_progress = set()
+        self._jhb_rebuild_guard = _threading.Lock()
+
+    def _mark_jhb_rebuild_in_progress(self, conv_id: str) -> None:
+        self._ensure_jhb_rebuild_state()
+        with self._jhb_rebuild_guard:
+            self._jhb_rebuild_in_progress.add(_normalize_session_id(conv_id))
+
+    def _clear_jhb_rebuild_in_progress(self, conv_id: str) -> None:
+        self._ensure_jhb_rebuild_state()
+        with self._jhb_rebuild_guard:
+            self._jhb_rebuild_in_progress.discard(_normalize_session_id(conv_id))
+
+    def jhb_rebuild_in_progress(self, session_id: str | None = None) -> bool:
+        self._ensure_jhb_rebuild_state()
+        conv_id = _normalize_session_id(session_id)
+        with self._jhb_rebuild_guard:
+            return conv_id in self._jhb_rebuild_in_progress
 
     def _get_encode_lock(self, conv_id: str) -> threading.Lock:
         with self._encode_locks_guard:
@@ -2067,6 +2114,7 @@ class JarvisAgentic:
         return True
 
     async def close(self) -> None:
+        await self._flush_pending_encodes_on_close()
         executor = getattr(self, "_background_encode_executor", None)
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=False)
@@ -2074,6 +2122,50 @@ class JarvisAgentic:
         await self._encoder_llm.close()
         await self.retriever.close()
         await self.jre.close()
+
+    def _encode_flush_timeout(self) -> float:
+        raw = os.environ.get("JARVIS_ENCODE_FLUSH_TIMEOUT")
+        if raw is None:
+            return 15.0
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return 15.0
+
+    async def _flush_pending_encodes_on_close(self) -> None:
+        timeout = self._encode_flush_timeout()
+        if timeout <= 0:
+            return
+        with self._encode_locks_guard:
+            conv_ids = list(self._encode_locks.keys())
+        if not conv_ids:
+            return
+        deadline = time.monotonic() + timeout
+        for conv_id in conv_ids:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print(
+                    f"[jlc:slim] pending encode flush timed out after {timeout}s during close",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
+                return
+            try:
+                ok = await asyncio.to_thread(self._wait_for_encode_idle, conv_id, remaining)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[jlc:slim] pending encode flush skipped for conv_id={conv_id!r}: {exc}",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
+                continue
+            if not ok:
+                print(
+                    f"[jlc:slim] pending encode flush timed out after {timeout}s during close",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
+                return
 
     def _load_project_md(self, project_path: str | None) -> str:
         if not project_path:
