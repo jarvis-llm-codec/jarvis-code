@@ -92,9 +92,14 @@ FINDER_PROMPT = (
     "in your dimension, say so explicitly. Return concise, grounded findings as your final message."
 )
 
+# The task and finder findings ride the run task (stdin), NOT this system prompt:
+# agent-sdk providers pass system_prompt as a `--system-prompt` CLI argument, and
+# Windows CreateProcess caps the whole command line at 32,767 chars — 5 finders'
+# findings blew past it and the spawn died as a misleading "Claude Code not
+# found" (live 60f6f78b3b3a, 2026-07-02). _verify_task already carries both.
 VERIFIER_PROMPT = (
-    "You are the verifier and synthesizer for an orchestration of the task:\n{task}\n\n"
-    "Finder dimensions: {dimensions}. Below are their raw findings:\n\n{findings_block}\n\n"
+    "You are the verifier and synthesizer for an orchestration. The user message "
+    "carries the task, the finder dimensions, and their raw findings.\n\n"
     "Adversarially verify each finding: DROP any not grounded in real code (re-check with "
     "read/grep if needed). Then synthesize a deduplicated list of CONFIRMED findings with "
     "file:line. Output a concise summary followed by the confirmed findings."
@@ -347,11 +352,7 @@ def run_orchestration(
             try:
                 verifier_result = Subagent(
                     name="verifier",
-                    system_prompt=VERIFIER_PROMPT.format(
-                        task=spec.task,
-                        dimensions=", ".join(dimensions),
-                        findings_block=_findings_block(outcomes),
-                    ),
+                    system_prompt=VERIFIER_PROMPT,
                     model=spec.verifier_model,
                     read_only=True,
                     allowed_tools=LEAN_READ_ONLY_TOOLS,

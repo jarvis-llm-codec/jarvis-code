@@ -1249,6 +1249,15 @@ manufacture questions to seem thorough. Never re-ask on an incoming
 directive/job/handback turn -- the plan already happened upstream.
 `.trim();
 
+// Regime-B work-route narration (2026-07-02, Jun): the SDK loop chains tools
+// silently, so the user sees edit/read cards without the "why". Claude Code
+// solves this with a system-prompt mandate; mirror it only for regime-B work.
+const NARRATION_DIRECTIVE_PROMPT = [
+	"Narrate as you work: before each tool call or batch, write ONE short sentence",
+	'in the user\'s language saying what you are about to do and why (e.g. "충돌 로직을 고치기 전에 현재 패들 판정을 확인할게").',
+	"After significant findings or edits, add a one-line progress note. Never work through multiple tools in silence.",
+].join(" ");
+
 // Mandatory ask_user gate for a NEW user-facing artifact turn (Jun, 2026-06-24).
 // The anthropic-agent-sdk regime is an autonomous-completion loop that barrels to
 // "finish the task" and skips the general CLARIFY directive; codex pauses only
@@ -1925,6 +1934,14 @@ let turnCheckpointScope: CheckpointScope | undefined;
 let sidecarHealthy = false;
 let currentMode: "chat" | "deepdive" = "chat";
 let currentRoute: EffectiveTurnRoute = "chat";
+// Route to restore when an [ULTRACODE DONE ...] completion directive re-engages
+// this window. The fast-handoff turn ends, the completion directive arrives as a
+// fresh user turn, the per-turn reset forces "chat", and shouldCallRouteClassifier
+// skips directive turns — so a deepdive-launched ultracode relays its result from
+// a chat turn (route demotion). Latched at agent_end when the ended turn invoked a
+// background-handoff tool; consumed one-shot by the completion directive turn.
+// Same-window handoffs only: worker/cross-window/second-eyes flows never latch.
+let ultracodeHandoffRouteToRestore: EffectiveTurnRoute | undefined;
 let currentTodoList: JarvisTodoItem[] = [];
 let readBeforeEditRegistry = new Map<string, number>();
 let deepdiveThinkingPreference: SupportedThinkingLevel | undefined;
@@ -2042,6 +2059,7 @@ let activeSecondEyesHeavyTurn = false;
 let secondEyesRequestedThisTurn = false;
 let secondEyesReviewSpawnedThisTurn = false;
 let secondEyesReminderInjectedThisTurn = false;
+let deepdiveReasoningStartNoticeSentThisTurn = false;
 let askUserIssuedThisProviderCall = false;
 // Set by the last pass verdict; consumed exactly once in agent_end so a
 // retried turn cannot double-post the synthesis self-directive.
@@ -2280,6 +2298,18 @@ function sendJarvisChatNotice(pi: ExtensionAPI, text: string): void {
 	} catch {
 		// ignore
 	}
+}
+
+function maybeSendDeepdiveReasoningStartNotice(pi: ExtensionAPI): void {
+	if (deepdiveReasoningStartNoticeSentThisTurn) return;
+	if (!isSidecarChatProxyProvider(activeModelProviderThisTurn)) return;
+	if (!isProjectRoute(currentRoute)) return;
+	if (secondEyesRequestedThisTurn || activeSecondEyesReviewTurn || activeSecondEyesMainTurn) return;
+	deepdiveReasoningStartNoticeSentThisTurn = true;
+	sendJarvisChatNotice(
+		pi,
+		`Reasoning started (${currentRoute}) — the model is planning before its first visible output; this can take a few minutes on high reasoning effort. Progress will stream as it works.`,
+	);
 }
 
 function formatUnregisterProjectStateLine(data: SidecarUnregisterResponse | undefined): string {
@@ -4411,7 +4441,9 @@ function baseModePromptForRoute(route: EffectiveTurnRoute): string {
 export function modePromptForRoute(route: EffectiveTurnRoute, provider: string | undefined): string {
 	const base = baseModePromptForRoute(route);
 	if (isSidecarChatProxyProvider(provider)) {
-		return `${base}\n\n${CLARIFY_DIRECTIVE_PROMPT}`;
+		const narration =
+			isProjectRoute(route) || route === "unregistered_coding" ? `\n\n${NARRATION_DIRECTIVE_PROMPT}` : "";
+		return `${base}\n\n${CLARIFY_DIRECTIVE_PROMPT}${narration}`;
 	}
 	return base;
 }
@@ -5154,6 +5186,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			activeSecondEyesReviewTurn = false;
 			activeSecondEyesMainTurn = false;
 			activeSecondEyesHeavyTurn = false;
+			deepdiveReasoningStartNoticeSentThisTurn = false;
 		}
 		if (
 			!isNewUserTurn &&
@@ -5172,6 +5205,10 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		if (activeSecondEyesReviewTurn || activeSecondEyesMainTurn) {
 			enterSecondEyesRoute();
 		}
+		// The [ULTRACODE DONE ...] completion directive turn resumes the route the
+		// handoff was fired from (the per-turn reset above forced "chat" and
+		// shouldCallRouteClassifier skips directive turns, so it cannot re-promote).
+		maybeRestoreUltracodeHandoffRoute(rawUserText);
 		if (isNewUserTurn) {
 			try {
 				await collectDirectiveReports(pi);
@@ -5555,6 +5592,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		}
 		startTurnMeter(ctx);
 		lastProviderStartedAtMs = Date.now();
+		maybeSendDeepdiveReasoningStartNotice(pi);
 		providerCallCountThisTurn = 0;
 		resetProviderCallCeilingState();
 		lastTurnPromptSnapshot = {
@@ -6234,6 +6272,9 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		// vanished from every memory layer through the old idle skip).
 		let assistantTextForTurn = assistantText;
 		let terminalReason = inferAssistantTerminalReason(assistantMessage, assistantText);
+		// Latch the route this turn ran in when it handed off to a background job
+		// (ultracode fast-handoff); the completion directive turn restores it.
+		const backgroundHandoffToolThisTurn = latchUltracodeHandoffRouteIfInvoked(event.messages);
 		const harnessSecondEyesSpawned = await maybeHarnessSpawnSecondEyesReview({
 			assistantText,
 			terminalReason,
@@ -6242,7 +6283,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		});
 		if (!harnessSecondEyesSpawned && !assistantTextForTurn.trim()) {
 			const guardStopReason = assistantMessage?.stopReason;
-			const backgroundHandoffTool = turnInvokedBackgroundHandoffTool(event.messages);
+			const backgroundHandoffTool = backgroundHandoffToolThisTurn;
 			let emptyAssistantEvent = "turn_loss_guard";
 			if (guardStopReason === "aborted") {
 				// User-initiated abort: persist the turn but do not blame the model
@@ -12334,6 +12375,42 @@ export function turnInvokedBackgroundHandoffTool(messages: AgentMessage[]): stri
 	return undefined;
 }
 
+// Completion directive body emitted by the sidecar when a background ultracode
+// run finishes (anthropic_agent_sdk._format_orchestrate_done).
+const ULTRACODE_COMPLETION_DIRECTIVE_RE = /^\s*\[ULTRACODE DONE\b/;
+
+// agent_end's event.messages is the full session history, so a handoff marker
+// from an old turn would re-match forever; scope the scan to the ended turn.
+export function messagesAfterLastUserMessage(messages: AgentMessage[]): AgentMessage[] {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (String((messages[i] as { role?: unknown }).role ?? "") === "user") return messages.slice(i + 1);
+	}
+	return messages;
+}
+
+export function latchUltracodeHandoffRouteIfInvoked(messages: AgentMessage[]): string | undefined {
+	const handoffTool = turnInvokedBackgroundHandoffTool(messagesAfterLastUserMessage(messages));
+	if (!handoffTool) return undefined;
+	// Second-eyes turns are per-turn review modes, not resumable work routes.
+	if (activeSecondEyesReviewTurn || activeSecondEyesMainTurn) return handoffTool;
+	// The per-turn reset target IS "chat"; nothing to restore.
+	if (currentRoute === "chat") return handoffTool;
+	ultracodeHandoffRouteToRestore = currentRoute;
+	appendSubturnEvent("ultracode_handoff_route_saved", { route: currentRoute, tool: handoffTool });
+	return handoffTool;
+}
+
+export function maybeRestoreUltracodeHandoffRoute(rawUserText: string): boolean {
+	if (!ultracodeHandoffRouteToRestore) return false;
+	if (!ULTRACODE_COMPLETION_DIRECTIVE_RE.test(rawUserText)) return false;
+	if (activeSecondEyesReviewTurn || activeSecondEyesMainTurn) return false;
+	const restored = ultracodeHandoffRouteToRestore;
+	ultracodeHandoffRouteToRestore = undefined;
+	setEffectiveRoute(restored);
+	appendSubturnEvent("ultracode_handoff_route_restored", { route: restored });
+	return true;
+}
+
 function buildBackgroundHandoffMarker(tool: string): string {
 	return (
 		`[JARVIS background handoff] ${tool} is running in the background; ` +
@@ -15173,6 +15250,10 @@ export function __setTurnToolActivityStateForTests(state: {
 	}
 }
 
+export function __getEffectiveRouteForTests(): EffectiveTurnRoute {
+	return currentRoute;
+}
+
 export function __setProjectRouteStateForTests(state: {
 	route?: EffectiveTurnRoute;
 	activeProjectPath?: string;
@@ -15227,6 +15308,7 @@ export function __resetJarvisJlcForTests(): void {
 	turnCheckpointScope = undefined;
 	sidecarHealthy = false;
 	setEffectiveRoute("chat");
+	ultracodeHandoffRouteToRestore = undefined;
 	currentTodoList = [];
 	clearReadBeforeEditRegistry();
 	deepdiveThinkingPreference = undefined;
@@ -15272,6 +15354,7 @@ export function __resetJarvisJlcForTests(): void {
 	secondEyesRequestedThisTurn = false;
 	secondEyesReviewSpawnedThisTurn = false;
 	secondEyesReminderInjectedThisTurn = false;
+	deepdiveReasoningStartNoticeSentThisTurn = false;
 	askUserIssuedThisProviderCall = false;
 	pendingMapSynthesisPost = false;
 	lastUserActivityAtMs = 0;
@@ -15376,7 +15459,7 @@ export function stripLeadingModeMarkerText(text: string, allowPartial = false): 
 	return isPartialMarker ? "" : text;
 }
 
-function sanitizeAssistantText(text: string, allowPartial = false): string {
+function sanitizeAssistantText(text: string, allowPartial = false, isFirstTextPart = true): string {
 	let sanitized = stripLeadingModeMarkerText(text, allowPartial);
 
 	// The model is mandated to lead with a [MODE:*] marker, so the real answer
@@ -15384,10 +15467,12 @@ function sanitizeAssistantText(text: string, allowPartial = false): string {
 	// (e.g. a "reasoning:" line the model added on its own). Drop it by POSITION
 	// — not by matching words — so this works in every chat language, not just
 	// the ones we happened to enumerate in a regex.
-	const firstMarker = sanitized.match(MODE_MARKER_ANY_RE)?.[0];
-	if (firstMarker) {
-		const markerIndex = sanitized.indexOf(firstMarker);
-		if (markerIndex > 0) sanitized = sanitized.slice(markerIndex);
+	if (isFirstTextPart) {
+		const firstMarker = sanitized.match(MODE_MARKER_ANY_RE)?.[0];
+		if (firstMarker) {
+			const markerIndex = sanitized.indexOf(firstMarker);
+			if (markerIndex > 0) sanitized = sanitized.slice(markerIndex);
+		}
 	}
 
 	// The marker(s) are routing signals the sidecar reads, never user content.
@@ -15406,15 +15491,18 @@ function sanitizeAssistantText(text: string, allowPartial = false): string {
 
 function sanitizeAssistantMessage(message: AssistantMessage, allowPartial: boolean): AssistantMessage {
 	if (!Array.isArray(message.content)) return message;
-	let stripped = false;
+	let changed = false;
+	let firstTextSeen = false;
 	const content = message.content.map((part) => {
-		if (stripped || part.type !== "text") return part;
-		const nextText = sanitizeAssistantText(part.text, allowPartial);
+		if (part.type !== "text") return part;
+		const isFirstText = !firstTextSeen;
+		firstTextSeen = true;
+		const nextText = sanitizeAssistantText(part.text, allowPartial, isFirstText);
 		if (nextText === part.text) return part;
-		stripped = true;
+		changed = true;
 		return { ...part, text: nextText };
 	});
-	return stripped ? { ...message, content } : message;
+	return changed ? { ...message, content } : message;
 }
 
 function sanitizeAssistantMessageInPlace(message: AssistantMessage, allowPartial: boolean): boolean {

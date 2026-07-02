@@ -38,3 +38,15 @@
 {"ts":"2026-06-28T23:33:42.399Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
 {"ts":"2026-06-29T01:24:19.931Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
 {"ts":"2026-06-29T01:24:50.265Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
+{"ts":"2026-07-01T23:20:58.618Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
+{"ts":"2026-07-01T23:23:51.104Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
+{"ts":"2026-07-02T01:49:39.556Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
+{"ts":"2026-07-02T01:52:34.897Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
+{"ts":"2026-07-02T02:18:29.799Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
+{"ts":"2026-07-02T02:19:05.330Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
+{"ts":"2026-07-02T02:21:38.629Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
+{"ts":"2026-07-02T02:21:58.626Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
+{"ts":"2026-07-02T05:25:49.191Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
+{"ts":"2026-07-02T05:29:00.344Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
+{"ts":"2026-07-02T06:44:25.274Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
+{"ts":"2026-07-02T06:45:12.867Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}

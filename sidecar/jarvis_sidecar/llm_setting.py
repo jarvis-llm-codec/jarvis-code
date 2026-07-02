@@ -900,6 +900,29 @@ def fetch_model_catalog(
             return ModelCatalogResult(static_models, "static")
         return ModelCatalogResult(None, "unavailable", warning="not logged in")
 
+    if cfg.get("auth_kind") == "agent-sdk":
+        # Claude subscription backend: list models with the logged-in Claude
+        # Code OAuth token (no ANTHROPIC_API_KEY). Anthropic's /v1/models accepts
+        # the Bearer token plus the anthropic-beta oauth header (verified live
+        # 2026-07-01). Only attempt the live fetch when the catalog wires an
+        # endpoint (mirrors the keyed path below); without one — or when the
+        # fetch fails / the user is logged out — fall back to models_static.
+        if cfg.get("models_endpoint"):
+            cached = _read_model_cache(provider_id, cfg)
+            if cached is not None and cached["fresh"] and not force_refresh:
+                return ModelCatalogResult(list(cached["models"]), "cache")
+            live_models = _fetch_agent_sdk_models(cfg)
+            if live_models:
+                _write_model_cache(provider_id, cfg, live_models)
+                return ModelCatalogResult(live_models, "live")
+            if not allow_fallback:
+                return ModelCatalogResult(None, "unavailable", warning="could not reach /models")
+            if cached is not None:
+                return ModelCatalogResult(list(cached["models"]), "cache", cache_stale=True, warning="using cached list")
+        if static_models:
+            return ModelCatalogResult(static_models, "static")
+        return ModelCatalogResult(None, "unavailable", warning="not logged in to Claude")
+
     auth_env = str(cfg.get("auth_env") or "").strip()
     api_key = os.environ.get(auth_env, "").strip() if auth_env else ""
     if auth_env and not api_key:
@@ -976,6 +999,38 @@ def _fetch_anthropic_models(url: str, headers: dict[str, str]) -> list[str] | No
             break
         next_url = _with_query_param(url, "after_id", last_id)
     return _dedupe_models(out) or None
+
+
+def _fetch_agent_sdk_models(cfg: dict[str, Any]) -> list[str] | None:
+    """List Claude models with the subscription OAuth token (no API key).
+
+    Anthropic's /v1/models honours the Claude Code OAuth bearer token when the
+    ``anthropic-beta: oauth-*`` header is present, so a subscription-only user
+    gets the live catalogue without ANTHROPIC_API_KEY.
+    """
+    try:
+        from jlc_agentic.claude_auth import get_agent_sdk_access_token
+
+        token = get_agent_sdk_access_token()
+    except Exception:  # noqa: BLE001
+        token = None
+    if not token:
+        return None
+
+    base_url = str(cfg.get("base_url") or "https://api.anthropic.com/v1").rstrip("/")
+    endpoint = str(cfg.get("models_endpoint") or "/models")
+    url = base_url + endpoint
+    headers = with_jarvis_user_agent(
+        {
+            "Authorization": f"Bearer {token}",
+            "anthropic-version": cfg.get("anthropic_version", "2023-06-01"),
+            "anthropic-beta": cfg.get("anthropic_oauth_beta", "oauth-2025-04-20"),
+        }
+    )
+    try:
+        return _fetch_anthropic_models(url, headers)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError):
+        return None
 
 
 def _static_model_ids(provider_id: str, cfg: dict[str, Any]) -> list[str]:

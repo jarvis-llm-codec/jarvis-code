@@ -198,8 +198,20 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			const toolCallBlocksByIndex = new Map<number, StreamingToolCallBlock>();
 			const toolCallBlocksById = new Map<string, StreamingToolCallBlock>();
 			const blocks = output.content as StreamingBlock[];
+			// regime-B (JLC sidecar) flattens a whole multi-step agent-sdk turn into ONE
+			// openai-completions stream (text -> tool -> tool -> text ...). On a new tool
+			// block we close the current text/thinking block so post-tool prose starts a
+			// fresh block BELOW the tool (generation order). OpenAI / regime-A never carry
+			// the presolved `jarvis_result` marker, so this gate stays false and their
+			// content is byte-identical (text keeps merging into one block above tools).
+			let sawPresolvedToolCall = false;
+			// Keep finishBlock idempotent: a block closed early on tool creation stays in
+			// `blocks`, so the stream-end finish loop would otherwise re-emit its *_end.
+			const finishedBlocks = new Set<StreamingBlock>();
 			const getContentIndex = (block: StreamingBlock) => blocks.indexOf(block);
 			const finishBlock = (block: StreamingBlock) => {
+				if (finishedBlocks.has(block)) return;
+				finishedBlocks.add(block);
 				const contentIndex = getContentIndex(block);
 				if (contentIndex === -1) {
 					return;
@@ -261,13 +273,23 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				thinkingBlock.thinkingSignature ||= thinkingSignature;
 				return thinkingBlock;
 			};
-			const ensureToolCallBlock = (toolCall: StreamingToolCallDelta) => {
+			const ensureToolCallBlock = (toolCall: StreamingToolCallDelta, regimeBInterleave: boolean) => {
 				const streamIndex = typeof toolCall.index === "number" ? toolCall.index : undefined;
 				let block = streamIndex !== undefined ? toolCallBlocksByIndex.get(streamIndex) : undefined;
 				if (!block && toolCall.id) {
 					block = toolCallBlocksById.get(toolCall.id);
 				}
 				if (!block) {
+					if (regimeBInterleave) {
+						if (textBlock) {
+							finishBlock(textBlock);
+							textBlock = null;
+						}
+						if (thinkingBlock) {
+							finishBlock(thinkingBlock);
+							thinkingBlock = null;
+						}
+					}
 					block = {
 						type: "toolCall",
 						id: toolCall.id || "",
@@ -376,7 +398,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 
 					if (choice?.delta?.tool_calls) {
 						for (const toolCall of choice.delta.tool_calls) {
-							const block = ensureToolCallBlock(toolCall);
+							const isPresolvedDelta = (toolCall as { jarvis_result?: unknown }).jarvis_result !== undefined;
+							if (isPresolvedDelta) sawPresolvedToolCall = true;
+							const block = ensureToolCallBlock(toolCall, isPresolvedDelta || sawPresolvedToolCall);
 							// Pre-resolved native tool (regime-B / JLC sidecar ONLY): result rides
 							// custom sibling fields on the tool_call delta -> attach to the block so
 							// the agent loop renders the widget WITHOUT executing. OpenAI/regime-A

@@ -3552,7 +3552,13 @@ async def openai_compatible_chat_completions(request: Request) -> Any:
         saw_finish = False
         # Set on the generator's own thread (StreamingResponse iterates it on a
         # worker thread); the SDK adapter reads turn_context on that same thread.
-        turn_context.set(conv_id=conv_id)
+        # Stream assistant text live so chat narrates its intent ("I'll read the
+        # log to see what's failing...") interleaved with tool activity, instead of
+        # buffering all prose until the end -- otherwise the user only sees raw tool
+        # spam with no "why". Gated OFF for second-eyes/critic turns (they share
+        # this proxy and return review-only payloads). (2026-07-01)
+        _is_second_eyes = bool(body.get("jarvis_second_eyes_phase") or body.get("jarvis_critic_phase"))
+        turn_context.set(conv_id=conv_id, stream_text_deltas=not _is_second_eyes)
         try:
             for chunk in llm.stream_chat_completions(
                 messages,

@@ -69,11 +69,15 @@ providers:
 
   # Subscription credit backend: delegates the turn to the embedded Claude Agent
   # SDK (auth via the logged-in Claude Code CLI, no API key). Mirrors the
-  # openai-codex (oauth) entry. No live /models endpoint — uses the static list.
+  # openai-codex (oauth) entry. Lists models live from Anthropic's /v1/models
+  # using the Claude Code OAuth token (no ANTHROPIC_API_KEY); models_static is
+  # the offline/logged-out fallback.
   anthropic-agent-sdk:
     label: "Claude (Anthropic) Agent-SDK"
     auth_kind: agent-sdk
     api_format: anthropic
+    base_url: "https://api.anthropic.com/v1"
+    models_endpoint: "/models"
     # chat/subagent run the agentic path. encoder is allowed too, but the apply
     # gate + adapter restrict it to haiku-class models: the JHB encoder fires every
     # turn, so a heavier model (opus/sonnet) would drain the subscription rate

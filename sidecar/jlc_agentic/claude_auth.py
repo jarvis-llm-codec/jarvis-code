@@ -25,6 +25,33 @@ def agent_sdk_auth_available() -> bool:
     return inspect_agent_sdk_auth().available
 
 
+def get_agent_sdk_access_token() -> str | None:
+    """Return the current Claude subscription OAuth access token, or None.
+
+    Prefers the explicit headless env token, then the logged-in Claude Code CLI
+    credentials (``~/.claude/.credentials.json`` -> ``claudeAiOauth.accessToken``).
+    The Claude CLI keeps this token refreshed on disk, so reading it fresh per
+    call is enough; this helper does NOT refresh and never logs the token. A
+    stale token simply yields a failed request that the caller falls back from.
+    """
+    env = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if env:
+        return env
+
+    path = Path.home() / ".claude" / ".credentials.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    oauth = raw.get("claudeAiOauth") if isinstance(raw, dict) else None
+    if not isinstance(oauth, dict):
+        return None
+
+    token = str(oauth.get("accessToken") or oauth.get("access_token") or "").strip()
+    return token or None
+
+
 def inspect_agent_sdk_auth(*, now_ms: int | None = None) -> ClaudeAgentSDKAuthStatus:
     """Inspect Claude Agent SDK subscription auth without exposing secrets.
 

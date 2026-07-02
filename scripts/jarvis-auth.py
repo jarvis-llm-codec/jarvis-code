@@ -27,6 +27,21 @@ PI_AGENT_DIR_DEFAULT = ROOT / "pi-agent"
 OPENAI_CODEX_PROVIDER = "openai-codex"
 OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.5"
 OPENAI_CODEX_ENCODER_MODEL = "gpt-5.4-mini"
+ANTHROPIC_AGENT_SDK_PROVIDER = "anthropic-agent-sdk"
+ANTHROPIC_AGENT_SDK_CHAT_MODEL = "claude-opus-4-8"
+ANTHROPIC_AGENT_SDK_ENCODER_MODEL = "claude-haiku-4-5-20251001"
+ANTHROPIC_AGENT_SDK_PI_PROVIDER_ENTRY: dict[str, Any] = {
+    "name": "Anthropic Agent SDK (sidecar-routed, window-init shell only)",
+    "baseUrl": "http://localhost:8765/v1",
+    "api": "openai-completions",
+    "apiKey": "JARVIS_LOCAL_KEYLESS",
+    "authHeader": False,
+    "headers": {"User-Agent": "jarvis-code/1.01.0 (pi-agent)"},
+    "models": [
+        {"id": ANTHROPIC_AGENT_SDK_CHAT_MODEL, "name": "Claude Opus 4.8 (Agent SDK)"},
+        {"id": ANTHROPIC_AGENT_SDK_ENCODER_MODEL, "name": "Claude Haiku 4.5 (Agent SDK)"},
+    ],
+}
 CLAUDE_CODE_OAUTH_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
 NO_CREDENTIAL_EXIT = 42
 MODEL_SETTING_EXIT = 43
@@ -305,6 +320,80 @@ def apply_openai_codex_defaults() -> dict[str, str]:
     )
 
 
+def _json_clone(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _merge_anthropic_agent_sdk_pi_provider(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        merged: dict[str, Any] = {}
+    else:
+        merged = _json_clone(raw)
+    providers = merged.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+        merged["providers"] = providers
+    providers.setdefault(ANTHROPIC_AGENT_SDK_PROVIDER, _json_clone(ANTHROPIC_AGENT_SDK_PI_PROVIDER_ENTRY))
+    return merged
+
+
+def _has_anthropic_agent_sdk_pi_provider(raw: Any) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    providers = raw.get("providers")
+    return isinstance(providers, dict) and ANTHROPIC_AGENT_SDK_PROVIDER in providers
+
+
+def write_anthropic_agent_sdk_pi_provider(existing_raw: Any = None) -> Path:
+    path = pi_agent_dir() / "models.json"
+    raw = existing_raw if existing_raw is not None else _read_json(path)
+    merged = _merge_anthropic_agent_sdk_pi_provider(raw)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(merged, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
+def apply_anthropic_agent_sdk_defaults() -> dict[str, str]:
+    from jarvis_sidecar.llm_setting import apply_picks
+
+    models_path = pi_agent_dir() / "models.json"
+    existing_models_json = _read_json(models_path)
+    try:
+        existing_models_text = models_path.read_text(encoding="utf-8")
+    except OSError:
+        existing_models_text = None
+    paths = apply_picks(
+        (ANTHROPIC_AGENT_SDK_PROVIDER, ANTHROPIC_AGENT_SDK_CHAT_MODEL),
+        (ANTHROPIC_AGENT_SDK_PROVIDER, ANTHROPIC_AGENT_SDK_ENCODER_MODEL),
+        subagent=(ANTHROPIC_AGENT_SDK_PROVIDER, ANTHROPIC_AGENT_SDK_CHAT_MODEL),
+        router=(ANTHROPIC_AGENT_SDK_PROVIDER, ANTHROPIC_AGENT_SDK_ENCODER_MODEL),
+        catalog=_load_catalog(),
+    )
+    if _has_anthropic_agent_sdk_pi_provider(existing_models_json) and existing_models_text is not None:
+        models_path.write_text(existing_models_text, encoding="utf-8")
+    else:
+        models_path = write_anthropic_agent_sdk_pi_provider(existing_models_json)
+    paths["models_json_path"] = str(models_path)
+    return paths
+
+
+def print_anthropic_agent_sdk_defaults_configured() -> None:
+    print(
+        f"[jarvis-auth] configured chat={ANTHROPIC_AGENT_SDK_PROVIDER}/{ANTHROPIC_AGENT_SDK_CHAT_MODEL}, "
+        f"encoder={ANTHROPIC_AGENT_SDK_PROVIDER}/{ANTHROPIC_AGENT_SDK_ENCODER_MODEL} "
+        "from Claude subscription credentials."
+    )
+
+
+def apply_anthropic_agent_sdk_defaults_if_seed() -> bool:
+    state = inspect_auth_state()
+    if not state.claude_agent_sdk_configured or not roles_are_untouched_seed(state.roles):
+        return False
+    apply_anthropic_agent_sdk_defaults()
+    print_anthropic_agent_sdk_defaults_configured()
+    return True
+
+
 def print_no_credentials_guidance() -> None:
     print("JARVIS Code needs an LLM credential before starting.")
     print()
@@ -374,6 +463,12 @@ def cmd_preflight(_args: argparse.Namespace) -> int:
                 f"encoder={OPENAI_CODEX_PROVIDER}/{OPENAI_CODEX_ENCODER_MODEL} from saved GPT OAuth."
             )
             return 0
+    elif state.claude_agent_sdk_configured and roles_are_untouched_seed(state.roles):
+        apply_anthropic_agent_sdk_defaults()
+        state = inspect_auth_state()
+        if state.ready:
+            print_anthropic_agent_sdk_defaults_configured()
+            return 0
 
     if not state.has_any_llm_credential:
         print_no_credentials_guidance()
@@ -423,17 +518,45 @@ def cmd_gpt_logout(_args: argparse.Namespace) -> int:
     return code
 
 
+def bundled_claude_cli() -> str | None:
+    """Return the Claude Code CLI bundled by claude-agent-sdk, when present."""
+    exe = "claude.exe" if os.name == "nt" else "claude"
+    try:
+        import claude_agent_sdk  # type: ignore[import-not-found]  # noqa: PLC0415
+
+        bundled = Path(claude_agent_sdk.__file__).resolve().parent / "_bundled" / exe
+        if bundled.is_file():
+            return str(bundled)
+    except Exception:
+        pass
+
+    venv_root = ROOT / "sidecar" / ".venv"
+    candidates = [
+        venv_root / "Lib" / "site-packages" / "claude_agent_sdk" / "_bundled" / exe,
+        *sorted(venv_root.glob("lib/python*/site-packages/claude_agent_sdk/_bundled/" + exe)),
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def claude_setup_token_command(*, prefer_npx: bool = False) -> list[str] | None:
-    if not prefer_npx:
-        claude = shutil.which("claude")
-        if claude:
-            return [claude, "setup-token"]
-    npx = shutil.which("npx")
-    if npx:
-        return [npx, "-y", "@anthropic-ai/claude-code", "setup-token"]
+    if prefer_npx:
+        npx = shutil.which("npx")
+        if npx:
+            return [npx, "-y", "@anthropic-ai/claude-code", "setup-token"]
+
     claude = shutil.which("claude")
     if claude:
         return [claude, "setup-token"]
+    bundled = bundled_claude_cli()
+    if bundled:
+        return [bundled, "setup-token"]
+    if not prefer_npx:
+        npx = shutil.which("npx")
+        if npx:
+            return [npx, "-y", "@anthropic-ai/claude-code", "setup-token"]
     return None
 
 
@@ -571,20 +694,26 @@ def cmd_claude_login(args: argparse.Namespace) -> int:
         path = save_claude_oauth_token(args.token)
         print(f"Saved {CLAUDE_CODE_OAUTH_ENV} to {path}.")
         print("Synced it to the user environment for Claude Code CLI where supported.")
-        print("Next: restart JARVIS, then pick or spawn an anthropic-agent-sdk model.")
+        if not apply_anthropic_agent_sdk_defaults_if_seed():
+            print("Next: restart JARVIS, then pick or spawn an anthropic-agent-sdk model.")
         return 0
 
     status = _inspect_agent_sdk_auth()
     if status.available and not args.refresh:
         print(f"Claude Agent SDK OAuth already available ({status.source}: {status.reason}).")
-        print("Use --refresh to run Claude setup-token anyway.")
+        if not apply_anthropic_agent_sdk_defaults_if_seed():
+            print("Use --refresh to run Claude setup-token anyway.")
         return 0
 
     if not args.no_setup_token:
         command = claude_setup_token_command(prefer_npx=args.npx)
         if command is None:
             print("Claude Code setup-token runner was not found.", file=sys.stderr)
-            print("Install Node.js/npm for npx, or install Claude Code CLI, then retry.", file=sys.stderr)
+            print(
+                "Claude Code CLI not found. Reinstall jarvis-code, install Claude Code, "
+                "or install Node.js for npx.",
+                file=sys.stderr,
+            )
             return 2
         print("Starting Claude Code setup-token...")
         print("JARVIS will capture and save the token automatically; token text is redacted from this output.")
@@ -597,12 +726,14 @@ def cmd_claude_login(args: argparse.Namespace) -> int:
             print(f"Saved {CLAUDE_CODE_OAUTH_ENV} to {path}.")
             print("Synced it to the user environment for Claude Code CLI where supported.")
             print("Claude Agent SDK OAuth is ready.")
-            print("Next: restart JARVIS, then pick or spawn an anthropic-agent-sdk model.")
+            if not apply_anthropic_agent_sdk_defaults_if_seed():
+                print("Next: restart JARVIS, then pick or spawn an anthropic-agent-sdk model.")
             return 0
         _load_credentials_into_env()
         status = _inspect_agent_sdk_auth()
         if status.available:
             print(f"Claude Agent SDK OAuth is ready ({status.source}: {status.reason}).")
+            apply_anthropic_agent_sdk_defaults_if_seed()
             return 0
 
     print("JARVIS still does not see a usable Claude Agent SDK OAuth token.")
@@ -612,7 +743,8 @@ def cmd_claude_login(args: argparse.Namespace) -> int:
         status = _inspect_agent_sdk_auth()
         if status.available:
             print("Claude Agent SDK OAuth is ready.")
-            print("Next: restart JARVIS, then pick or spawn an anthropic-agent-sdk model.")
+            if not apply_anthropic_agent_sdk_defaults_if_seed():
+                print("Next: restart JARVIS, then pick or spawn an anthropic-agent-sdk model.")
             return 0
     print("Claude OAuth token was not saved.", file=sys.stderr)
     return 2

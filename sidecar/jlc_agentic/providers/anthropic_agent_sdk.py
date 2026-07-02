@@ -46,6 +46,7 @@ import contextlib
 import os
 import queue
 import re
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -284,6 +285,19 @@ _SECOND_EYES_MAIN_MARKERS = (_SECOND_EYES_MAIN_MARKER, _LEGACY_SECOND_EYES_MAIN_
 _NEW_ARTIFACT_GATE_MARKER = "[JLC:NEW_ARTIFACT_ASK_USER_GATE]"
 _NEW_ARTIFACT_GATED_TOOLS = frozenset({"write", "edit", "multi_edit", "bash"})
 
+# Claude-native harness-orchestration tools that launch DETACHED background work
+# (a nested Claude Code workflow / agent runner). permission_mode="bypassPermissions"
+# lets the model reach these even though they are not in our curated allow_tools set.
+# Inside JARVIS's embedded one-shot Agent SDK turn there is no persistent Claude Code
+# harness to actually RUN that background work and no path for its results to return:
+# the model calls it, gets "launched in background", then waits on results that never
+# arrive -> the turn goes silent and the stream-idle guard aborts it (120s hang).
+# Self-contained native tools (Read/Write/Bash/WebSearch/Task/...) run and finish
+# inside the turn and are left to flow through untouched -- this set is ONLY the
+# orchestration class, redirected to JARVIS's own bridged equivalents (ultracode /
+# delegate_subagent) which run in-process and stream results back. (2026-07-01)
+_EMBEDDED_UNSUPPORTED_NATIVE_TOOLS = frozenset({"workflow"})
+
 # Disable the bundled Claude CLI's ToolSearch. On a first-party Anthropic host
 # (OAuth via ~/.claude/.credentials.json) with a supported model, the CLI
 # auto-enables tool-search and DEFERS MCP tools (mcp__jarvis_control__ask_user,
@@ -400,6 +414,81 @@ def _normalize_tool_schema_name(raw: Any) -> str:
     if collapsed in _TOOL_NAME_CANONICAL_ALIASES:
         return _TOOL_NAME_CANONICAL_ALIASES[collapsed]
     return value
+
+
+# The raw name of the bridged control tool as the model sees it, e.g.
+# ``mcp__jarvis_control__ask_user``. Anything that normalizes to ``ask_user`` but
+# does NOT start with this prefix is the Claude-native ``AskUserQuestion`` (or a
+# variant), which cannot render a question UI in the embedded one-shot SDK turn.
+_BRIDGED_CONTROL_TOOL_PREFIX = f"mcp__{_CONTROL_SERVER_NAME}__"
+_EDIT_PARAM_ALIASES = {"old_text": "old_string", "new_text": "new_string"}
+
+
+def _is_native_ask_user_leak(raw_name: Any, normalized_name: str) -> bool:
+    """True when the model invoked Claude's NATIVE ``AskUserQuestion`` instead of
+    the bridged ``mcp__jarvis_control__ask_user``.
+
+    Both names collapse to ``ask_user`` through the alias table (see
+    ``_TOOL_NAME_CANONICAL_ALIASES``), so the normalized name alone cannot tell
+    them apart. We inspect the RAW name: a genuinely bridged call starts with the
+    control-server MCP prefix; anything else that still normalizes to ``ask_user``
+    is the native leak. ``bypassPermissions`` lets the model reach the native tool
+    even though it is not in our curated ``allowed_tools`` -- and inside this
+    embedded turn it has no question UI, so it returns ``is_error`` immediately and
+    the user's answer never arrives. Callers deny it and redirect to the bridge.
+    """
+    if normalized_name != _ASK_USER_TOOL_NAME:
+        return False
+    if not isinstance(raw_name, str):
+        return True
+    return not raw_name.strip().lower().startswith(_BRIDGED_CONTROL_TOOL_PREFIX)
+
+
+def _remap_edit_params(input_data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    remapped = dict(input_data)
+    changed = False
+    for alias, canonical in _EDIT_PARAM_ALIASES.items():
+        if alias in remapped and canonical not in remapped:
+            remapped[canonical] = remapped.pop(alias)
+            changed = True
+    return remapped, changed
+
+
+def _remap_edit_param_slips(tool_name: str, tool_input: Any) -> dict[str, Any] | None:
+    """Map pi edit arg slips (old_text/new_text) to Claude native names.
+
+    Returns None when no correction is needed. Official keys are never overwritten:
+    if a model sends both an alias and the native key, the native key wins and that
+    pair is left untouched.
+    """
+    try:
+        if not isinstance(tool_input, dict):
+            return None
+        normalized_name = _normalize_tool_schema_name(tool_name)
+        if normalized_name == "edit":
+            remapped, changed = _remap_edit_params(tool_input)
+            return remapped if changed else None
+        if normalized_name != "multi_edit":
+            return None
+        edits = tool_input.get("edits")
+        if not isinstance(edits, list):
+            return None
+        remapped_edits: list[Any] = []
+        changed = False
+        for edit in edits:
+            if isinstance(edit, dict):
+                remapped_edit, edit_changed = _remap_edit_params(edit)
+                remapped_edits.append(remapped_edit if edit_changed else edit)
+                changed = changed or edit_changed
+            else:
+                remapped_edits.append(edit)
+        if not changed:
+            return None
+        remapped_input = dict(tool_input)
+        remapped_input["edits"] = remapped_edits
+        return remapped_input
+    except Exception:  # pragma: no cover - hook correction must never block tools
+        return None
 
 
 def _is_encoder_safe_model(model: str) -> bool:
@@ -618,6 +707,9 @@ class AnthropicAgentSDKAdapter:
         ]
         new_artifact_gate = _NEW_ARTIFACT_GATE_MARKER in (system_prompt or "")
         hooks = _build_agent_sdk_hooks(second_eyes_phase, HookMatcher, new_artifact_gate=new_artifact_gate)
+        # Fold AFTER the marker scan above — folding moves system text into the
+        # prompt body, so any system_prompt scans must run first.
+        system_prompt, prompt = _fold_oversized_system_prompt(system_prompt, prompt)
         # For plan_draft, `tools` already restricts Claude native tools to a
         # read-only set. Passing deny rules for tools outside that set can make
         # the Agent SDK abort with "Permission deny rule ... matches no known
@@ -804,6 +896,39 @@ class AnthropicAgentSDKAdapter:
 # ----------------------------------------------------------------- helpers
 
 
+# The SDK passes system_prompt as a `--system-prompt <text>` CLI argument
+# (subprocess_cli._build_command), and Windows CreateProcess caps the whole
+# command line at 32,767 chars. An oversized system prompt therefore dies AT
+# SPAWN with WinError 206, which python maps to ENOENT and the SDK misreports as
+# CLINotFoundError "Claude Code not found" (live: ultracode verifier carrying 5
+# finders' findings, run 60f6f78b3b3a, 2026-07-02). Fold oversized system
+# prompts into the stdin-borne prompt, which has no such limit. POSIX argv
+# limits are ~2MB, so the guard only engages on Windows.
+_SYSTEM_PROMPT_ARG_SAFE_CHARS = 24_000
+
+
+def _fold_oversized_system_prompt(
+    system_prompt: str | None,
+    prompt: str,
+    *,
+    limit: int = _SYSTEM_PROMPT_ARG_SAFE_CHARS,
+    platform: str | None = None,
+) -> tuple[str | None, str]:
+    if not system_prompt:
+        return system_prompt, prompt
+    if (platform if platform is not None else sys.platform) != "win32":
+        return system_prompt, prompt
+    if len(system_prompt) <= limit:
+        return system_prompt, prompt
+    folded = (
+        "<system-instructions>\n"
+        f"{system_prompt}\n"
+        "</system-instructions>\n\n"
+        f"{prompt}"
+    )
+    return None, folded
+
+
 def _split_messages(messages: list[dict[str, Any]]) -> tuple[str, str]:
     """Fold JLC's OpenAI-style messages into (system_prompt, user prompt).
 
@@ -917,11 +1042,30 @@ def _build_agent_sdk_hooks(
 
     async def _pre_tool_use(input_data: Any, _tool_use_id: str | None, _context: dict[str, Any]) -> dict[str, Any]:
         if isinstance(input_data, dict):
-            tool_name = _normalize_tool_schema_name(input_data.get("tool_name") or input_data.get("toolName") or "")
+            raw_tool_name = input_data.get("tool_name") or input_data.get("toolName") or ""
         else:
-            tool_name = _normalize_tool_schema_name(
-                getattr(input_data, "tool_name", "") or getattr(input_data, "toolName", "")
+            raw_tool_name = getattr(input_data, "tool_name", "") or getattr(input_data, "toolName", "")
+        tool_name = _normalize_tool_schema_name(raw_tool_name)
+        # Native AskUserQuestion (or any non-bridged variant) has no question UI in
+        # this embedded one-shot SDK turn: it fails with is_error immediately and the
+        # model never receives the answer. Redirect to the bridged ask_user. This MUST
+        # run BEFORE the new-artifact gate below -- otherwise the native call would set
+        # ask_user_seen and silently disable the create-file gate without ever asking.
+        if _is_native_ask_user_leak(raw_tool_name, tool_name):
+            reason = (
+                "[JLC] The native AskUserQuestion tool cannot show a question UI in "
+                "this embedded agent-sdk turn: it fails immediately with an error and "
+                "you never receive the user's answer. Call the bridged `ask_user` tool "
+                "instead -- it opens a modal in the JARVIS UI and returns the user's reply."
             )
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                },
+                "reason": reason,
+            }
         if new_artifact_gate:
             if tool_name == _ASK_USER_TOOL_NAME:
                 ask_user_seen["seen"] = True
@@ -938,6 +1082,22 @@ def _build_agent_sdk_hooks(
                     },
                     "reason": reason,
                 }
+        if tool_name in _EMBEDDED_UNSUPPORTED_NATIVE_TOOLS:
+            reason = (
+                "[JLC] The native Workflow tool is unavailable here: its background "
+                "workflow has no runner in this environment and cannot return results, "
+                "so it would hang. Use the `ultracode` tool for parallel multi-agent "
+                "orchestration, or `delegate_subagent` for a single subagent -- both "
+                "run inside JARVIS and stream results back."
+            )
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                },
+                "reason": reason,
+            }
         if phase and tool_name in blocked:
             reason = _second_eyes_permission_message(phase, tool_name)
             return {
@@ -947,6 +1107,24 @@ def _build_agent_sdk_hooks(
                     "permissionDecisionReason": reason,
                 },
                 "reason": reason,
+            }
+        if isinstance(input_data, dict):
+            tool_input = input_data.get("tool_input")
+            if tool_input is None:
+                tool_input = input_data.get("toolInput")
+        else:
+            tool_input = getattr(input_data, "tool_input", None)
+            if tool_input is None:
+                tool_input = getattr(input_data, "toolInput", None)
+        updated_input = _remap_edit_param_slips(tool_name, tool_input)
+        if updated_input is not None:
+            _debug_note("edit_param_remap", tool_name=tool_name)
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "updatedInput": updated_input,
+                }
             }
         return {
             "hookSpecificOutput": {

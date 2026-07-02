@@ -143,6 +143,16 @@ interface Expandable {
 	setExpanded(expanded: boolean): void;
 }
 
+type AssistantContentBlock = AssistantMessage["content"][number];
+type AssistantToolCallContent = Extract<AssistantContentBlock, { type: "toolCall" }>;
+type AssistantTextRunContent = Exclude<AssistantContentBlock, AssistantToolCallContent>;
+
+type RegimeBAssistantTextRun = {
+	index: number;
+	visibleContent: AssistantTextRunContent[];
+	renderContent: AssistantContentBlock[];
+};
+
 const TERMINATED_STREAM_ERROR_REGEX = /^(?:TypeError:\s*)?terminated$/i;
 const RETRY_TERMINATED_STREAM_ERROR_REGEX = /^(Retry failed after \d+ attempts:\s*)(?:TypeError:\s*)?terminated$/i;
 
@@ -158,6 +168,58 @@ function formatUserFacingError(message: string): string {
 
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
+}
+
+function assistantMessageHasPresolvedToolCall(message: AssistantMessage): boolean {
+	return message.content.some((c) => c.type === "toolCall" && c.presolvedResult !== undefined);
+}
+
+function assistantTextRunHasVisibleContent(run: RegimeBAssistantTextRun): boolean {
+	return run.visibleContent.some(
+		(c) => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()),
+	);
+}
+
+function splitRegimeBAssistantTextRuns(message: AssistantMessage): RegimeBAssistantTextRun[] {
+	const runs: RegimeBAssistantTextRun[] = [];
+	let runIndex = 0;
+	let visibleContent: AssistantTextRunContent[] = [];
+	let previousToolCall: AssistantToolCallContent | undefined;
+
+	const flushRun = (nextToolCall?: AssistantToolCallContent) => {
+		const renderContent: AssistantContentBlock[] = previousToolCall
+			? [previousToolCall, ...visibleContent]
+			: [...visibleContent];
+		if (!previousToolCall && nextToolCall) {
+			renderContent.push(nextToolCall);
+		}
+		runs.push({
+			index: runIndex,
+			visibleContent,
+			renderContent,
+		});
+		visibleContent = [];
+	};
+
+	for (const content of message.content) {
+		if (content.type === "toolCall") {
+			flushRun(content);
+			previousToolCall = content;
+			runIndex++;
+		} else {
+			visibleContent.push(content);
+		}
+	}
+	flushRun();
+
+	return runs;
+}
+
+function getAssistantTextRunSignature(run: RegimeBAssistantTextRun): string {
+	return JSON.stringify({
+		hasToolCall: run.renderContent.some((content) => content.type === "toolCall"),
+		content: run.visibleContent,
+	});
 }
 
 class ExpandableText extends Text implements Expandable {
@@ -301,6 +363,8 @@ export class InteractiveMode {
 	// Streaming message tracking
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
+	private streamingRunComponents = new Map<number, AssistantMessageComponent>();
+	private streamingRunContentSignatures = new Map<number, string>();
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
@@ -2810,6 +2874,8 @@ export class InteractiveMode {
 			case "agent_start":
 				this.pendingTools.clear();
 				this.streamedPresolvedResults.clear();
+				this.streamingRunComponents.clear();
+				this.streamingRunContentSignatures.clear();
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
 				}
@@ -2864,6 +2930,8 @@ export class InteractiveMode {
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
+					this.streamingRunComponents.clear();
+					this.streamingRunContentSignatures.clear();
 					this.streamingComponent = new AssistantMessageComponent(
 						undefined,
 						this.hideThinkingBlock,
@@ -2873,8 +2941,13 @@ export class InteractiveMode {
 						this.showFinalizedThinking,
 					);
 					this.streamingMessage = event.message;
+					this.streamingRunComponents.set(0, this.streamingComponent);
 					this.chatContainer.addChild(this.streamingComponent);
-					this.streamingComponent.updateContent(this.streamingMessage);
+					if (this.assistantMessageHasPresolvedToolCall(this.streamingMessage)) {
+						this.renderRegimeBStreamingMessage(this.streamingMessage);
+					} else {
+						this.streamingComponent.updateContent(this.streamingMessage);
+					}
 					this.ui.requestRender();
 				}
 				break;
@@ -2882,61 +2955,13 @@ export class InteractiveMode {
 			case "message_update":
 				if (this.streamingComponent && event.message.role === "assistant") {
 					this.streamingMessage = event.message;
-					this.streamingComponent.updateContent(this.streamingMessage);
-
-					for (const content of this.streamingMessage.content) {
-						if (content.type === "toolCall") {
-							if (this.shouldHideToolFromTranscript(content.name)) continue;
-							let component = this.pendingTools.get(content.id);
-							if (!component) {
-								component = new ToolExecutionComponent(
-									content.name,
-									content.id,
-									content.arguments,
-									{
-										showImages: this.settingsManager.getShowImages(),
-										imageWidthCells: this.settingsManager.getImageWidthCells(),
-									},
-									this.getRegisteredToolDefinition(content.name),
-									this.ui,
-									this.sessionManager.getCwd(),
-								);
-								component.setExpanded(this.toolOutputExpanded);
-								this.chatContainer.addChild(component);
-								this.pendingTools.set(content.id, component);
-							} else {
-								component.updateArgs(content.arguments);
-							}
-							// regime-B (anthropic-agent-sdk): the SDK already executed this
-							// tool upstream and the sidecar shipped the result inline on the
-							// tool_call block (presolvedResult). Attach it NOW so the card
-							// expands as it streams in, instead of popping open in a batch
-							// after the turn (when tool_execution_end fires post-stream for
-							// the immediate/presolved outcome). Gated on presolvedResult, a
-							// sidecar-only field -> regime-A tool calls never carry it, so
-							// their rendering is byte-identical. The Set keeps this to one
-							// attach per card; the later tool_execution_end re-sets the same
-							// result idempotently (same content + isError -> same display).
-							if (content.presolvedResult !== undefined && !this.streamedPresolvedResults.has(content.id)) {
-								this.streamedPresolvedResults.add(content.id);
-								component.updateResult({
-									content: [{ type: "text", text: content.presolvedResult }],
-									isError: content.presolvedIsError ?? false,
-								});
-								// regime-B (presolved): args arrive complete in one chunk and the
-								// SDK already executed the tool (disk is at its final state), so
-								// mark args complete NOW. This unblocks edit's argsComplete-gated
-								// computeEditsDiff (edit.ts:450) immediately instead of letting it
-								// fire in a batch at message_end (the "뿅" all-cards-expand). read/
-								// bash render result text directly (no argsComplete gate) so they
-								// were already live; this brings edit's diff to parity. The
-								// message_end setArgsComplete (safety net) stays; edit.ts's
-								// !preview && !previewPending guard makes the recompute idempotent.
-								// markPresolved BEFORE setArgsComplete so alreadyApplied is set
-								// when setArgsComplete's updateDisplay runs the edit renderCall ->
-								// it takes the args-diff path (no file re-read = no false red error).
-								component.markPresolved();
-								component.setArgsComplete();
+					if (this.assistantMessageHasPresolvedToolCall(this.streamingMessage)) {
+						this.renderRegimeBStreamingMessage(this.streamingMessage);
+					} else {
+						this.streamingComponent.updateContent(this.streamingMessage);
+						for (const content of this.streamingMessage.content) {
+							if (content.type === "toolCall") {
+								this.ensureLiveToolCallComponent(content);
 							}
 						}
 					}
@@ -2965,7 +2990,7 @@ export class InteractiveMode {
 					this.streamingComponent.setFinalized(true);
 					this.streamingComponent.setShowFinalizedThinking(true);
 					if (this.assistantMessageHasPresolvedToolCall(this.streamingMessage)) {
-						this.finalizeRegimeBMessageLayout(this.streamingComponent, this.streamingMessage);
+						this.renderRegimeBStreamingMessage(this.streamingMessage, { finalized: true, force: true });
 					} else {
 						this.streamingComponent.updateContent(this.streamingMessage);
 					}
@@ -2989,6 +3014,8 @@ export class InteractiveMode {
 					}
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
+					this.streamingRunComponents.clear();
+					this.streamingRunContentSignatures.clear();
 					this.footer.invalidate();
 				}
 				this.ui.requestRender();
@@ -3055,6 +3082,11 @@ export class InteractiveMode {
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
 				}
+				for (const component of this.streamingRunComponents.values()) {
+					this.chatContainer.removeChild(component);
+				}
+				this.streamingRunComponents.clear();
+				this.streamingRunContentSignatures.clear();
 				this.pendingTools.clear();
 
 				await this.checkShutdownRequested();
@@ -3313,6 +3345,12 @@ export class InteractiveMode {
 				break;
 			}
 			case "assistant": {
+				if (assistantMessageHasPresolvedToolCall(message)) {
+					this.addRegimeBAssistantMessageToChat(message, {
+						showFinalizedThinking: options?.showFinalizedThinking ?? this.showFinalizedThinking,
+					});
+					break;
+				}
 				const assistantComponent = new AssistantMessageComponent(
 					message,
 					this.hideThinkingBlock,
@@ -3340,44 +3378,222 @@ export class InteractiveMode {
 	 * regime-A / pi-native providers never carry this -> false -> existing path.
 	 */
 	private assistantMessageHasPresolvedToolCall(message: AssistantMessage): boolean {
-		return message.content.some((c) => c.type === "toolCall" && c.presolvedResult !== undefined);
+		return assistantMessageHasPresolvedToolCall(message);
 	}
 
-	/**
-	 * regime-B layout fix (T#2): the SDK packs thinking, tool calls, AND the final
-	 * conclusion text into ONE assistant message. The default streaming path renders
-	 * all of that text in a single component placed ABOVE the tool widgets, so the
-	 * conclusion floats over the widgets. Split the message at the LAST tool call:
-	 * pre-tool blocks (thinking + any pre-amble) stay in the top component; the text
-	 * the SDK emitted AFTER its tools (the conclusion) moves to a new component
-	 * appended BELOW the already-rendered tool widgets — matching regime-A, where the
-	 * conclusion is a separate, later message.
-	 */
-	private finalizeRegimeBMessageLayout(component: AssistantMessageComponent, message: AssistantMessage): void {
-		let lastToolIndex = -1;
-		for (let i = 0; i < message.content.length; i++) {
-			if (message.content[i].type === "toolCall") lastToolIndex = i;
+	private addChatChildIfMissing(component: Component): void {
+		if (!this.chatContainer.children.includes(component)) {
+			this.chatContainer.addChild(component);
 		}
-		if (lastToolIndex === -1) {
-			component.updateContent(message);
-			return;
+	}
+
+	private createToolExecutionComponent(content: AssistantToolCallContent): ToolExecutionComponent {
+		const component = new ToolExecutionComponent(
+			content.name,
+			content.id,
+			content.arguments,
+			{
+				showImages: this.settingsManager.getShowImages(),
+				imageWidthCells: this.settingsManager.getImageWidthCells(),
+			},
+			this.getRegisteredToolDefinition(content.name),
+			this.ui,
+			this.sessionManager.getCwd(),
+		);
+		component.setExpanded(this.toolOutputExpanded);
+		return component;
+	}
+
+	private applyPresolvedToolResult(component: ToolExecutionComponent, content: AssistantToolCallContent): void {
+		if (content.presolvedResult === undefined) return;
+		component.updateResult({
+			content: [{ type: "text", text: content.presolvedResult }],
+			isError: content.presolvedIsError ?? false,
+		});
+		component.markPresolved();
+		component.setArgsComplete();
+	}
+
+	private applyStreamingPresolvedToolResult(
+		component: ToolExecutionComponent,
+		content: AssistantToolCallContent,
+	): void {
+		if (content.presolvedResult === undefined || this.streamedPresolvedResults.has(content.id)) return;
+		this.streamedPresolvedResults.add(content.id);
+		// regime-B: the SDK has already executed this tool upstream. Attach the inline
+		// result as soon as it streams in, and mark args complete after alreadyApplied
+		// is set so edit renderers diff args directly instead of re-reading files.
+		this.applyPresolvedToolResult(component, content);
+	}
+
+	private ensureLiveToolCallComponent(content: AssistantToolCallContent): ToolExecutionComponent | undefined {
+		if (this.shouldHideToolFromTranscript(content.name)) return undefined;
+		let component = this.pendingTools.get(content.id);
+		if (!component) {
+			component = this.createToolExecutionComponent(content);
+			this.chatContainer.addChild(component);
+			this.pendingTools.set(content.id, component);
+		} else {
+			component.updateArgs(content.arguments);
+			this.addChatChildIfMissing(component);
 		}
-		const preBlocks = message.content.slice(0, lastToolIndex + 1);
-		const postBlocks = message.content.slice(lastToolIndex + 1);
-		// toolCall blocks inside preBlocks are ignored by updateContent (rendered as
-		// separate widgets); this keeps thinking + any pre-tool text up top.
-		component.updateContent({ ...message, content: preBlocks });
-		const hasConclusion = postBlocks.some((c) => c.type === "text" && c.text.trim());
-		if (hasConclusion) {
-			const conclusion = new AssistantMessageComponent(
-				{ ...message, content: postBlocks },
+		this.applyStreamingPresolvedToolResult(component, content);
+		return component;
+	}
+
+	private getAssistantRunMessage(message: AssistantMessage, run: RegimeBAssistantTextRun): AssistantMessage {
+		return { ...message, content: run.renderContent };
+	}
+
+	private ensureStreamingRunComponent(runIndex: number, finalized: boolean): AssistantMessageComponent {
+		let component = this.streamingRunComponents.get(runIndex);
+		if (!component && runIndex === 0 && this.streamingComponent) {
+			component = this.streamingComponent;
+			this.streamingRunComponents.set(runIndex, component);
+		}
+		if (!component) {
+			component = new AssistantMessageComponent(
+				undefined,
 				this.hideThinkingBlock,
 				this.getMarkdownThemeWithSettings(),
 				this.hiddenThinkingLabel,
-				true,
-				true,
+				finalized,
+				finalized ? true : this.showFinalizedThinking,
 			);
-			this.chatContainer.addChild(conclusion);
+			this.streamingRunComponents.set(runIndex, component);
+		}
+		this.addChatChildIfMissing(component);
+		return component;
+	}
+
+	private updateStreamingRunComponent(
+		component: AssistantMessageComponent,
+		message: AssistantMessage,
+		run: RegimeBAssistantTextRun,
+		options: { finalized: boolean; force?: boolean },
+	): void {
+		const signature = getAssistantTextRunSignature(run);
+		if (!options.force && this.streamingRunContentSignatures.get(run.index) === signature) {
+			return;
+		}
+		if (options.finalized) {
+			component.setFinalized(true);
+			component.setShowFinalizedThinking(true);
+		}
+		component.updateContent(this.getAssistantRunMessage(message, run));
+		this.streamingRunContentSignatures.set(run.index, signature);
+	}
+
+	private detachRegimeBStreamingComponents(message: AssistantMessage): void {
+		const detached = new Set<Component>();
+		const detach = (component: Component | undefined) => {
+			if (!component || detached.has(component)) return;
+			this.chatContainer.removeChild(component);
+			detached.add(component);
+		};
+
+		for (const component of this.streamingRunComponents.values()) {
+			detach(component);
+		}
+		for (const content of message.content) {
+			if (content.type === "toolCall") {
+				detach(this.pendingTools.get(content.id));
+			}
+		}
+	}
+
+	private renderRegimeBStreamingMessage(
+		message: AssistantMessage,
+		options: { finalized?: boolean; force?: boolean } = {},
+	): void {
+		const finalized = options.finalized ?? false;
+		const runs = splitRegimeBAssistantTextRuns(message);
+		const runByIndex = new Map(runs.map((run) => [run.index, run]));
+		this.detachRegimeBStreamingComponents(message);
+		const firstRun = runByIndex.get(0);
+		if (firstRun) {
+			this.updateStreamingRunComponent(this.ensureStreamingRunComponent(0, finalized), message, firstRun, {
+				finalized,
+				force: options.force,
+			});
+		}
+
+		let runIndex = 0;
+		for (const content of message.content) {
+			if (content.type !== "toolCall") continue;
+			this.ensureLiveToolCallComponent(content);
+			runIndex++;
+			const run = runByIndex.get(runIndex);
+			if (!run || !assistantTextRunHasVisibleContent(run)) continue;
+			this.updateStreamingRunComponent(this.ensureStreamingRunComponent(runIndex, finalized), message, run, {
+				finalized,
+				force: options.force,
+			});
+		}
+	}
+
+	private getToolErrorMessage(message: AssistantMessage): string {
+		if (message.stopReason === "aborted") {
+			const retryAttempt = this.session.retryAttempt;
+			return retryAttempt > 0
+				? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`
+				: "Operation aborted";
+		}
+		return message.errorMessage || "Error";
+	}
+
+	private addRegimeBToolCallToChat(
+		content: AssistantToolCallContent,
+		message: AssistantMessage,
+		renderedPendingTools?: Map<string, ToolExecutionComponent>,
+	): void {
+		if (this.shouldHideToolFromTranscript(content.name)) return;
+		const component = this.createToolExecutionComponent(content);
+		this.chatContainer.addChild(component);
+
+		if (message.stopReason === "aborted" || message.stopReason === "error") {
+			component.updateResult({
+				content: [{ type: "text", text: this.getToolErrorMessage(message) }],
+				isError: true,
+			});
+		} else if (content.presolvedResult !== undefined) {
+			this.applyPresolvedToolResult(component, content);
+		} else {
+			renderedPendingTools?.set(content.id, component);
+		}
+	}
+
+	private addRegimeBAssistantMessageToChat(
+		message: AssistantMessage,
+		options?: {
+			showFinalizedThinking?: boolean;
+			renderedPendingTools?: Map<string, ToolExecutionComponent>;
+		},
+	): void {
+		const runs = splitRegimeBAssistantTextRuns(message);
+		const runByIndex = new Map(runs.map((run) => [run.index, run]));
+		const addRun = (runIndex: number) => {
+			const run = runByIndex.get(runIndex);
+			if (!run || !assistantTextRunHasVisibleContent(run)) return;
+			this.chatContainer.addChild(
+				new AssistantMessageComponent(
+					this.getAssistantRunMessage(message, run),
+					this.hideThinkingBlock,
+					this.getMarkdownThemeWithSettings(),
+					this.hiddenThinkingLabel,
+					true,
+					options?.showFinalizedThinking ?? this.showFinalizedThinking,
+				),
+			);
+		};
+
+		addRun(0);
+		let runIndex = 0;
+		for (const content of message.content) {
+			if (content.type !== "toolCall") continue;
+			this.addRegimeBToolCallToChat(content, message, options?.renderedPendingTools);
+			runIndex++;
+			addRun(runIndex);
 		}
 	}
 
@@ -3410,8 +3626,16 @@ export class InteractiveMode {
 		for (const [index, message] of sessionContext.messages.entries()) {
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
+				const showFinalizedThinking = index === lastAssistantIndex || this.showFinalizedThinking;
+				if (assistantMessageHasPresolvedToolCall(message)) {
+					this.addRegimeBAssistantMessageToChat(message, {
+						showFinalizedThinking,
+						renderedPendingTools,
+					});
+					continue;
+				}
 				this.addMessageToChat(message, {
-					showFinalizedThinking: index === lastAssistantIndex || this.showFinalizedThinking,
+					showFinalizedThinking,
 				});
 				// Render tool call components
 				for (const content of message.content) {
@@ -3807,9 +4031,13 @@ export class InteractiveMode {
 
 		// If streaming, re-add the streaming component with updated visibility and re-render
 		if (this.streamingComponent && this.streamingMessage) {
-			this.streamingComponent.setShowFinalizedThinking(this.showFinalizedThinking);
-			this.streamingComponent.updateContent(this.streamingMessage);
-			this.chatContainer.addChild(this.streamingComponent);
+			if (this.assistantMessageHasPresolvedToolCall(this.streamingMessage)) {
+				this.renderRegimeBStreamingMessage(this.streamingMessage, { force: true });
+			} else {
+				this.streamingComponent.setShowFinalizedThinking(this.showFinalizedThinking);
+				this.streamingComponent.updateContent(this.streamingMessage);
+				this.chatContainer.addChild(this.streamingComponent);
+			}
 		}
 
 		this.showStatus(`Finalized thinking: ${this.showFinalizedThinking ? "expanded" : "collapsed"}`);
