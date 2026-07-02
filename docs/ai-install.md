@@ -313,6 +313,11 @@ jarvis doctor --skip-sidecar
 It checks Python, Node, the embedding model, the provider catalog, and auth. **This is
 your primary proof the install is sound.**
 
+On Windows, also confirm the doctor output includes `[OK] windows:vcredist-x64`. If
+it fails, install the Microsoft Visual C++ Redistributable (x64) from
+<https://aka.ms/vs/17/release/vc_redist.x64.exe>, then rerun
+`jarvis doctor --skip-sidecar`.
+
 **Verify BOTH model roles are set** — this is where the common encoder bug shows up.
 Open `~/.jarvis-code/config.yaml` (or run `jarvis model-setting` and read the current
 values) and confirm **chat AND encoder** are both what you intended for their plan —

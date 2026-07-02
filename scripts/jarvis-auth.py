@@ -114,6 +114,12 @@ def pi_auth_path() -> Path:
     return pi_agent_dir() / "auth.json"
 
 
+def sidecar_venv_python() -> Path:
+    if os.name == "nt":
+        return SIDECAR_ROOT / ".venv" / "Scripts" / "python.exe"
+    return SIDECAR_ROOT / ".venv" / "bin" / "python"
+
+
 def python_auth_path() -> Path:
     override = os.environ.get("JARVIS_CODE_OAUTH_AUTH_PATH")
     return Path(override) if override else Path.home() / ".jarvis-code" / "auth.json"
@@ -243,6 +249,14 @@ def launchable_for_pi(provider: str, model: str) -> bool:
     return provider in BUILT_IN_MODEL_PROVIDERS or model_registered_in_pi_models(provider, model)
 
 
+def roles_reference_provider(roles: dict[str, str | None], provider: str) -> bool:
+    for value in roles.values():
+        role = split_role(value)
+        if role and role[0] == provider:
+            return True
+    return False
+
+
 def _agent_sdk_auth_available() -> bool:
     """Claude Agent SDK auth: a headless CLAUDE_CODE_OAUTH_TOKEN, or an interactive
     Claude Code login stored at ~/.claude/.credentials.json. 2026-06-20: expired
@@ -353,6 +367,80 @@ def write_anthropic_agent_sdk_pi_provider(existing_raw: Any = None) -> Path:
     return path
 
 
+def anthropic_agent_sdk_pi_provider_registered() -> bool:
+    return _has_anthropic_agent_sdk_pi_provider(_read_json(pi_agent_dir() / "models.json"))
+
+
+def repair_missing_anthropic_agent_sdk_pi_provider(roles: dict[str, str | None]) -> bool:
+    if not roles_reference_provider(roles, ANTHROPIC_AGENT_SDK_PROVIDER):
+        return False
+    if anthropic_agent_sdk_pi_provider_registered():
+        return False
+    path = write_anthropic_agent_sdk_pi_provider()
+    print(f"[jarvis-auth] registered {ANTHROPIC_AGENT_SDK_PROVIDER} provider in {path} for existing Claude roles.")
+    return True
+
+
+def claude_agent_sdk_importable_in_sidecar_venv(py: Path | None = None) -> bool:
+    python = py or sidecar_venv_python()
+    if not python.exists():
+        return False
+    try:
+        completed = subprocess.run(
+            [str(python), "-c", "import claude_agent_sdk"],
+            cwd=str(ROOT),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _manual_claude_agent_sdk_install_command(py: Path) -> str:
+    return f'"{py}" -m pip install claude-agent-sdk'
+
+
+def ensure_claude_agent_sdk_installed() -> bool:
+    if not _env_flag_enabled("JARVIS_CLAUDE_AGENT_SDK_AUTO_INSTALL", True):
+        return False
+    py = sidecar_venv_python()
+    if claude_agent_sdk_importable_in_sidecar_venv(py):
+        return True
+    manual = _manual_claude_agent_sdk_install_command(py)
+    if not py.exists():
+        print(
+            f"[jarvis-auth] sidecar venv Python not found at {py}; install later with: {manual}",
+            file=sys.stderr,
+        )
+        return False
+
+    print("[jarvis-auth] installing claude-agent-sdk into the sidecar venv (one-time, ~250MB)...")
+    try:
+        completed = subprocess.run(
+            [str(py), "-m", "pip", "install", "claude-agent-sdk"],
+            cwd=str(ROOT),
+            check=False,
+        )
+    except FileNotFoundError:
+        print(f"[jarvis-auth] failed to start sidecar venv Python. Run manually: {manual}", file=sys.stderr)
+        return False
+    if completed.returncode != 0:
+        print(
+            f"[jarvis-auth] claude-agent-sdk install failed with exit code {completed.returncode}. "
+            f"Run manually: {manual}",
+            file=sys.stderr,
+        )
+        return False
+    if not claude_agent_sdk_importable_in_sidecar_venv(py):
+        print(f"[jarvis-auth] claude-agent-sdk still is not importable. Run manually: {manual}", file=sys.stderr)
+        return False
+    return True
+
+
 def apply_anthropic_agent_sdk_defaults() -> dict[str, str]:
     from jarvis_sidecar.llm_setting import apply_picks
 
@@ -374,6 +462,7 @@ def apply_anthropic_agent_sdk_defaults() -> dict[str, str]:
     else:
         models_path = write_anthropic_agent_sdk_pi_provider(existing_models_json)
     paths["models_json_path"] = str(models_path)
+    ensure_claude_agent_sdk_installed()
     return paths
 
 
@@ -445,7 +534,11 @@ def cmd_preflight(_args: argparse.Namespace) -> int:
         return 0
 
     state = inspect_auth_state()
+    if repair_missing_anthropic_agent_sdk_pi_provider(state.roles):
+        state = inspect_auth_state()
     if state.ready:
+        if state.claude_agent_sdk_configured and roles_reference_provider(state.roles, ANTHROPIC_AGENT_SDK_PROVIDER):
+            ensure_claude_agent_sdk_installed()
         return 0
 
     # Auto-configure OpenAI Codex defaults ONLY on first run, i.e. while the

@@ -281,21 +281,17 @@ function Get-GitCommand {
 }
 
 function Test-VcRedistX64 {
-    $paths = @(
-        "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\X64"
-    )
-    foreach ($path in $paths) {
-        try {
-            $item = Get-ItemProperty -LiteralPath $path -ErrorAction Stop
-            if ($item.Installed -eq 1 -or $item.Version) {
-                return $true
-            }
-        } catch {
-            continue
+    $systemRoot = $env:SystemRoot
+    if (-not $systemRoot) { $systemRoot = $env:WINDIR }
+    if (-not $systemRoot) { $systemRoot = "C:\Windows" }
+    $system32 = Join-Path $systemRoot "System32"
+    $dlls = @("vcruntime140_1.dll", "msvcp140.dll")
+    foreach ($dll in $dlls) {
+        if (-not (Test-Path (Join-Path $system32 $dll))) {
+            return $false
         }
     }
-    return $false
+    return $true
 }
 
 function Install-VcRedistX64 {
@@ -310,7 +306,7 @@ function Install-VcRedistX64 {
         return
     }
 
-    throw "Microsoft Visual C++ 2015-2022 Redistributable (x64) is required. Install it from https://aka.ms/vs/17/release/vc_redist.x64.exe"
+    throw "Microsoft Visual C++ Redistributable (x64) is required for the memory/embedding layer: https://aka.ms/vs/17/release/vc_redist.x64.exe"
 }
 
 function Stop-JarvisSidecarOnPort {

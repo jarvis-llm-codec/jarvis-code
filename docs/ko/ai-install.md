@@ -296,6 +296,11 @@ jarvis doctor --skip-sidecar
 Python, Node, 임베딩 모델, 프로바이더 카탈로그, 인증을 점검합니다. **이게 설치가 온전하다는
 1차 증거입니다.**
 
+Windows에서는 doctor 출력에 `[OK] windows:vcredist-x64`가 있는지도 확인하세요. 실패하면
+Microsoft Visual C++ Redistributable (x64)을
+<https://aka.ms/vs/17/release/vc_redist.x64.exe>에서 설치한 뒤
+`jarvis doctor --skip-sidecar`를 다시 실행하세요.
+
 **두 모델 역할이 모두 설정됐는지 검증하세요** — 흔한 인코더 버그가 드러나는 지점입니다.
 `~/.jarvis-code/config.yaml`을 열거나(`jarvis model-setting`으로 현재 값을 읽어) **채팅과
 인코더 둘 다** 그들의 플랜에 맞는지 확인하세요 — 예를 들어 GPT라면 채팅

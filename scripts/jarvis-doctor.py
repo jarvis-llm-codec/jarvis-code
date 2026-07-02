@@ -22,6 +22,11 @@ SIDECAR_VENV = SIDECAR_ROOT / ".venv"
 PI_AGENT_DIR = ROOT / "pi-agent"
 DATA_DIR = ROOT / "data"
 EMBEDDER_MODEL = "BAAI/bge-m3"
+WINDOWS_VC_REDIST_DLLS = ("vcruntime140_1.dll", "msvcp140.dll")
+WINDOWS_VC_REDIST_MESSAGE = (
+    "Microsoft Visual C++ Redistributable (x64) is required for the memory/embedding layer: "
+    "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+)
 
 
 def config_summary_line() -> str:
@@ -67,31 +72,9 @@ def is_windows() -> bool:
 def vc_redist_x64_installed() -> bool:
     if not is_windows():
         return True
-    try:
-        import winreg
-    except ImportError:
-        return False
-
-    paths = (
-        r"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64",
-        r"SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\X64",
-    )
-    for path in paths:
-        try:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
-                try:
-                    installed, _ = winreg.QueryValueEx(key, "Installed")
-                except OSError:
-                    installed = None
-                try:
-                    version, _ = winreg.QueryValueEx(key, "Version")
-                except OSError:
-                    version = None
-                if installed == 1 or version:
-                    return True
-        except OSError:
-            continue
-    return False
+    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
+    system32 = Path(system_root) / "System32"
+    return all((system32 / dll).exists() for dll in WINDOWS_VC_REDIST_DLLS)
 
 
 def venv_python() -> Path:
@@ -166,14 +149,7 @@ def check_windows_vc_redist(checks: list[Check]) -> None:
     if vc_redist_x64_installed():
         add(checks, "windows:vcredist-x64", "ok", "Microsoft Visual C++ 2015-2022 Redistributable (x64)")
         return
-    add(
-        checks,
-        "windows:vcredist-x64",
-        "fail",
-        "Microsoft Visual C++ 2015-2022 Redistributable (x64) is required for torch. "
-        "Install with `winget install --id Microsoft.VCRedist.2015+.x64 --exact` "
-        "or download https://aka.ms/vs/17/release/vc_redist.x64.exe",
-    )
+    add(checks, "windows:vcredist-x64", "fail", WINDOWS_VC_REDIST_MESSAGE)
 
 
 def check_paths(checks: list[Check]) -> None:
