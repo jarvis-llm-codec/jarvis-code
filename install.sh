@@ -16,8 +16,89 @@ log() {
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     printf 'JARVIS Code requires %s.\n' "$1" >&2
+    if [ $# -gt 1 ] && [ -n "$2" ]; then
+      printf '%s\n' "$2" >&2
+    fi
     exit 1
   fi
+}
+
+platform_name() {
+  uname -s 2>/dev/null || printf 'unknown'
+}
+
+is_macos() {
+  [ "$(platform_name)" = "Darwin" ]
+}
+
+print_prereq_help() {
+  name=$1
+  mac_pkg=$2
+  linux_hint=$3
+  if is_macos; then
+    if command -v brew >/dev/null 2>&1; then
+      printf 'Install it with Homebrew: brew install %s\n' "$mac_pkg" >&2
+    else
+      printf 'Install Homebrew from https://brew.sh or install %s manually, then retry.\n' "$name" >&2
+    fi
+  else
+    printf '%s\n' "$linux_hint" >&2
+  fi
+}
+
+install_node() {
+  if command -v node >/dev/null 2>&1; then
+    if assert_node_version >/dev/null 2>&1; then
+      return 0
+    fi
+    found=$(node --version 2>/dev/null || printf 'unknown')
+    log "Node.js found but too old: $found"
+  else
+    log "Node.js not found"
+  fi
+
+  if is_macos && command -v brew >/dev/null 2>&1; then
+    log "attempting automatic Node.js install with Homebrew"
+    brew install node
+  fi
+
+  if ! command -v node >/dev/null 2>&1 || ! assert_node_version >/dev/null 2>&1; then
+    printf 'JARVIS Code requires Node.js 20 or newer.\n' >&2
+    print_prereq_help "Node.js 20+" "node" "Install Node.js 20+ with your distro package manager, nvm, fnm, or from https://nodejs.org, then retry."
+    exit 1
+  fi
+}
+
+install_python() {
+  if find_python >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log "Python 3.10+ not found"
+  if is_macos && command -v brew >/dev/null 2>&1; then
+    log "attempting automatic Python install with Homebrew"
+    brew install python
+  fi
+
+  if ! find_python >/dev/null 2>&1; then
+    printf 'JARVIS Code requires Python 3.10 or newer with venv/ensurepip.\n' >&2
+    print_prereq_help "Python 3.10+" "python" "Install Python 3.10+ plus the venv package (for example python3-venv on Debian/Ubuntu), then retry."
+    exit 1
+  fi
+}
+
+ensure_download_tools() {
+  need_cmd curl "curl is required when install.sh downloads the release archive."
+  need_cmd tar "tar is required to extract the downloaded release archive."
+}
+
+ensure_npm() {
+  if command -v npm >/dev/null 2>&1; then
+    return 0
+  fi
+  printf 'JARVIS Code requires npm. Node.js was found, but npm is not on PATH.\n' >&2
+  print_prereq_help "npm" "node" "Install npm using your Node.js 20+ distribution, then retry."
+  exit 1
 }
 
 install_git() {
@@ -52,12 +133,12 @@ assert_node_version() {
   case "$major" in
     ''|*[!0-9]*)
       printf 'Could not parse Node.js version: %s\n' "$ver" >&2
-      exit 1
+      return 1
       ;;
   esac
   if [ "$major" -lt 20 ]; then
     printf 'Node.js 20 or newer is required; found %s\n' "$ver" >&2
-    exit 1
+    return 1
   fi
   printf '%s\n' "$ver"
 }
@@ -95,10 +176,18 @@ ensure_python_venv() {
   elif command -v pacman >/dev/null 2>&1; then
     : # Arch's python package already includes venv and ensurepip
   elif command -v brew >/dev/null 2>&1; then
-    : # Homebrew's python includes venv and ensurepip
+    log "attempting Homebrew Python repair for venv/ensurepip"
+    brew install python
+    if new_py=$(find_python); then
+      py=$new_py
+    fi
   fi
   if ! "$py" -c 'import ensurepip' >/dev/null 2>&1; then
-    printf 'JARVIS Code requires the Python venv module with ensurepip. Install %s-venv (Debian/Ubuntu) or the equivalent and retry.\n' "$pyver" >&2
+    if is_macos; then
+      printf 'JARVIS Code requires Python venv/ensurepip. Install or repair Homebrew Python (`brew install python`) and retry.\n' >&2
+    else
+      printf 'JARVIS Code requires the Python venv module with ensurepip. Install %s-venv (Debian/Ubuntu) or the equivalent and retry.\n' "$pyver" >&2
+    fi
     exit 1
   fi
 }
@@ -296,9 +385,13 @@ install_command() {
   esac
 }
 
-need_cmd node
+log "platform: $(uname -s 2>/dev/null || printf unknown) $(uname -m 2>/dev/null || printf unknown)"
+install_node
 node_version=$(assert_node_version)
 log "using Node $node_version"
+ensure_npm
+log "using npm $(npm --version)"
+install_python
 install_git
 log "using $(git --version)"
 
@@ -309,6 +402,7 @@ if is_local_package "$src_dir"; then
   log "installing from local package $src_dir"
   copy_package "$src_dir" "$INSTALL_DIR"
 else
+  ensure_download_tools
   download_package "$INSTALL_DIR"
 fi
 

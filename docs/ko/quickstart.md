@@ -6,24 +6,35 @@
 
 ## 1. 설치
 
-**Windows** (현재 지원) — PowerShell에서:
+**Windows** (1급 지원) — PowerShell에서:
 
 ```powershell
 irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
 ```
 
-**macOS · Linux** — 인스톨러 마무리 중 (**곧 지원 예정**). 그 전까지는 소스에서 설치 — [install.md](../install.md) 참고.
+**macOS · Linux** (베타/basic 지원) — POSIX shell에서:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | sh
+```
+
+큰 임베딩 모델 다운로드를 첫 메모리 사용 시점으로 미루려면:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | env JARVIS_CODE_NO_MODEL_PRELOAD=1 sh
+```
 
 ### 뭐가 설치되고 얼마나 큰가
 
-전부 `%LOCALAPPDATA%\JARVIS-Code` 아래 설치. 새 머신 기준 대략 용량:
+Windows는 `%LOCALAPPDATA%\JARVIS-Code`, macOS/Linux는
+`$HOME/.local/share/jarvis-code` 아래 설치. 새 머신 기준 대략 용량:
 
 | 구성 | 크기 |
 |---|---|
 | 앱 + Node 의존성 | ~580 MB |
 | Python 사이드카 (PyTorch CPU 포함) | ~1.3 GB |
 | `bge-m3` 임베딩 모델 — **회상 담당 (필수)** | ~2.3 GB 다운로드 · 디스크 ~4.3 GB |
-| 전제조건 (Node 20+, Python 3.10+, Git, MSVC) — *없을 때만* | ~0.5 GB |
+| 전제조건 (Node 20+, npm, Python 3.10+, Git, Windows의 MSVC) — *없을 때만* | ~0.5 GB |
 
 **총 ≈ 6 GB** (전제조건은 없을 때만 추가). 회상은 **BM25 + bge-m3** 하이브리드(키워드 + 시맨틱)라 모델은 선택이 아니라 **핵심** — `JARVIS_CODE_NO_MODEL_PRELOAD=1`은 다운로드를 첫 사용으로 **미룰 뿐** 의존성을 없애진 않음. 메모리 데이터(`~/.jarvis-code`)는 작게 시작해 천천히 늘어남.
 

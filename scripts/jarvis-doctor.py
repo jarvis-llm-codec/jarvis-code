@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -31,23 +32,33 @@ WINDOWS_VC_REDIST_MESSAGE = (
 
 def config_summary_line() -> str:
     env_state = "set" if os.environ.get("JARVIS_CODE_CONFIG") else "unset"
-    if str(SIDECAR_ROOT) not in sys.path:
-        sys.path.insert(0, str(SIDECAR_ROOT))
-    from jarvis_sidecar.config import config_path
+    try:
+        if str(SIDECAR_ROOT) not in sys.path:
+            sys.path.insert(0, str(SIDECAR_ROOT))
+        from jarvis_sidecar.config import config_path
 
-    return f"config: {config_path().resolve()} (env JARVIS_CODE_CONFIG {env_state})"
+        return f"config: {config_path().resolve()} (env JARVIS_CODE_CONFIG {env_state})"
+    except Exception as exc:
+        return f"config: unavailable ({type(exc).__name__}: {exc}; env JARVIS_CODE_CONFIG {env_state})"
 
 
 def provider_catalog_summary_line() -> str:
-    if str(SIDECAR_ROOT) not in sys.path:
-        sys.path.insert(0, str(SIDECAR_ROOT))
-    from jarvis_sidecar.llm_setting import catalog_overlay_summary
+    try:
+        if str(SIDECAR_ROOT) not in sys.path:
+            sys.path.insert(0, str(SIDECAR_ROOT))
+        from jarvis_sidecar.llm_setting import catalog_overlay_summary
 
-    summary = catalog_overlay_summary()
-    user_path = summary["user_path"]
-    if not summary["user_exists"]:
-        return f"user overlay: none ({user_path})"
-    return f"providers: catalog {summary['repo_count']} + user {summary['user_count']} ({user_path})"
+        summary = catalog_overlay_summary()
+        user_path = summary["user_path"]
+        if not summary["user_exists"]:
+            return f"user overlay: none ({user_path})"
+        return f"providers: catalog {summary['repo_count']} + user {summary['user_count']} ({user_path})"
+    except Exception as exc:
+        return f"providers: unavailable ({type(exc).__name__}: {exc})"
+
+
+def platform_summary_line() -> str:
+    return f"platform: {platform.platform()} ({platform.machine()}); python={sys.version.split()[0]} at {sys.executable}"
 
 
 def configure_hf_public_download_env() -> None:
@@ -140,7 +151,8 @@ def check_node(checks: list[Check]) -> None:
 
 def check_command(checks: list[Check], name: str, command: str, args: list[str]) -> None:
     ok, text = command_version(command, args)
-    add(checks, name, "ok" if ok else "fail", text)
+    summary = text.splitlines()[0] if text.splitlines() else text
+    add(checks, name, "ok" if ok else "fail", summary)
 
 
 def check_windows_vc_redist(checks: list[Check]) -> None:
@@ -150,6 +162,17 @@ def check_windows_vc_redist(checks: list[Check]) -> None:
         add(checks, "windows:vcredist-x64", "ok", "Microsoft Visual C++ 2015-2022 Redistributable (x64)")
         return
     add(checks, "windows:vcredist-x64", "fail", WINDOWS_VC_REDIST_MESSAGE)
+
+
+def check_platform(checks: list[Check]) -> None:
+    add(checks, "platform", "ok", f"{platform.system()} {platform.release()} ({platform.machine()})")
+
+
+def check_posix_install_tools(checks: list[Check]) -> None:
+    if is_windows():
+        return
+    check_command(checks, "curl", "curl", ["--version"])
+    check_command(checks, "tar", "tar", ["--version"])
 
 
 def check_paths(checks: list[Check]) -> None:
@@ -344,6 +367,7 @@ def check_sidecar(checks: list[Check]) -> None:
 
 def print_text(checks: list[Check]) -> None:
     labels = {"ok": "OK", "warn": "WARN", "fail": "FAIL"}
+    print(platform_summary_line())
     print(config_summary_line())
     print(provider_catalog_summary_line())
     print("JARVIS Code doctor")
@@ -363,8 +387,10 @@ def main() -> int:
     args = parser.parse_args()
 
     checks: list[Check] = []
+    check_platform(checks)
     check_paths(checks)
     check_command(checks, "git", "git", ["--version"])
+    check_posix_install_tools(checks)
     check_node(checks)
     check_command(checks, "npm", "npm", ["--version"])
     check_windows_vc_redist(checks)

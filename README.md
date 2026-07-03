@@ -8,7 +8,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-0088ff)](LICENSE)
 [![Built on](https://img.shields.io/badge/Built_on-Pi_MIT-ff8800)](NOTICE.md)
-[![Platform](https://img.shields.io/badge/Platform-Windows-5b5b66)](#-install)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%2FLinux%20beta-5b5b66)](#-install)
 [![Web](https://img.shields.io/badge/web-jlc--codec.org-0088ff)](https://jlc-codec.org)
 
 </div>
@@ -61,7 +61,7 @@ The user-facing command is `jarvis`. (`pi/` is the internal engine folder, kept 
 
 ## 🚀 Install
 
-> **Windows is first-class today. macOS / Linux are coming soon.**
+> **Windows is first-class today. macOS / Linux basic support is available in beta.**
 
 **Windows** (PowerShell):
 
@@ -71,13 +71,32 @@ irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.
 
 Missing prerequisites (Node.js, Python, Git, MSVC redistributable) are installed via `winget` when available. The installer also preloads the local `BAAI/bge-m3` embedding model (~2.3 GB) unless `JARVIS_CODE_NO_MODEL_PRELOAD=1` is set.
 
+**macOS / Linux** (beta, POSIX shell):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | sh
+```
+
+For a faster first install that defers the large embedding-model download until
+first memory use:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | env JARVIS_CODE_NO_MODEL_PRELOAD=1 sh
+```
+
+macOS/Linux requires Node.js 20+, npm, Python 3.10+ with `venv`, Git, `curl`,
+and `tar`. On macOS the installer can use Homebrew for missing Git, Node.js, or
+Python. On Linux, install those prerequisites with your distro package manager
+first if the installer reports them missing.
+
 > After install, **open a new terminal** so the `jarvis` command is on your PATH.
 
 Manual / advanced install: [README-INSTALL.md](README-INSTALL.md).
 
 ## 💾 What gets installed & how big
 
-Everything installs under `%LOCALAPPDATA%\JARVIS-Code`. Rough footprint on a fresh machine:
+Windows installs under `%LOCALAPPDATA%\JARVIS-Code`; macOS/Linux installs under
+`$HOME/.local/share/jarvis-code`. Rough footprint on a fresh machine:
 
 | Component | Size |
 |---|---|

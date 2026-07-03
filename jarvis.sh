@@ -3,22 +3,34 @@ set -eu
 
 # Resolve symlinks so an installed `jarvis` shim (e.g. ~/.local/bin/jarvis ->
 # .../jarvis.sh, as created by install.sh) still locates the real repo root.
+# Keep this POSIX/BSD friendly: macOS `dirname` does not consistently accept
+# GNU-style `--` separators.
 SCRIPT_PATH=$0
 while [ -h "$SCRIPT_PATH" ]; do
+  script_dir=$(dirname "$SCRIPT_PATH")
   link=$(readlink "$SCRIPT_PATH")
   case $link in
     /*) SCRIPT_PATH=$link ;;
-    *) SCRIPT_PATH=$(dirname -- "$SCRIPT_PATH")/$link ;;
+    *) SCRIPT_PATH=$script_dir/$link ;;
   esac
 done
-ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+ROOT_DIR=$(CDPATH= cd "$(dirname "$SCRIPT_PATH")" && pwd -P)
 
-if command -v python3 >/dev/null 2>&1; then
-  PYTHON_BIN=python3
-elif command -v python >/dev/null 2>&1; then
-  PYTHON_BIN=python
-else
+find_python() {
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+if ! PYTHON_BIN=$(find_python); then
   echo "JARVIS Code requires Python 3.10 or newer." >&2
+  echo "Install Python 3.10+ and retry. On macOS, Homebrew users can run: brew install python" >&2
   exit 1
 fi
 

@@ -21,19 +21,30 @@ iex ((curl.exe -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-c
 curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | sh
 ```
 
+To skip the initial 2.3 GB embedding-model preload and defer it until first
+memory use:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | env JARVIS_CODE_NO_MODEL_PRELOAD=1 sh
+```
+
 ## Requirements
 
 - Node.js 20 or newer
+- npm
 - Python 3.10 or newer
+- Python `venv`/`ensurepip` support
 - Git
+- `curl`, `tar`, and a POSIX shell on macOS/Linux
 - Microsoft Visual C++ 2015-2022 Redistributable (x64) on Windows
 - Internet access for first install
 
 On Windows, the installer attempts to install missing Node.js, Python, Git, and
 Microsoft Visual C++ Redistributable (x64) automatically with `winget`. The VC++
-runtime is required by torch for local embedding support. On macOS/Linux, the
-installer attempts to install Git with a supported package manager when it is
-missing.
+runtime is required by torch for local embedding support. On macOS, the POSIX
+installer can use Homebrew to install missing Git, Node.js, or Python. On Linux,
+install missing prerequisites with your distribution package manager; Debian and
+Ubuntu users may need `python3-venv` for `python -m venv`.
 
 The installer creates a Python virtual environment for the sidecar and installs
 Node dependencies for the internal agent engine. It also preloads the local
@@ -48,10 +59,22 @@ $env:JARVIS_CODE_NO_MODEL_PRELOAD = "1"
 irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
 ```
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | env JARVIS_CODE_NO_MODEL_PRELOAD=1 sh
+```
+
 Run diagnostics after install:
 
 ```bash
 jarvis doctor
+```
+
+For a quick macOS/Linux installer smoke check that does not require a running
+sidecar:
+
+```bash
+jarvis --help
+jarvis doctor --skip-sidecar
 ```
 
 ## First Run Auth

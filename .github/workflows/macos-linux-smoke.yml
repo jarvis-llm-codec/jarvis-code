@@ -1,0 +1,57 @@
+name: macOS/Linux install smoke
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+      - "fix/**"
+      - "chore/**"
+      - "docs/**"
+  pull_request:
+
+jobs:
+  posix-install-smoke:
+    name: ${{ matrix.os }} install smoke
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Static syntax checks
+        run: |
+          sh -n install.sh
+          sh -n jarvis.sh
+          sh -n uninstall.sh
+          python -m py_compile scripts/jarvis-launcher.py scripts/jarvis-doctor.py
+
+      - name: Install without preloading embedding model
+        run: |
+          set -eu
+          install_dir="$RUNNER_TEMP/jarvis-code-install"
+          bin_dir="$RUNNER_TEMP/jarvis-code-bin"
+          rm -rf "$install_dir" "$bin_dir"
+          JARVIS_CODE_INSTALL_DIR="$install_dir" \
+          JARVIS_CODE_BIN_DIR="$bin_dir" \
+          JARVIS_CODE_NO_MODEL_PRELOAD=1 \
+          ./install.sh
+          "$bin_dir/jarvis" --help
+          "$bin_dir/jarvis" doctor --skip-sidecar

@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -91,6 +92,12 @@ BUILT_IN_MODEL_PROVIDERS = {
 
 def is_windows() -> bool:
     return os.name == "nt"
+
+
+def ensure_supported_python() -> None:
+    if sys.version_info < (3, 10):
+        version = ".".join(str(part) for part in sys.version_info[:3])
+        raise SystemExit(f"JARVIS Code requires Python 3.10 or newer; found {version} at {sys.executable}")
 
 
 def venv_python() -> Path:
@@ -613,15 +620,30 @@ def start_sidecar(args: list[str]) -> subprocess.Popen[str] | None:
         return None
 
     py = ensure_sidecar_venv()
-    proc = subprocess.Popen(
-        [str(py), "-m", "jarvis_sidecar"],
-        cwd=str(SIDECAR_ROOT),
-        env=sidecar_env(),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
+    # Match the Unix containment model used by worker processes: the sidecar
+    # leads its own session/process group so shutdown can terminate any helper
+    # children without signalling the foreground TUI process group.
+    if is_windows():
+        proc = subprocess.Popen(
+            [str(py), "-m", "jarvis_sidecar"],
+            cwd=str(SIDECAR_ROOT),
+            env=sidecar_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    else:
+        proc = subprocess.Popen(
+            [str(py), "-m", "jarvis_sidecar"],
+            cwd=str(SIDECAR_ROOT),
+            env=sidecar_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
 
     deadline = time.time() + 20
     while time.time() < deadline:
@@ -713,15 +735,66 @@ def terminate_started_sidecar(proc: subprocess.Popen[str] | None) -> None:
     if truthy(os.environ.get("JARVIS_KEEP_SIDECAR")):
         return
     if proc.poll() is not None:
+        remove_started_sidecar_runtime(proc)
         return
-    proc.terminate()
+    terminate_process_tree(proc, signal.SIGTERM)
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        terminate_process_tree(proc, signal.SIGKILL)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        remove_started_sidecar_runtime(proc)
+
+
+def terminate_process_tree(proc: subprocess.Popen[str], sig: signal.Signals) -> None:
+    if is_windows():
+        if sig == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
+        return
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        return
+    except OSError:
+        if sig == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
+
+
+def remove_started_sidecar_runtime(proc: subprocess.Popen[str]) -> None:
+    runtime = os.environ.get("JARVIS_SIDECAR_RUNTIME")
+    if not runtime:
+        return
+    path = Path(runtime)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError):
+        return
+    try:
+        runtime_pid = int(payload.get("pid") or 0)
+    except (TypeError, ValueError):
+        return
+    if runtime_pid != proc.pid:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
 
 
 def main(argv: Iterable[str]) -> int:
+    ensure_supported_python()
     args = list(argv)
     if args and args[0] == "doctor":
         configure_env([])
