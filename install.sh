@@ -67,7 +67,7 @@ install_node() {
 
   if is_macos && command -v brew >/dev/null 2>&1; then
     log "attempting automatic Node.js install with Homebrew"
-    brew install node
+    brew install node || log "Homebrew Node.js install failed; checking PATH anyway"
   fi
 
   if ! command -v node >/dev/null 2>&1 || ! assert_node_version >/dev/null 2>&1; then
@@ -85,7 +85,7 @@ install_python() {
   log "Python 3.10+ not found"
   if is_macos && command -v brew >/dev/null 2>&1; then
     log "attempting automatic Python install with Homebrew"
-    brew install python
+    brew install python || log "Homebrew Python install failed; checking PATH anyway"
   fi
 
   if ! find_python >/dev/null 2>&1; then
@@ -152,7 +152,11 @@ assert_node_version() {
 }
 
 find_python() {
-  for candidate in python3 python; do
+  # PATH order can hide a new-enough interpreter behind an old one (for
+  # example Apple's /usr/bin/python3 shadowing Homebrew python), so try
+  # versioned names and the common Homebrew locations too.
+  for candidate in python3 python python3.13 python3.12 python3.11 python3.10 \
+    /opt/homebrew/bin/python3 /usr/local/bin/python3; do
     if command -v "$candidate" >/dev/null 2>&1; then
       if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
         printf '%s\n' "$candidate"
@@ -185,7 +189,7 @@ ensure_python_venv() {
     : # Arch's python package already includes venv and ensurepip
   elif command -v brew >/dev/null 2>&1; then
     log "attempting Homebrew Python repair for venv/ensurepip"
-    brew install python
+    brew install python || log "Homebrew Python repair failed; checking venv/ensurepip anyway"
     if new_py=$(find_python); then
       py=$new_py
     fi

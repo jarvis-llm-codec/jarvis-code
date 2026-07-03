@@ -17,7 +17,10 @@ done
 ROOT_DIR=$(CDPATH= cd "$(dirname "$SCRIPT_PATH")" && pwd -P)
 
 find_python() {
-  for candidate in python3 python; do
+  # Keep the candidate list in sync with install.sh: PATH order can hide a
+  # new-enough interpreter behind an old one.
+  for candidate in python3 python python3.13 python3.12 python3.11 python3.10 \
+    /opt/homebrew/bin/python3 /usr/local/bin/python3; do
     if command -v "$candidate" >/dev/null 2>&1; then
       if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
         printf '%s\n' "$candidate"

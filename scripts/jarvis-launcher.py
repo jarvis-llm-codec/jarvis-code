@@ -543,11 +543,10 @@ def choose_port() -> None:
 
 
 def find_host_python() -> str:
-    for name in ("python3", "python"):
-        found = shutil.which(name)
-        if found:
-            return found
-    raise SystemExit("Python 3.10 or newer is required.")
+    # The running interpreter already passed ensure_supported_python(), while
+    # whichever python3 happens to be first on PATH may be older than 3.10 and
+    # would build a broken sidecar venv.
+    return sys.executable
 
 
 def run_checked(command: list[str], cwd: Path | None = None) -> None:
