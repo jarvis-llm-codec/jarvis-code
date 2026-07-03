@@ -737,11 +737,11 @@ def terminate_started_sidecar(proc: subprocess.Popen[str] | None) -> None:
     if proc.poll() is not None:
         remove_started_sidecar_runtime(proc)
         return
-    terminate_process_tree(proc, signal.SIGTERM)
+    terminate_process_tree(proc, force=False)
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        terminate_process_tree(proc, signal.SIGKILL)
+        terminate_process_tree(proc, force=True)
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -750,19 +750,20 @@ def terminate_started_sidecar(proc: subprocess.Popen[str] | None) -> None:
         remove_started_sidecar_runtime(proc)
 
 
-def terminate_process_tree(proc: subprocess.Popen[str], sig: signal.Signals) -> None:
+def terminate_process_tree(proc: subprocess.Popen[str], *, force: bool) -> None:
     if is_windows():
-        if sig == signal.SIGKILL:
+        if force:
             proc.kill()
         else:
             proc.terminate()
         return
+    sig = signal.SIGKILL if force else signal.SIGTERM
     try:
         os.killpg(proc.pid, sig)
     except ProcessLookupError:
         return
     except OSError:
-        if sig == signal.SIGKILL:
+        if force:
             proc.kill()
         else:
             proc.terminate()

@@ -57,6 +57,31 @@ def provider_catalog_summary_line() -> str:
         return f"providers: unavailable ({type(exc).__name__}: {exc})"
 
 
+def check_config_and_provider_catalog(checks: list[Check]) -> None:
+    try:
+        if str(SIDECAR_ROOT) not in sys.path:
+            sys.path.insert(0, str(SIDECAR_ROOT))
+        from jarvis_sidecar.config import config_path
+
+        add(checks, "config", "ok", str(config_path().resolve()))
+    except Exception as exc:
+        add(checks, "config", "warn", f"{type(exc).__name__}: {exc}")
+
+    try:
+        if str(SIDECAR_ROOT) not in sys.path:
+            sys.path.insert(0, str(SIDECAR_ROOT))
+        from jarvis_sidecar.llm_setting import catalog_overlay_summary
+
+        summary = catalog_overlay_summary()
+        if summary["user_exists"]:
+            message = f"repo={summary['repo_count']} user={summary['user_count']} path={summary['user_path']}"
+        else:
+            message = f"repo={summary['repo_count']} user=0 path={summary['user_path']}"
+        add(checks, "providers", "ok", message)
+    except Exception as exc:
+        add(checks, "providers", "warn", f"{type(exc).__name__}: {exc}")
+
+
 def platform_summary_line() -> str:
     return f"platform: {platform.platform()} ({platform.machine()}); python={sys.version.split()[0]} at {sys.executable}"
 
@@ -389,6 +414,7 @@ def main() -> int:
     checks: list[Check] = []
     check_platform(checks)
     check_paths(checks)
+    check_config_and_provider_catalog(checks)
     check_command(checks, "git", "git", ["--version"])
     check_posix_install_tools(checks)
     check_node(checks)

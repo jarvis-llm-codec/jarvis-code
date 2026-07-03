@@ -55,3 +55,35 @@ jobs:
           ./install.sh
           "$bin_dir/jarvis" --help
           "$bin_dir/jarvis" doctor --skip-sidecar
+          port=18765
+          runtime="$install_dir/data/ci-sidecar-runtime.json"
+          JARVIS_SIDECAR_PORT="$port" \
+          JARVIS_SIDECAR_URL="http://127.0.0.1:$port" \
+          JARVIS_SIDECAR_RUNTIME="$runtime" \
+          PYTHONPATH="$install_dir/sidecar" \
+          "$install_dir/sidecar/.venv/bin/python" -m jarvis_sidecar > "$RUNNER_TEMP/jarvis-sidecar.log" 2>&1 &
+          sidecar_pid=$!
+          trap 'kill "$sidecar_pid" 2>/dev/null || true; wait "$sidecar_pid" 2>/dev/null || true' EXIT
+          i=0
+          until curl -fsS "http://127.0.0.1:$port/health" > "$RUNNER_TEMP/jarvis-sidecar-health.json"; do
+            if ! kill -0 "$sidecar_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/jarvis-sidecar.log"
+              exit 1
+            fi
+            i=$((i + 1))
+            if [ "$i" -ge 40 ]; then
+              cat "$RUNNER_TEMP/jarvis-sidecar.log"
+              exit 1
+            fi
+            sleep 0.5
+          done
+          python - <<'PY'
+          import json
+          import os
+
+          path = os.path.join(os.environ["RUNNER_TEMP"], "jarvis-sidecar-health.json")
+          with open(path, encoding="utf-8") as fh:
+              payload = json.load(fh)
+          assert payload.get("ok") is True, payload
+          assert payload.get("service") == "jarvis-jlc-sidecar", payload
+          PY

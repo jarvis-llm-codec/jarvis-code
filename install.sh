@@ -8,6 +8,7 @@ BRANCH=${JARVIS_CODE_BRANCH:-main}
 ARCHIVE_URL=${JARVIS_CODE_ARCHIVE_URL:-}
 NO_MODEL_PRELOAD=${JARVIS_CODE_NO_MODEL_PRELOAD:-0}
 REQUIRE_MODEL_PRELOAD=${JARVIS_CODE_REQUIRE_MODEL_PRELOAD:-0}
+START_DIR=$(pwd -P)
 
 log() {
   printf '[jarvis-install] %s\n' "$1"
@@ -25,6 +26,13 @@ need_cmd() {
 
 platform_name() {
   uname -s 2>/dev/null || printf 'unknown'
+}
+
+absolute_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$START_DIR" "$1" ;;
+  esac
 }
 
 is_macos() {
@@ -376,6 +384,7 @@ install_command() {
   root=$1
   chmod +x "$root/jarvis.sh"
   bin_dir=${JARVIS_CODE_BIN_DIR:-"$HOME/.local/bin"}
+  bin_dir=$(absolute_path "$bin_dir")
   mkdir -p "$bin_dir"
   ln -sfn "$root/jarvis.sh" "$bin_dir/jarvis"
   log "installed command shim at $bin_dir/jarvis"
@@ -395,6 +404,7 @@ install_python
 install_git
 log "using $(git --version)"
 
+INSTALL_DIR=$(absolute_path "$INSTALL_DIR")
 src_dir=$(script_dir)
 mkdir -p "$INSTALL_DIR"
 
