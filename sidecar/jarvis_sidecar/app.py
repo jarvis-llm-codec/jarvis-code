@@ -846,6 +846,24 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _auto_recall_top_k_for_mode(mode: str | None) -> int:
+    global_top_k = _env_int("JARVIS_AUTO_RECALL_TOP_K", 10)
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode in {"deepdive", "heavy_deepdive"}:
+        return _env_int("JARVIS_AUTO_RECALL_TOP_K_DEEPDIVE", global_top_k)
+    return global_top_k
+
+
 def _agent_jhb_rebuild_in_progress(agent: Any, session_id: str) -> bool:
     probe = getattr(agent, "jhb_rebuild_in_progress", None)
     if not callable(probe):
@@ -1980,12 +1998,9 @@ def context(req: ContextRequest) -> dict[str, Any]:
     # fallback. Keeping /context and recall_turns on the same retrieval path is
     # important for personal facts that live in the conversation store rather
     # than the repo-local raw-store.
-    try:
-        _recall_top_k = max(0, int(os.environ.get("JARVIS_AUTO_RECALL_TOP_K", "10")))
-    except ValueError:
-        _recall_top_k = 10
-    auto_recall_enabled = str(req.mode or "").strip().lower() == "chat"
-    if auto_recall_enabled and _recall_top_k > 0 and req.user_message.strip():
+    _recall_top_k = _auto_recall_top_k_for_mode(req.mode)
+    auto_recall_enabled = _recall_top_k > 0 and bool(req.user_message.strip())
+    if auto_recall_enabled:
         try:
             agent = get_agent()
             if agent is None:

@@ -1148,6 +1148,46 @@ class JLCEncoder:
         cut = text[:max_chars].rsplit("\n", 1)[0]
         return cut + "\n...(truncated)"
 
+    _DENIAL_HEAD_CHARS = 240
+    _DENIAL_PHRASES = (
+        "no record",
+        "no records",
+        "no such record",
+        "no stored record",
+        "no matching record",
+        "nothing found",
+        "nothing logged",
+        "came up empty",
+        "don't have any record",
+        "do not have any record",
+        "have no record",
+        "can't confirm",
+        "cannot confirm",
+        "unknown",
+    )
+    _DENIAL_REPLACEMENT = (
+        "[DENIAL RESPONSE OMITTED FROM DURABLE MEMORY: the assistant reported no record "
+        "or insufficient evidence. Do not add this denial as a JHB fact.]"
+    )
+
+    @staticmethod
+    def _is_denial_reply(text: str) -> bool:
+        head = unicodedata.normalize("NFC", text or "").strip()[:JLCEncoder._DENIAL_HEAD_CHARS]
+        head = re.sub(r"^[`'\"*_\s>:-]+", "", head)
+        head = re.sub(r"(?i)^answer\s*[:：]\s*", "", head).strip()
+        folded = head.casefold()
+        if re.match(r"^(?:no records?|no such record|none|unknown)\b", folded):
+            return True
+        return any(phrase in folded for phrase in JLCEncoder._DENIAL_PHRASES)
+
+    @staticmethod
+    def _assistant_for_jhb_prompt(assistant_msg: str) -> str:
+        normalized = unicodedata.normalize("NFC", assistant_msg.strip())
+        neutralized = JLCEncoder._neutralize_delimiters(normalized)
+        if JLCEncoder._is_denial_reply(neutralized):
+            return JLCEncoder._DENIAL_REPLACEMENT
+        return neutralized
+
     @staticmethod
     def _build_user_prompt(
         prev_jhb: str,
@@ -1164,9 +1204,7 @@ class JLCEncoder:
         safe_user = unicodedata.normalize("NFC", user_msg)
         safe_user = JLCEncoder._escape_markdown_headings(safe_user)
         safe_user = JLCEncoder._neutralize_delimiters(safe_user)
-        trimmed_assistant = JLCEncoder._neutralize_delimiters(
-            unicodedata.normalize("NFC", assistant_msg.strip())
-        )
+        trimmed_assistant = JLCEncoder._assistant_for_jhb_prompt(assistant_msg)
         turn_line = f"current_turn=t{current_turn}\n" if current_turn is not None else ""
         origin_line = f"ORIGIN: {origin or 'user'}\n"
         if origin_window:
@@ -1199,9 +1237,7 @@ class JLCEncoder:
             safe_user = unicodedata.normalize("NFC", t.get("user", "") or "")
             safe_user = JLCEncoder._escape_markdown_headings(safe_user)
             safe_user = JLCEncoder._neutralize_delimiters(safe_user)
-            trimmed_assistant = JLCEncoder._neutralize_delimiters(
-                unicodedata.normalize("NFC", (t.get("assistant", "") or "").strip())
-            )
+            trimmed_assistant = JLCEncoder._assistant_for_jhb_prompt(t.get("assistant", "") or "")
             origin = str(t.get("origin") or "user").strip() or "user"
             origin_window = str(t.get("origin_window") or "").strip()
             origin_window_label = str(t.get("origin_window_label") or "").strip()

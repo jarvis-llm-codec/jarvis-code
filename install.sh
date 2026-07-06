@@ -2,7 +2,7 @@
 set -eu
 
 INSTALL_DIR=${JARVIS_CODE_INSTALL_DIR:-"$HOME/.local/share/jarvis-code"}
-DEFAULT_REPO="jarvis-llm-codec/jarvis-code"
+DEFAULT_REPO="jarvis-llm-codec/jlc"
 REPO=${JARVIS_CODE_REPO:-$DEFAULT_REPO}
 BRANCH=${JARVIS_CODE_BRANCH:-main}
 ARCHIVE_URL=${JARVIS_CODE_ARCHIVE_URL:-}
@@ -157,7 +157,7 @@ download_package() {
   dst=$1
   if [ -z "$ARCHIVE_URL" ]; then
     if [ -z "$REPO" ]; then
-      printf 'Set JARVIS_CODE_REPO=jarvis-llm-codec/jarvis-code or JARVIS_CODE_ARCHIVE_URL before running the remote installer.\n' >&2
+      printf 'Set JARVIS_CODE_REPO=jarvis-llm-codec/jlc or JARVIS_CODE_ARCHIVE_URL before running the remote installer.\n' >&2
       exit 1
     fi
     ARCHIVE_URL="https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz"

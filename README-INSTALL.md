@@ -15,19 +15,19 @@
 Windows:
 
 ```powershell
-irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/install.ps1 | iex
 ```
 
 Windows with curl:
 
 ```powershell
-iex ((curl.exe -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1) -join "`n")
+iex ((curl.exe -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/install.ps1) -join "`n")
 ```
 
 macOS/Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/install.sh | sh
 ```
 
 The installer downloads the release source, installs Node dependencies in
@@ -53,22 +53,22 @@ Windows to make preload failure abort installation.
 Windows:
 
 ```powershell
-$env:JARVIS_CODE_REPO = "jarvis-llm-codec/jarvis-code"
-irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
+$env:JARVIS_CODE_REPO = "jarvis-llm-codec/jlc"
+irm https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/install.ps1 | iex
 ```
 
 Windows with curl:
 
 ```powershell
-$env:JARVIS_CODE_REPO = "jarvis-llm-codec/jarvis-code"
-iex ((curl.exe -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1) -join "`n")
+$env:JARVIS_CODE_REPO = "jarvis-llm-codec/jlc"
+iex ((curl.exe -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/install.ps1) -join "`n")
 ```
 
 macOS/Linux:
 
 ```bash
-JARVIS_CODE_REPO=jarvis-llm-codec/jarvis-code \
-curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | sh
+JARVIS_CODE_REPO=jarvis-llm-codec/jlc \
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/install.sh | sh
 ```
 
 Install location defaults:
@@ -143,13 +143,13 @@ jarvis doctor --preload-embedder
 Windows:
 
 ```powershell
-irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/uninstall.ps1 | iex
+irm https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/uninstall.ps1 | iex
 ```
 
 macOS/Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/uninstall.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/uninstall.sh | sh
 ```
 
 Default uninstall removes the install directory and `jarvis` command shim, then
@@ -159,13 +159,13 @@ To also remove JARVIS user data on Windows:
 
 ```powershell
 $env:JARVIS_CODE_REMOVE_USER_DATA = "1"
-irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/uninstall.ps1 | iex
+irm https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/uninstall.ps1 | iex
 ```
 
 On macOS/Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/uninstall.sh | sh -s -- --remove-user-data
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/uninstall.sh | sh -s -- --remove-user-data
 ```
 
 To force a fresh `BAAI/bge-m3` model download on the next install, also set
