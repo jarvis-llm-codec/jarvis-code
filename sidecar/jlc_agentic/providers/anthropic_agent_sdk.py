@@ -1238,6 +1238,7 @@ def _build_memory_server(conv_id: str, retriever: Any):
             top_k=int(args.get("top_k") or 5),
             conv_id=conv_id,
             retriever=retriever,
+            trace_surface="sdk_mcp",
         )
         return {"content": [{"type": "text", "text": _to_text(result)}]}
 

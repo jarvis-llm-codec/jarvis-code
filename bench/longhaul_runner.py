@@ -36,7 +36,14 @@ utc_now_iso = agent_exec.utc_now_iso
 
 ALLOWED_KINDS = {"plant", "mutate", "filler", "probe", "trap", "exam"}
 ALLOWED_TIERS = {100, 300, 500, 1000}
-LEDGER_EVENTS = {"compaction_observed", "retry", "rate_limit_stall", "session_restart", "format_violation"}
+LEDGER_EVENTS = {
+    "compaction_observed",
+    "compaction_inferred",
+    "retry",
+    "rate_limit_stall",
+    "session_restart",
+    "format_violation",
+}
 TRANSCRIPT_EVENTS = LEDGER_EVENTS | {"timeout"}
 
 META_FILENAME = "longhaul_runner_meta.json"
@@ -44,12 +51,19 @@ RUN_STATE_FILENAME = "longhaul_runner_run_state.json"
 EVENTS_FILENAME = "longhaul_runner_events.jsonl"
 PROMPT_MAP_FILENAME = "prompt_map.jsonl"
 SCRIPT_COPY_FILENAME = "script.jsonl"
+MANIFEST_COPY_FILENAME = "manifest.json"
+AUTO_PROMPTS_JSONL_FILENAME = "auto_prompts.jsonl"
+AUTO_PROMPTS_TXT_FILENAME = "auto_prompts.txt"
 DEFAULT_MODEL_LABEL = "gpt-5.5 (openai-codex subscription)"
 DRIVE_CONTRACT = "external:jarvis-code/bench/longhaul_runner.py"
 AUTO_PROMPT_ENGINE_EVIDENCE = (
     "pi/packages/coding-agent/examples/extensions/jarvis-jlc.ts:"
-    "loadAutoPromptState splits the file on CR/LF and trims nonempty lines"
+    "loadAutoPromptState preserves JSONL record.text exactly for .jsonl auto-prompts; "
+    "legacy .txt files still split on CR/LF and trim nonempty lines"
 )
+PROVIDER_TOKEN_SOURCE = "raw_bench_archive.llm_meta.usage_from_pi_assistant_message_usage"
+PROVIDER_SCOPE_CHAT_ONLY = "provider_scope=chat_main_loop_only"
+ENCODER_PROVIDER_EXCLUSION = "encoder_aux_excluded_from_provider"
 
 
 def resolve_path(path: str | Path) -> Path:
@@ -108,8 +122,34 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def flatten_for_line_auto_prompts(text: str) -> str:
-    return re.sub(r"[\r\n]+", " ", text).strip()
+def adjacent_manifest_path(script_path: Path) -> Path:
+    return script_path.parent / MANIFEST_COPY_FILENAME
+
+
+def load_manifest_for_script(script_path: Path) -> dict[str, Any] | None:
+    manifest_path = adjacent_manifest_path(script_path)
+    if not manifest_path.exists():
+        return None
+    return read_json(manifest_path)
+
+
+def infer_tier(script: list[dict[str, Any]], manifest: dict[str, Any] | None) -> int:
+    if manifest is not None:
+        parameters = manifest.get("parameters")
+        raw_tier = manifest.get("tier") or (parameters.get("tier") if isinstance(parameters, dict) else None)
+        if isinstance(raw_tier, int):
+            return raw_tier
+    scored_workload = sum(1 for record in script if record.get("kind") in {"plant", "mutate", "filler"})
+    if scored_workload in ALLOWED_TIERS:
+        return scored_workload
+    return len(script)
+
+
+def prompt_text_for_delivery(record: dict[str, Any]) -> str:
+    text = record["text"]
+    if not isinstance(text, str) or text == "":
+        raise RunnerError(f"script:{record.get('turn')}: prompt text must be a nonempty string")
+    return text
 
 
 def validate_script(records: list[dict[str, Any]]) -> None:
@@ -123,8 +163,8 @@ def validate_script(records: list[dict[str, Any]]) -> None:
             raise RunnerError(f"script:{index}: expected turn {index}, got {record.get('turn')!r}")
         if record["kind"] not in ALLOWED_KINDS:
             raise RunnerError(f"script:{index}: unexpected kind {record.get('kind')!r}")
-        if not isinstance(record["text"], str):
-            raise RunnerError(f"script:{index}: text must be string")
+        if not isinstance(record["text"], str) or record["text"] == "":
+            raise RunnerError(f"script:{index}: text must be nonempty string")
 
 
 def bench_conv_id(seed: int, tier: int) -> str:
@@ -143,8 +183,9 @@ def prepare_command(args: argparse.Namespace) -> int:
 
     script = read_jsonl(script_path)
     validate_script(script)
+    manifest = load_manifest_for_script(script_path)
 
-    tier = int(args.tier) if args.tier is not None else len(script)
+    tier = int(args.tier) if args.tier is not None else infer_tier(script, manifest)
     seed = int(args.seed)
     if tier not in ALLOWED_TIERS:
         print(f"[warn] tier {tier} is outside LongHaul's published tiers {sorted(ALLOWED_TIERS)}", file=sys.stderr)
@@ -153,21 +194,23 @@ def prepare_command(args: argparse.Namespace) -> int:
     script_copy = workdir / SCRIPT_COPY_FILENAME
     if script_path.resolve(strict=False) != script_copy.resolve(strict=False):
         shutil.copy2(script_path, script_copy)
+    manifest_copy: Path | None = None
+    if manifest is not None and adjacent_manifest_path(script_path).exists():
+        manifest_copy = workdir / MANIFEST_COPY_FILENAME
+        if adjacent_manifest_path(script_path).resolve(strict=False) != manifest_copy.resolve(strict=False):
+            shutil.copy2(adjacent_manifest_path(script_path), manifest_copy)
 
     prompt_records: list[dict[str, Any]] = []
-    delivered_prompts: list[str] = []
-    any_flattened = False
+    delivered_prompt_records: list[dict[str, Any]] = []
     for record in script:
-        original = record["text"]
-        delivered = flatten_for_line_auto_prompts(original)
-        if not delivered:
-            raise RunnerError(f"script:{record['turn']}: prompt becomes empty after auto-prompts flattening")
-        flattened = delivered != original.strip()
-        any_flattened = any_flattened or flattened
-        delivered_prompts.append(delivered)
+        original = prompt_text_for_delivery(record)
+        delivered = original
         prompt_map: dict[str, Any] = {
             "delivered_sha256": sha256_text(delivered),
-            "flattened": flattened,
+            "delivered_utf8_bytes": len(delivered.encode("utf-8")),
+            "delivery_mode": "jsonl_text",
+            "flattened": False,
+            "has_newlines": "\n" in delivered or "\r" in delivered,
             "kind": record["kind"],
             "original_sha256": sha256_text(original),
             "prompt_sha256": sha256_text(delivered),
@@ -176,41 +219,53 @@ def prepare_command(args: argparse.Namespace) -> int:
         if "refs" in record:
             prompt_map["refs"] = record["refs"]
         prompt_records.append(prompt_map)
+        delivered_prompt_records.append(
+            {
+                "delivered_sha256": sha256_text(delivered),
+                "kind": record["kind"],
+                "text": delivered,
+                "turn": record["turn"],
+            }
+        )
 
     full_prompt_dir = prompt_dir(workdir, "full")
-    full_prompt_file = full_prompt_dir / "auto_prompts.txt"
+    full_prompt_file = full_prompt_dir / AUTO_PROMPTS_JSONL_FILENAME
     full_prompt_dir.mkdir(parents=True, exist_ok=True)
-    full_prompt_file.write_text("\n".join(delivered_prompts) + "\n", encoding="utf-8", newline="\n")
+    write_jsonl(full_prompt_file, delivered_prompt_records)
     write_jsonl(workdir / PROMPT_MAP_FILENAME, prompt_records)
 
     metadata = {
         "auto_prompt_engine_evidence": AUTO_PROMPT_ENGINE_EVIDENCE,
-        "auto_prompt_mode": "line_file",
+        "auto_prompt_mode": "jsonl_text",
         "auto_prompts_path": str(full_prompt_file),
         "bench_conv": bench_conv_id(seed, tier),
         "created_at": utc_now_iso(),
-        "hidden_answer_key_policy": "script_only; answer_key.jsonl and manifest.json are not copied by this runner",
-        "prepare_mode": "flattened_line_auto_prompts",
+        "hidden_answer_key_policy": "script_and_manifest_only; answer_key.jsonl is not copied by this runner",
+        "manifest_copy_path": str(manifest_copy) if manifest_copy is not None else None,
+        "manifest_sha256": sha256_file(manifest_copy) if manifest_copy is not None else None,
+        "prepare_mode": "jsonl_multiline_preserved",
         "prompt_count": len(script),
-        "prompt_flattening": any_flattened,
+        "prompt_flattening": False,
         "prompt_map_path": str(workdir / PROMPT_MAP_FILENAME),
         "public_longhaul_repo_touched": False,
         "script_copy_path": str(script_copy),
         "script_sha256": sha256_file(script_copy),
         "seed": seed,
-        "selected_path": "3_flatten_newlines_to_spaces",
+        "selected_path": "jsonl_auto_prompts_preserve_multiline_text",
         "selected_path_reason": (
-            "JARVIS auto-prompts currently accepts one trimmed prompt per line; "
-            "runner flattening avoids Pi engine surgery for this pilot."
+            "JARVIS auto-prompts accepts one JSON object per physical line for .jsonl files; "
+            "record.text is sent to pi.sendUserMessage without newline flattening."
         ),
         "tier": tier,
+        "total_turns": manifest.get("total_turns") if manifest else len(script),
+        "workload_turns": manifest.get("workload_turns") if manifest else tier,
         "workdir": str(workdir),
     }
     write_json(workdir / META_FILENAME, metadata)
 
     print(
         f"prepared {len(script)} prompts for {metadata['bench_conv']} "
-        f"at {workdir} (prompt_flattening={any_flattened})"
+        f"at {workdir} (prompt_flattening={metadata['prompt_flattening']})"
     )
     print(f"auto_prompts={full_prompt_file}")
     return 0
@@ -240,8 +295,15 @@ def load_prompt_map(workdir: Path) -> list[dict[str, Any]]:
     return records
 
 
+def full_prompt_file_for_workdir(workdir: Path) -> Path:
+    jsonl_file = prompt_dir(workdir, "full") / AUTO_PROMPTS_JSONL_FILENAME
+    if jsonl_file.exists():
+        return jsonl_file
+    return prompt_dir(workdir, "full") / AUTO_PROMPTS_TXT_FILENAME
+
+
 def active_prompt_file_for_run(workdir: Path, prompt_map: list[dict[str, Any]], limit: int | None) -> tuple[str, Path, int]:
-    full_file = prompt_dir(workdir, "full") / "auto_prompts.txt"
+    full_file = full_prompt_file_for_workdir(workdir)
     if limit is None:
         if not full_file.exists():
             raise RunnerError(f"missing auto prompts file: {full_file}")
@@ -249,15 +311,43 @@ def active_prompt_file_for_run(workdir: Path, prompt_map: list[dict[str, Any]], 
     if limit <= 0:
         raise RunnerError("--limit must be positive")
     target = min(limit, len(prompt_map))
+    label = f"limit_{target}"
+    limited_dir = prompt_dir(workdir, label)
+    limited_dir.mkdir(parents=True, exist_ok=True)
+    if full_file.suffix.lower() == ".jsonl":
+        source_records = read_jsonl(full_file)
+        if len(source_records) < target:
+            raise RunnerError(f"{full_file}: expected at least {target} prompt records, got {len(source_records)}")
+        limited_file = limited_dir / AUTO_PROMPTS_JSONL_FILENAME
+        write_jsonl(limited_file, source_records[:target])
+        return label, limited_file, target
     source_lines = full_file.read_text(encoding="utf-8").splitlines()
     if len(source_lines) < target:
         raise RunnerError(f"{full_file}: expected at least {target} prompt lines, got {len(source_lines)}")
-    label = f"limit_{target}"
-    limited_dir = prompt_dir(workdir, label)
-    limited_file = limited_dir / "auto_prompts.txt"
-    limited_dir.mkdir(parents=True, exist_ok=True)
+    limited_file = limited_dir / AUTO_PROMPTS_TXT_FILENAME
     limited_file.write_text("\n".join(source_lines[:target]) + "\n", encoding="utf-8", newline="\n")
     return label, limited_file, target
+
+
+def load_delivered_prompt_texts(workdir: Path, target: int) -> list[str]:
+    prompt_file = full_prompt_file_for_workdir(workdir)
+    if not prompt_file.exists():
+        raise RunnerError(f"missing auto prompts file: {prompt_file}")
+    if prompt_file.suffix.lower() == ".jsonl":
+        records = read_jsonl(prompt_file)
+        texts: list[str] = []
+        for index, record in enumerate(records[:target], start=1):
+            text = record.get("text")
+            if not isinstance(text, str):
+                raise RunnerError(f"{prompt_file}:{index}: expected string text")
+            texts.append(text)
+        if len(texts) < target:
+            raise RunnerError(f"{prompt_file}: expected {target} prompt records, got {len(texts)}")
+        return texts
+    lines = prompt_file.read_text(encoding="utf-8").splitlines()
+    if len(lines) < target:
+        raise RunnerError(f"{prompt_file}: expected {target} prompt lines, got {len(lines)}")
+    return lines[:target]
 
 
 def read_progress(progress_file: Path) -> int:
@@ -613,11 +703,14 @@ def bench_store_root(args: argparse.Namespace) -> Path:
     return (Path("~/.jarvis-code/raw-store").expanduser().parent / "conversation_bench_archive").resolve(strict=False)
 
 
-def load_archive(archive_path: Path, since: dt.datetime | None) -> tuple[list[tuple[int, dict[str, Any]]], list[tuple[int, dict[str, Any]]]]:
+def load_archive(
+    archive_path: Path, since: dt.datetime | None
+) -> tuple[list[tuple[int, dict[str, Any]]], list[tuple[int, dict[str, Any]]], list[tuple[int, dict[str, Any]]]]:
     turns: list[tuple[int, dict[str, Any]]] = []
     meters: list[tuple[int, dict[str, Any]]] = []
+    encoders: list[tuple[int, dict[str, Any]]] = []
     if not archive_path.exists():
-        return turns, meters
+        return turns, meters, encoders
     with archive_path.open("r", encoding="utf-8-sig", errors="replace") as fh:
         for line_no, line in enumerate(fh, start=1):
             line = line.strip()
@@ -632,10 +725,10 @@ def load_archive(archive_path: Path, since: dt.datetime | None) -> tuple[list[tu
             if record.get("kind") == "meter":
                 meters.append((line_no, record))
             elif record.get("kind") in {"encoder"}:
-                continue
+                encoders.append((line_no, record))
             elif "user" in record or "assistant" in record:
                 turns.append((line_no, record))
-    return turns, meters
+    return turns, meters, encoders
 
 
 def parse_paperlog_line(line: str) -> dict[str, Any] | None:
@@ -704,6 +797,287 @@ def parse_meter_usage(meter_line: str | None) -> tuple[int | None, int | None]:
 
 def estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
+
+
+def nonnegative_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float) and value.is_integer():
+        return max(0, int(value))
+    if isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
+        return int(value.strip())
+    return None
+
+
+def first_count(*values: Any) -> int | None:
+    for value in values:
+        parsed = nonnegative_int(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def usage_scope_is_cumulative(scope: Any) -> bool:
+    return isinstance(scope, str) and "cumul" in scope.lower()
+
+
+def provider_call_usage_snapshots(raw_calls: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_calls, list):
+        return []
+    calls: list[dict[str, Any]] = []
+    for raw_call in raw_calls:
+        if not isinstance(raw_call, dict):
+            continue
+        call = {
+            "cache_read_tokens": first_count(raw_call.get("cacheRead"), raw_call.get("cache_read")),
+            "cache_write_tokens": first_count(raw_call.get("cacheWrite"), raw_call.get("cache_write")),
+            "input_uncached_tokens": first_count(raw_call.get("input"), raw_call.get("input_tokens")),
+            "output_visible_tokens": first_count(raw_call.get("output"), raw_call.get("output_tokens")),
+            "reasoning_tokens": first_count(raw_call.get("reasoningTokens"), raw_call.get("reasoning_tokens")),
+            "total_tokens": first_count(raw_call.get("totalTokens"), raw_call.get("total_tokens")),
+        }
+        if any(value is not None for value in call.values()):
+            calls.append(call)
+    return calls
+
+
+def provider_usage_snapshot(turn_record: dict[str, Any]) -> dict[str, Any] | None:
+    llm_meta = turn_record.get("llm_meta")
+    if not isinstance(llm_meta, dict):
+        return None
+    usage = llm_meta.get("usage")
+    usage_dict = usage if isinstance(usage, dict) else {}
+    input_uncached = first_count(
+        usage_dict.get("input"),
+        usage_dict.get("input_tokens"),
+        usage_dict.get("prompt_tokens_uncached"),
+        llm_meta.get("tokens_in"),
+        llm_meta.get("input_tokens"),
+    )
+    cache_read = first_count(
+        usage_dict.get("cacheRead"),
+        usage_dict.get("cache_read"),
+        usage_dict.get("cached_tokens"),
+        llm_meta.get("cache_read_tokens"),
+    )
+    cache_write = first_count(
+        usage_dict.get("cacheWrite"),
+        usage_dict.get("cache_write"),
+        llm_meta.get("cache_write_tokens"),
+    )
+    output_visible = first_count(
+        usage_dict.get("output"),
+        usage_dict.get("output_tokens"),
+        usage_dict.get("completion_tokens"),
+        llm_meta.get("tokens_out"),
+        llm_meta.get("output_tokens"),
+    )
+    reasoning = first_count(
+        usage_dict.get("reasoningTokens"),
+        usage_dict.get("reasoning_tokens"),
+        usage_dict.get("thought"),
+        llm_meta.get("reasoning_tokens"),
+    )
+    total = first_count(usage_dict.get("totalTokens"), usage_dict.get("total_tokens"), llm_meta.get("total_tokens"))
+    provider_call_usages = provider_call_usage_snapshots(
+        llm_meta.get("provider_call_usages")
+        or usage_dict.get("providerCallUsages")
+        or usage_dict.get("provider_call_usages")
+    )
+    if all(value is None for value in (input_uncached, cache_read, cache_write, output_visible, reasoning, total)) and not provider_call_usages:
+        return None
+    scope = usage_dict.get("scope") or llm_meta.get("provider_usage_scope") or "pi_turn_summed_per_turn"
+    source = PROVIDER_TOKEN_SOURCE if usage_dict else "raw_bench_archive.llm_meta_token_fields"
+    provider_calls = nonnegative_int(llm_meta.get("provider_calls"))
+    if provider_calls is None and provider_call_usages:
+        provider_calls = len(provider_call_usages)
+    return {
+        "api": llm_meta.get("api"),
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "cost_usd": llm_meta.get("cost_usd"),
+        "input_uncached_tokens": input_uncached,
+        "model": llm_meta.get("response_model") or llm_meta.get("model"),
+        "output_visible_tokens": output_visible,
+        "provider": llm_meta.get("provider"),
+        "provider_call_usages": provider_call_usages,
+        "provider_calls": provider_calls,
+        "reasoning_tokens": reasoning,
+        "scope": scope,
+        "source": source,
+        "total_tokens": total,
+    }
+
+
+def _diff_optional_count(current: int | None, previous: int | None) -> int | None:
+    if current is None:
+        return None
+    if previous is None:
+        return current
+    return max(0, current - previous)
+
+
+def normalize_provider_usage_snapshots(snapshots: list[dict[str, Any] | None]) -> list[dict[str, Any] | None]:
+    components = (
+        "input_uncached_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "output_visible_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+    )
+    previous_cumulative: dict[str, int | None] = {key: None for key in components}
+    normalized: list[dict[str, Any] | None] = []
+    for snapshot in snapshots:
+        if snapshot is None:
+            normalized.append(None)
+            continue
+        item = dict(snapshot)
+        if usage_scope_is_cumulative(snapshot.get("scope")):
+            for key in components:
+                current = snapshot.get(key)
+                parsed = nonnegative_int(current)
+                item[key] = _diff_optional_count(parsed, previous_cumulative.get(key))
+                if parsed is not None:
+                    previous_cumulative[key] = parsed
+        input_parts = [
+            nonnegative_int(item.get("input_uncached_tokens")),
+            nonnegative_int(item.get("cache_read_tokens")),
+            nonnegative_int(item.get("cache_write_tokens")),
+        ]
+        output_parts = [
+            nonnegative_int(item.get("output_visible_tokens")),
+            nonnegative_int(item.get("reasoning_tokens")),
+        ]
+        input_present = any(value is not None for value in input_parts)
+        output_present = any(value is not None for value in output_parts)
+        item["input_tokens"] = sum(value or 0 for value in input_parts) if input_present else None
+        item["output_tokens"] = sum(value or 0 for value in output_parts) if output_present else None
+        if item.get("total_tokens") is None and (input_present or output_present):
+            item["total_tokens"] = (item.get("input_tokens") or 0) + (item.get("output_tokens") or 0)
+        call_context_tokens = provider_context_tokens_from_call_usages(item.get("provider_call_usages"))
+        if call_context_tokens is not None:
+            item["provider_context_tokens"] = call_context_tokens
+        else:
+            provider_calls = nonnegative_int(item.get("provider_calls"))
+            if provider_calls is None or provider_calls <= 1:
+                item["provider_context_tokens"] = item.get("input_tokens")
+            else:
+                item["provider_context_tokens"] = None
+                item["provider_context_tokens_unavailable_reason"] = "missing_provider_call_usages_for_multi_call_turn"
+        normalized.append(item)
+    return normalized
+
+
+def provider_context_tokens_from_call_usages(raw_calls: Any) -> int | None:
+    if not isinstance(raw_calls, list) or not raw_calls:
+        return None
+    call_inputs: list[int] = []
+    for raw_call in raw_calls:
+        if not isinstance(raw_call, dict):
+            continue
+        input_parts = [
+            nonnegative_int(raw_call.get("input_uncached_tokens")),
+            nonnegative_int(raw_call.get("cache_read_tokens")),
+            nonnegative_int(raw_call.get("cache_write_tokens")),
+        ]
+        if any(value is not None for value in input_parts):
+            call_inputs.append(sum(value or 0 for value in input_parts))
+    return max(call_inputs) if call_inputs else None
+
+
+def provider_total_formula_note(usage: dict[str, Any]) -> str | None:
+    input_tokens = nonnegative_int(usage.get("input_tokens"))
+    output_tokens = nonnegative_int(usage.get("output_tokens"))
+    total_tokens = nonnegative_int(usage.get("total_tokens"))
+    if input_tokens is None or output_tokens is None or total_tokens is None:
+        return None
+    formula_tokens = input_tokens + output_tokens
+    if formula_tokens == total_tokens:
+        return "provider_total_check=matches_totalTokens"
+    return f"provider_total_check=mismatch_totalTokens(total={total_tokens},formula={formula_tokens})"
+
+
+def provider_usage_notes(usage: dict[str, Any] | None) -> str:
+    if usage is None:
+        return "provider=null; provider_usage_missing_from_raw_turn_llm_meta"
+    parts = [
+        f"provider_source={usage.get('source')}",
+        f"provider_usage_scope={usage.get('scope')}",
+        "provider_input=input+cacheRead+cacheWrite",
+        "provider_context=max_call(input+cacheRead+cacheWrite)",
+        "provider_output=output+reasoningTokens",
+    ]
+    total_note = provider_total_formula_note(usage)
+    if total_note:
+        parts.append(total_note)
+    unavailable_reason = usage.get("provider_context_tokens_unavailable_reason")
+    if unavailable_reason:
+        parts.append(f"provider_context_tokens_unavailable_reason={unavailable_reason}")
+    for key in (
+        "provider",
+        "api",
+        "model",
+        "provider_calls",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+        "cost_usd",
+    ):
+        value = usage.get(key)
+        if value is not None and value != "":
+            parts.append(f"{key}={value}")
+    return "; ".join(parts)
+
+
+def encoder_estimate_snapshot(record: dict[str, Any]) -> dict[str, Any] | None:
+    meta = record.get("encoder_meta")
+    meta_dict = meta if isinstance(meta, dict) else {}
+    enc_in = first_count(meta_dict.get("enc_in"), record.get("enc_in"))
+    enc_out = first_count(meta_dict.get("enc_out"), record.get("enc_out"))
+    enc_think = first_count(meta_dict.get("enc_think"), record.get("enc_think"))
+    if enc_in is None and enc_out is None and enc_think is None:
+        return None
+    return {
+        "enc_in": enc_in,
+        "enc_out": enc_out,
+        "enc_think": enc_think,
+        "failure_mode": meta_dict.get("failure_mode"),
+        "retries": first_count(meta_dict.get("encoder_retries"), record.get("encoder_retries")),
+    }
+
+
+def choose_encoder_estimate_for_turn(
+    turn_index: int,
+    encoders: list[tuple[int, dict[str, Any]]],
+) -> tuple[dict[str, Any] | None, str]:
+    explicit = [record for _line_no, record in encoders if record.get("turn") == turn_index]
+    if explicit:
+        return encoder_estimate_snapshot(explicit[-1]), "raw_encoder_explicit_turn"
+    if len(encoders) >= turn_index:
+        return encoder_estimate_snapshot(encoders[turn_index - 1][1]), "raw_encoder_order"
+    return None, "none"
+
+
+def encoder_estimate_notes(estimate: dict[str, Any] | None, source: str) -> str:
+    parts = [PROVIDER_SCOPE_CHAT_ONLY, ENCODER_PROVIDER_EXCLUSION, f"encoder_estimate_source={source}"]
+    if estimate is not None:
+        for label, key in (
+            ("encoder_estimate_in", "enc_in"),
+            ("encoder_estimate_out", "enc_out"),
+            ("encoder_estimate_think", "enc_think"),
+            ("encoder_retries", "retries"),
+        ):
+            value = estimate.get(key)
+            if value is not None:
+                parts.append(f"{label}={value}")
+        failure_mode = estimate.get("failure_mode")
+        if failure_mode:
+            parts.append(f"encoder_failure_mode={failure_mode}")
+    return "; ".join(parts)
 
 
 def load_runner_events(path: Path, since: dt.datetime | None) -> list[dict[str, Any]]:
@@ -775,12 +1149,13 @@ def collect_command(args: argparse.Namespace) -> int:
     target = min(target, len(prompt_map))
     since = parse_iso(run_state.get("started_at"))
     prompt_subset = prompt_map[:target]
+    delivered_texts = load_delivered_prompt_texts(workdir, target)
 
     store_root = bench_store_root(args)
     bench_conv = str(meta["bench_conv"])
     archive_path = store_root / f"{bench_conv}.jsonl"
     paperlog_path = store_root / f"{bench_conv}.paperlog"
-    turns, meters = load_archive(archive_path, since)
+    turns, meters, encoders = load_archive(archive_path, since)
     paperlog = load_paperlog(paperlog_path, since)
     runner_events = load_runner_events(workdir / EVENTS_FILENAME, since)
     turn_events = events_by_turn(runner_events, target)
@@ -789,6 +1164,10 @@ def collect_command(args: argparse.Namespace) -> int:
     ledger: list[dict[str, Any]] = []
     warnings: list[str] = []
     usable_turns = turns[:target]
+    provider_usages = normalize_provider_usage_snapshots(
+        [provider_usage_snapshot(turn_record) for _line_no, turn_record in usable_turns[:target]]
+    )
+    expected_context_tokens = 0
 
     for index, prompt_record in enumerate(prompt_subset, start=1):
         if len(usable_turns) < index:
@@ -796,12 +1175,15 @@ def collect_command(args: argparse.Namespace) -> int:
         line_no, turn_record = usable_turns[index - 1]
         response = str(turn_record.get("assistant") or "")
         user_text = str(turn_record.get("user") or "")
+        delivered_text = delivered_texts[index - 1]
         delivered_sha = str(prompt_record["delivered_sha256"])
         if sha256_text(user_text) != delivered_sha:
             warnings.append(
                 f"archive line {line_no} did not match delivered prompt sha for turn {index}; "
                 "using script order mapping"
             )
+        if sha256_text(delivered_text) != delivered_sha:
+            warnings.append(f"prepared prompt text did not match prompt_map delivered sha for turn {index}")
         events = turn_events.get(index, [])
         started_at = str(turn_record.get("timestamp") or run_state.get("started_at") or "")
         finished_at = started_at
@@ -818,39 +1200,48 @@ def collect_command(args: argparse.Namespace) -> int:
 
         meter_line, meter_source = choose_meter_for_turn(index, meters, paperlog)
         agent_in, agent_out = parse_meter_usage(meter_line)
+        provider_usage = provider_usages[index - 1] if index - 1 < len(provider_usages) else None
+        encoder_estimate, encoder_source = choose_encoder_estimate_for_turn(index, encoders)
+        expected_context_tokens += estimate_tokens(delivered_text)
+        expected_input_tokens = expected_context_tokens
         notes = (
-            "provider=null; provider_usage_not_confirmed_by_runner; "
+            f"{provider_usage_notes(provider_usage)}; "
+            f"{encoder_estimate_notes(encoder_estimate, encoder_source)}; "
             f"agent_submitted_source={meter_source}; harness_estimate_method=chars_div_4_fallback"
         )
         ledger.append(
             {
                 "events": [event for event in events if event in LEDGER_EVENTS],
+                "expected_input_tokens": expected_input_tokens,
                 "input_tokens": {
                     "agent_submitted": agent_in,
-                    "harness_estimate": estimate_tokens(user_text),
-                    "provider": None,
+                    "harness_estimate": estimate_tokens(delivered_text),
+                    "provider": provider_usage.get("input_tokens") if provider_usage else None,
                 },
                 "notes": notes,
                 "output_tokens": {
                     "agent_submitted": agent_out,
                     "harness_estimate": estimate_tokens(response),
-                    "provider": None,
+                    "provider": provider_usage.get("output_tokens") if provider_usage else None,
                 },
+                "provider_context_tokens": provider_usage.get("provider_context_tokens") if provider_usage else None,
                 "turn": index,
                 "wall_ms": None,
             }
         )
+        expected_context_tokens += estimate_tokens(response)
 
     turns_completed = len(transcript)
     tier = int(meta["tier"])
     limited_run = run_state.get("limit") is not None
-    dnf = turns_completed < tier
+    full_prompt_count = len(prompt_map)
+    dnf = turns_completed < full_prompt_count
     dnf_reason = None
     if dnf:
         if limited_run:
-            dnf_reason = f"partial_limit_{run_state.get('limit')}: completed {turns_completed}/{tier}"
+            dnf_reason = f"partial_limit_{run_state.get('limit')}: completed {turns_completed}/{full_prompt_count}"
         else:
-            dnf_reason = f"incomplete_archive: completed {turns_completed}/{tier}"
+            dnf_reason = f"incomplete_archive: completed {turns_completed}/{full_prompt_count}"
     started_at = transcript[0]["started_at"] if transcript else str(run_state.get("started_at") or utc_now_iso())
     finished_at = transcript[-1]["finished_at"] if transcript else str(run_state.get("finished_at") or utc_now_iso())
     run_meta = {
@@ -874,7 +1265,7 @@ def collect_command(args: argparse.Namespace) -> int:
         "hidden_answer_key_policy": meta.get("hidden_answer_key_policy"),
         "prompt_flattening": bool(meta.get("prompt_flattening")),
         "prompt_flattening_reason": meta.get("selected_path_reason"),
-        "provider_token_source": None,
+        "provider_token_source": PROVIDER_TOKEN_SOURCE,
         "resumed": bool(run_state.get("resumed") or run_state.get("session_restarts")),
         "run_state": {
             "active_label": run_state.get("active_label"),
@@ -887,9 +1278,14 @@ def collect_command(args: argparse.Namespace) -> int:
         "seed": int(meta["seed"]),
         "started_at": started_at,
         "tier": tier,
+        "script_turns": len(prompt_map),
         "token_ledger_policy": (
-            "provider is null unless runner can independently confirm provider/API usage; "
-            "JLC meter is recorded under agent_submitted only"
+            f"{PROVIDER_SCOPE_CHAT_ONLY}; {ENCODER_PROVIDER_EXCLUSION}; "
+            "provider uses raw bench archive llm_meta.usage from Pi assistant message usage; "
+            "input provider count is input+cacheRead+cacheWrite and output provider count is output+reasoningTokens; "
+            "provider_context_tokens is the per-turn provider-call input high-water mark when per-call usage is present; "
+            "encoder enc_in/enc_out in ledger notes are sidecar count_tokens estimates, not provider-reported usage; "
+            "JLC meter remains recorded under agent_submitted for cross-check"
         ),
         "turns_completed": turns_completed,
     }
@@ -953,7 +1349,16 @@ def validate_transcript(records: list[dict[str, Any]]) -> None:
 
 
 def validate_ledger(records: list[dict[str, Any]]) -> None:
-    allowed = {"events", "input_tokens", "notes", "output_tokens", "turn", "wall_ms"}
+    allowed = {
+        "events",
+        "expected_input_tokens",
+        "input_tokens",
+        "notes",
+        "output_tokens",
+        "provider_context_tokens",
+        "turn",
+        "wall_ms",
+    }
     for index, record in enumerate(records, start=1):
         if not {"turn", "input_tokens", "output_tokens"} <= set(record):
             raise RunnerError(f"ledger:{index}: missing required fields")
@@ -966,6 +1371,10 @@ def validate_ledger(records: list[dict[str, Any]]) -> None:
         wall_ms = record.get("wall_ms")
         if wall_ms is not None and (not isinstance(wall_ms, int) or wall_ms < 0):
             raise RunnerError(f"ledger:{index}: wall_ms must be nonnegative integer or null")
+        for key in ("expected_input_tokens", "provider_context_tokens"):
+            value = record.get(key)
+            if value is not None and (not isinstance(value, int) or value < 0):
+                raise RunnerError(f"ledger:{index}: {key} must be nonnegative integer or null")
         events = record.get("events", [])
         if not isinstance(events, list) or any(event not in LEDGER_EVENTS for event in events):
             raise RunnerError(f"ledger:{index}: bad events")

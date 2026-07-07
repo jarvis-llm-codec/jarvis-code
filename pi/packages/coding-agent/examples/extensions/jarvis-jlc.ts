@@ -536,8 +536,17 @@ type FooterMeterEntry = {
 	jhb_tokens: number;
 };
 
+type ProviderCallUsage = {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	reasoningTokens: number;
+};
+
 type TurnUsageSummary = NonNullable<AssistantMessage["usage"]> & {
 	reasoningTokens?: number;
+	providerCallUsages?: ProviderCallUsage[];
 };
 
 type JarvisCacheSignal = "actual" | "unreported";
@@ -2591,6 +2600,7 @@ function summarizeAssistantUsage(messages: AgentMessage[]): TurnUsageSummary | u
 	};
 	let seen = false;
 	let reasoningTokens = 0;
+	const providerCallUsages: ProviderCallUsage[] = [];
 	for (const message of messages) {
 		if (message.role !== "assistant") continue;
 		const usage = (message as AssistantMessage).usage;
@@ -2600,6 +2610,7 @@ function summarizeAssistantUsage(messages: AgentMessage[]): TurnUsageSummary | u
 		const output = Math.max(0, usage.output ?? 0);
 		const cacheRead = Math.max(0, usage.cacheRead ?? 0);
 		const cacheWrite = Math.max(0, usage.cacheWrite ?? 0);
+		const reasoning = Math.max(0, (usage as { reasoningTokens?: number }).reasoningTokens ?? 0);
 		summary.input += input;
 		summary.output += output;
 		summary.cacheRead += cacheRead;
@@ -2610,10 +2621,12 @@ function summarizeAssistantUsage(messages: AgentMessage[]): TurnUsageSummary | u
 		summary.cost.cacheRead += Math.max(0, usage.cost?.cacheRead ?? 0);
 		summary.cost.cacheWrite += Math.max(0, usage.cost?.cacheWrite ?? 0);
 		summary.cost.total += Math.max(0, usage.cost?.total ?? 0);
-		reasoningTokens += Math.max(0, (usage as { reasoningTokens?: number }).reasoningTokens ?? 0);
+		reasoningTokens += reasoning;
+		providerCallUsages.push({ input, output, cacheRead, cacheWrite, reasoningTokens: reasoning });
 	}
 	if (!seen) return undefined;
 	if (reasoningTokens > 0) summary.reasoningTokens = reasoningTokens;
+	if (providerCallUsages.length > 0) summary.providerCallUsages = providerCallUsages;
 	return summary;
 }
 
@@ -15014,11 +15027,14 @@ function loadAutoPromptState(flagValue: boolean | string | undefined): AutoPromp
 	const promptsFile = path.resolve(flagValue);
 	if (!fs.existsSync(promptsFile)) return undefined;
 
-	const prompts = fs
-		.readFileSync(promptsFile, "utf-8")
-		.split(/\r?\n/)
-		.map((line) => line.trim())
-		.filter((line) => line.length > 0);
+	const raw = fs.readFileSync(promptsFile, "utf-8");
+	const prompts =
+		path.extname(promptsFile).toLowerCase() === ".jsonl"
+			? loadJsonlAutoPrompts(raw, promptsFile)
+			: raw
+					.split(/\r?\n/)
+					.map((line) => line.trim())
+					.filter((line) => line.length > 0);
 	if (prompts.length === 0) return undefined;
 
 	const progressFile = path.join(path.dirname(promptsFile), ".auto_progress.json");
@@ -15041,6 +15057,29 @@ function loadAutoPromptState(flagValue: boolean | string | undefined): AutoPromp
 		idx,
 		total: prompts.length,
 	};
+}
+
+function loadJsonlAutoPrompts(raw: string, promptsFile: string): string[] {
+	const prompts: string[] = [];
+	for (const [lineIndex, line] of raw.split(/\r?\n/).entries()) {
+		if (!line.trim()) continue;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line);
+		} catch (error) {
+			console.error(`[jarvis:auto-prompts] ${promptsFile}:${lineIndex + 1}: invalid JSONL: ${String(error)}`);
+			return [];
+		}
+		if (!parsed || typeof parsed !== "object" || typeof (parsed as { text?: unknown }).text !== "string") {
+			console.error(`[jarvis:auto-prompts] ${promptsFile}:${lineIndex + 1}: expected object with string text`);
+			return [];
+		}
+		const text = (parsed as { text: string }).text;
+		if (text.length > 0) {
+			prompts.push(text);
+		}
+	}
+	return prompts;
 }
 
 function persistAutoPromptState(state: AutoPromptState): void {
@@ -15587,6 +15626,7 @@ function buildTurnLlmMeta(
 	terminalReason?: JarvisTurnTerminalReason,
 ): Record<string, unknown> {
 	const usage = turnUsage ?? assistantMessage?.usage;
+	const providerUsageScope = turnUsage ? "pi_turn_summed_per_turn" : usage ? "pi_single_message" : undefined;
 	let contextUsage: ReturnType<ExtensionContext["getContextUsage"]> | undefined;
 	let modelProvider: string | undefined;
 	let modelId: string | undefined;
@@ -15615,6 +15655,8 @@ function buildTurnLlmMeta(
 		cache_read_tokens: usage?.cacheRead,
 		cache_write_tokens: usage?.cacheWrite,
 		total_tokens: usage?.totalTokens,
+		provider_calls: providerCallCountThisTurn,
+		provider_usage_scope: providerUsageScope,
 		cost_usd: usage?.cost?.total,
 		chat_seconds: chatSeconds,
 		terminal_reason: terminalReason,
@@ -15630,6 +15672,9 @@ function buildTurnLlmMeta(
 		meta.cache_meter = cacheReport.cache_meter;
 		meta.cache_hit_pct = cacheReport.cache_hit_pct;
 		meta.usage = usage;
+		if (turnUsage?.providerCallUsages?.length) {
+			meta.provider_call_usages = turnUsage.providerCallUsages;
+		}
 	}
 	if (contextResponse) {
 		meta.prompt_context = Object.fromEntries(

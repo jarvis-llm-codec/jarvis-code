@@ -28,6 +28,8 @@ from jlc_agentic.providers import load_config as load_runtime_config
 from jlc_agentic.providers import clear_cache
 from jlc_agentic.providers import _apply_chat_model_override
 from jlc_agentic.providers import turn_context
+from jlc_agentic import recall_budget, recall_trace
+from jlc_agentic.agentic.preflight import ProviderPreflightError, preflight_messages
 from jlc_agentic.slim import JarvisAgentic
 from jlc_agentic.user_agent import JARVIS_CODE_VERSION
 
@@ -2014,18 +2016,61 @@ def context(req: ContextRequest) -> dict[str, Any]:
                 session_id=session_id,
             )
             recall_block = str(recall_result.get("text") or "").strip()
+            recall_trace.emit(
+                "recall_trace",
+                surface="context_auto",
+                conv_id=session_id,
+                mode=req.mode,
+                top_k=_recall_top_k,
+                **recall_trace.query_fields(req.user_message),
+                candidates=[
+                    {
+                        "rank": idx,
+                        "turn": frag.get("turn"),
+                        "score": frag.get("score", 0.0),
+                        "user_chars": len(str(frag.get("user", ""))),
+                        "assistant_chars": len(str(frag.get("assistant", ""))),
+                    }
+                    for idx, frag in enumerate(recall_result.get("fragments") or [], start=1)
+                    if isinstance(frag, dict)
+                ],
+                served_turns=[
+                    frag.get("turn")
+                    for frag in (recall_result.get("fragments") or [])
+                    if isinstance(frag, dict)
+                ],
+                served_chars=len(recall_block),
+                served_policy=recall_result.get("served_policy", "formatted"),
+                cap=recall_result.get("cap"),
+                confidence=recall_result.get("confidence", "LOW"),
+            )
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"JLC auto recall degraded: {exc}")
             recall_block = ""
         raw_recall_block = _format_raw_hits(
             recall_raw(req.user_message, top_k=_recall_top_k, session_id=session_id),
             current_origin_window=current_origin_window,
+            query=req.user_message,
+            session_id=session_id,
         )
         if raw_recall_block:
             recall_block = (
                 f"{raw_recall_block}\n\n{recall_block}"
                 if recall_block and raw_recall_block not in recall_block
                 else raw_recall_block
+            )
+        if recall_block:
+            capped_recall_block, cap_meta = recall_budget.cap_block(recall_block)
+            recall_block = capped_recall_block.strip()
+            recall_trace.emit(
+                "recall_trace",
+                surface="context_recall_block",
+                conv_id=session_id,
+                mode=req.mode,
+                **recall_trace.query_fields(req.user_message),
+                served_chars=len(recall_block),
+                served_policy=cap_meta["served_policy"],
+                cap=cap_meta,
             )
 
     # Backstop for stale JHB: include the last verbatim turn so the LLM
@@ -2428,7 +2473,12 @@ def recall(req: RecallRequest) -> dict[str, Any]:
             raw_hits = recall_raw(query, top_k=req.top_k, session_id=session_id)
             results.append({
                 "query": query,
-                "text": _format_raw_hits(raw_hits, current_origin_window=current_origin_window),
+                "text": _format_raw_hits(
+                    raw_hits,
+                    current_origin_window=current_origin_window,
+                    query=query,
+                    session_id=session_id,
+                ),
                 "fragments": _raw_hits_to_fragments(raw_hits),
                 "confidence": "HIGH" if raw_hits else "LOW",
                 "source": "raw_explicit",
@@ -2450,7 +2500,12 @@ def recall(req: RecallRequest) -> dict[str, Any]:
             confidence = recall_result.get("confidence", "LOW")
             if not text and not fragments:
                 raw_hits = recall_raw(query, top_k=req.top_k, session_id=session_id)
-                text = _format_raw_hits(raw_hits, current_origin_window=current_origin_window)
+                text = _format_raw_hits(
+                    raw_hits,
+                    current_origin_window=current_origin_window,
+                    query=query,
+                    session_id=session_id,
+                )
                 fragments = _raw_hits_to_fragments(raw_hits)
                 confidence = "LOW"
                 if raw_hits:
@@ -2471,7 +2526,12 @@ def recall(req: RecallRequest) -> dict[str, Any]:
             if raw_hits:
                 results.append({
                     "query": query,
-                    "text": _format_raw_hits(raw_hits, current_origin_window=current_origin_window),
+                    "text": _format_raw_hits(
+                        raw_hits,
+                        current_origin_window=current_origin_window,
+                        query=query,
+                        session_id=session_id,
+                    ),
                     "fragments": _raw_hits_to_fragments(raw_hits),
                     "confidence": "LOW",
                     "source": "raw_fallback",
@@ -3552,6 +3612,17 @@ async def openai_compatible_chat_completions(request: Request) -> Any:
     # own cwd default rather than the wrong sidecar dir). No-op for non-SDK
     # providers, which ignore turn_context. (2026-06-22 fix.)
     conv_id = _openai_proxy_conv_id(request)
+    try:
+        preflight = preflight_messages(
+            messages,
+            tools=tools,
+            model=str(body.get("model") or getattr(llm, "model", "") or "jarvis-sidecar-chat"),
+            provider_call_index=1,
+            surface="openai_proxy",
+        )
+        provider_messages = preflight.messages
+    except ProviderPreflightError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
 
     if body.get("stream", True) is False:
         content_parts: list[str] = []
@@ -3560,7 +3631,7 @@ async def openai_compatible_chat_completions(request: Request) -> Any:
         turn_context.set(conv_id=conv_id)
         try:
             for chunk in llm.stream_chat_completions(
-                messages,
+                provider_messages,
                 tools=tools,
                 parallel_tool_calls=False if parallel_tool_calls is False else True,
                 stream=True,
@@ -3613,7 +3684,7 @@ async def openai_compatible_chat_completions(request: Request) -> Any:
         turn_context.set(conv_id=conv_id, stream_text_deltas=not _is_second_eyes)
         try:
             for chunk in llm.stream_chat_completions(
-                messages,
+                provider_messages,
                 tools=tools,
                 parallel_tool_calls=False if parallel_tool_calls is False else True,
                 stream=True,
@@ -4178,6 +4249,8 @@ def _format_raw_hits(
     hits: list[dict[str, Any]],
     *,
     current_origin_window: str | None = None,
+    query: str | None = None,
+    session_id: str | None = None,
 ) -> str:
     """Format raw JSONL hits into a bounded multi-line recall block.
 
@@ -4202,7 +4275,32 @@ def _format_raw_hits(
         lines.append(f"Q: {origin_label}{user}")
         lines.append(f"A: {assistant}")
         lines.append("")
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    capped_text, cap_meta = recall_budget.cap_block(text)
+    recall_trace.emit(
+        "recall_trace",
+        surface="raw_fallback",
+        conv_id=session_id,
+        **(recall_trace.query_fields(query or "") if query else {}),
+        candidates=[
+            {
+                "rank": idx,
+                "line": hit.get("line", "?"),
+                "turn": hit.get("turn", hit.get("line", "?")),
+                "user_chars": len(str(hit.get("user", ""))),
+                "assistant_chars": len(str(hit.get("assistant", ""))),
+                "served_policy": "head_clip",
+                "max_chars_per_field": max_chars_per_field,
+                "local_date": hit.get("local_date"),
+            }
+            for idx, hit in enumerate(hits, start=1)
+        ],
+        served_turns=[hit.get("turn", hit.get("line", "?")) for hit in hits],
+        served_chars=len(capped_text),
+        served_policy=cap_meta["served_policy"] if cap_meta["served_policy"] == "capped" else "head_clip",
+        cap=cap_meta,
+    )
+    return capped_text
 
 
 def _is_explicit_raw_recall_query(query: str) -> bool:

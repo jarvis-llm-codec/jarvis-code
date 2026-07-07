@@ -1,6 +1,6 @@
 param(
     [string] $InstallDir = $(if ($env:JARVIS_CODE_INSTALL_DIR) { $env:JARVIS_CODE_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "JARVIS-Code" }),
-    [string] $Repo = $(if ($env:JARVIS_CODE_REPO) { $env:JARVIS_CODE_REPO } else { "jarvis-llm-codec/jlc" }),
+    [string] $Repo = $(if ($env:JARVIS_CODE_REPO) { $env:JARVIS_CODE_REPO } else { "jarvis-llm-codec/jarvis-code" }),
     [string] $Branch = $(if ($env:JARVIS_CODE_BRANCH) { $env:JARVIS_CODE_BRANCH } else { "main" }),
     [string] $ArchiveUrl = $(if ($env:JARVIS_CODE_ARCHIVE_URL) { $env:JARVIS_CODE_ARCHIVE_URL } else { "" }),
     [switch] $NoPathUpdate,
@@ -404,7 +404,7 @@ function Download-Package {
 
     if (-not $ArchiveUrl) {
         if (-not $Repo) {
-            throw "Set JARVIS_CODE_REPO=jarvis-llm-codec/jlc or JARVIS_CODE_ARCHIVE_URL before running the remote installer."
+            throw "Set JARVIS_CODE_REPO=jarvis-llm-codec/jarvis-code or JARVIS_CODE_ARCHIVE_URL before running the remote installer."
         }
         $script:ArchiveUrl = "https://github.com/$Repo/archive/refs/heads/$Branch.zip"
     }

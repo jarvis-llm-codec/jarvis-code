@@ -6,19 +6,19 @@ installers and a shared Python launcher.
 ## Windows
 
 ```powershell
-irm https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
 ```
 
 Or with curl on Windows:
 
 ```powershell
-iex ((curl.exe -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/install.ps1) -join "`n")
+iex ((curl.exe -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1) -join "`n")
 ```
 
 ## macOS/Linux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | sh
 ```
 
 ## Requirements
@@ -45,7 +45,7 @@ Skip model preload when needed:
 
 ```powershell
 $env:JARVIS_CODE_NO_MODEL_PRELOAD = "1"
-irm https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
 ```
 
 Run diagnostics after install:
@@ -90,13 +90,13 @@ jarvis
 Windows:
 
 ```powershell
-irm https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/uninstall.ps1 | iex
+irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/uninstall.ps1 | iex
 ```
 
 macOS/Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/uninstall.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/uninstall.sh | sh
 ```
 
 Default uninstall removes the install directory and command shim. It does not
@@ -107,13 +107,13 @@ Optional full local JARVIS data removal:
 
 ```powershell
 $env:JARVIS_CODE_REMOVE_USER_DATA = "1"
-irm https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/uninstall.ps1 | iex
+irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/uninstall.ps1 | iex
 ```
 
 or:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/uninstall.sh | sh -s -- --remove-user-data
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/uninstall.sh | sh -s -- --remove-user-data
 ```
 
 ## Runtime Locations

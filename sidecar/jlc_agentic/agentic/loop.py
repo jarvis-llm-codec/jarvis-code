@@ -2,14 +2,44 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from typing import Any, Callable
 
+from jlc_agentic import recall_trace
+
+from .preflight import preflight_messages
 from .schema import ALL_TOOLS
 
 
 _tiktoken_enc = None
+_RECALL_TOOL_NAMES = {"recall_turn", "recall_turns"}
+_RECALL_CONTEXT_MARKERS = (
+    "[Recalled context",
+    "## Retrieved Prior Turns",
+    "[Auto raw recall",
+    "<auto_recall",
+)
+_DENIAL_AUDIT_PATTERNS = (
+    "answer: no record",
+    "no record",
+    "no records",
+    "not on record",
+    "not recorded",
+    "no stored record",
+    "no stored evidence",
+    "nothing found",
+    "nothing logged",
+    "cannot find",
+    "can't find",
+    "could not find",
+    "don't have any record",
+    "do not have any record",
+    "have no record",
+    "came up empty",
+)
+_RECENT_WINDOW_RE = re.compile(r"<recent_window>.*?</recent_window>", re.DOTALL)
 
 
 def _get_tiktoken_enc():
@@ -48,6 +78,35 @@ def _msg_text(m: dict[str, Any]) -> str:
 
 def _count_messages_tokens(messages: list[dict[str, Any]]) -> int:
     return sum(_count_tokens(_msg_text(m)) for m in (messages or []))
+
+
+def _strip_runtime_context(text: str) -> str:
+    value = text or ""
+    recall_end = "\n---RECALL_END---\n"
+    if "[Recalled context]\n" in value and recall_end in value:
+        value = value.split(recall_end, 1)[1]
+    value = _RECENT_WINDOW_RE.sub("", value)
+    return value.strip()
+
+
+def _last_user_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages or []):
+        if isinstance(message, dict) and message.get("role") == "user":
+            return _strip_runtime_context(_msg_text(message))
+    return ""
+
+
+def _history_has_recall_context(messages: list[dict[str, Any]]) -> bool:
+    for message in messages or []:
+        text = _msg_text(message)
+        if any(marker in text for marker in _RECALL_CONTEXT_MARKERS):
+            return True
+    return False
+
+
+def _looks_like_denial(text: str) -> bool:
+    lowered = (text or "").lower()[:1000]
+    return any(pattern in lowered for pattern in _DENIAL_AUDIT_PATTERNS)
 
 
 class AgenticLoop:
@@ -97,6 +156,7 @@ class AgenticLoop:
         self.last_call_in_tokens = 0
         self.last_call_out_tokens = 0
         self.last_call_think_tokens = 0
+        self._provider_call_index = 0
 
     def run(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         """Run loop and return final message with execution stats."""
@@ -115,6 +175,9 @@ class AgenticLoop:
         self.last_call_in_tokens = 0
         self.last_call_out_tokens = 0
         self.last_call_think_tokens = 0
+        self._provider_call_index = 0
+        recall_tool_called = False
+        auto_recall_present = _history_has_recall_context(history)
         # 2026-05-04 R3: capture user-facing content emitted alongside
         # tool_calls in earlier iterations. OpenAI/Anthropic spec allows an
         # assistant message to carry BOTH content and tool_calls (model says
@@ -333,6 +396,14 @@ class AgenticLoop:
                         "out_tokens": self.last_call_out_tokens,
                         "think_tokens": self.last_call_think_tokens,
                     })
+                self._emit_deny_gate_audit(
+                    final=final,
+                    halt_reason=halt_reason,
+                    tool_calls_made=tool_calls_made,
+                    recall_tool_called=recall_tool_called,
+                    auto_recall_present=auto_recall_present,
+                    history=history,
+                )
                 return {
                     "final_message": final,
                     "tool_calls_made": tool_calls_made,
@@ -362,6 +433,8 @@ class AgenticLoop:
                         "args": parsed_args,
                     }
                 )
+            if any(call.get("name") in _RECALL_TOOL_NAMES for call in normalized_calls):
+                recall_tool_called = True
             if self.on_tool_call is not None:
                 for call in normalized_calls:
                     try:
@@ -407,12 +480,50 @@ class AgenticLoop:
             "cumulative_chat_seconds": self.cumulative_chat_seconds,
         }
 
+    def _emit_deny_gate_audit(
+        self,
+        *,
+        final: str,
+        halt_reason: str,
+        tool_calls_made: int,
+        recall_tool_called: bool,
+        auto_recall_present: bool,
+        history: list[dict[str, Any]],
+    ) -> None:
+        final_is_denial = _looks_like_denial(final)
+        recall_observed = bool(recall_tool_called or auto_recall_present)
+        query = _last_user_text(history)
+        fields = recall_trace.query_fields(query) if query else {}
+        recall_trace.emit(
+            "deny_gate_audit",
+            provider_call_index=self._provider_call_index,
+            halt_reason=halt_reason,
+            tool_calls_made=tool_calls_made,
+            final_is_denial=final_is_denial,
+            recall_tool_called=recall_tool_called,
+            auto_recall_present=auto_recall_present,
+            recall_observed=recall_observed,
+            deny_gate_observed=bool(final_is_denial and recall_observed),
+            final_preview=recall_trace.preview_text(final),
+            **fields,
+        )
+
     def _call_llm_stream(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        self._provider_call_index += 1
+        model_name = str(getattr(self.llm_client, "model", "") or "")
+        preflight = preflight_messages(
+            messages,
+            tools=self.tools,
+            model=model_name,
+            provider_call_index=self._provider_call_index,
+            surface="agentic_loop",
+        )
+        messages = preflight.messages
         # Charge the FULL prompt sent to the API (system + history + tool
         # results so far) to the per-run counter — this is what the provider
         # actually bills, and is what `chat[in]` should reflect across N
         # internal turns instead of just the first call.
-        in_delta = _count_messages_tokens(messages)
+        in_delta = preflight.estimated_input_tokens
         self.last_call_in_tokens = in_delta
         self.cumulative_in_tokens += in_delta
         import os as _os

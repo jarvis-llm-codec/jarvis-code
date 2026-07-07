@@ -328,6 +328,7 @@ def recall_raw(query: str, top_k: int = 5, session_id: str = _SESSION_ID) -> lis
     terms = _recall_terms(query)
     hits: list[tuple[int, int, dict[str, Any]]] = []
     if path.exists():
+        ordinal_turn = 0
         for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
             try:
                 record = json.loads(line)
@@ -335,9 +336,13 @@ def recall_raw(query: str, top_k: int = 5, session_id: str = _SESSION_ID) -> lis
                 continue
             if record.get("kind") in {"encoder", "meter"}:
                 continue
+            ordinal_turn += 1
             score = _raw_recall_score(terms, str(record.get("user", "")), str(record.get("assistant", "")))
             if score > 0 or not terms:
-                hits.append((score, line_no, {"line": line_no, **record}))
+                hit = {"line": line_no, **record}
+                if not isinstance(hit.get("turn"), int):
+                    hit["turn"] = ordinal_turn
+                hits.append((score, line_no, hit))
     if paperlog_path.exists():
         for line_no, line in enumerate(paperlog_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
             parsed = _parse_paperlog_line(line)
@@ -527,6 +532,7 @@ def recall_raw_dates(query: str, top_k: int = 5, session_id: str = _SESSION_ID) 
     hits: list[dict[str, Any]] = []
     path = _session_path(session_id)
     if path.exists():
+        ordinal_turn = 0
         for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
             try:
                 record = json.loads(line)
@@ -536,9 +542,13 @@ def recall_raw_dates(query: str, top_k: int = 5, session_id: str = _SESSION_ID) 
                 continue
             if "user" not in record and "assistant" not in record:
                 continue
+            ordinal_turn += 1
             local_date = _timestamp_local_date(record.get("timestamp") or record.get("ts"))
             if local_date in wanted:
-                hits.append({"line": line_no, "local_date": local_date, **record})
+                hit = {"line": line_no, "local_date": local_date, **record}
+                if not isinstance(hit.get("turn"), int):
+                    hit["turn"] = ordinal_turn
+                hits.append(hit)
     paperlog_path = _paperlog_path(session_id)
     if paperlog_path.exists():
         for line_no, line in enumerate(paperlog_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):

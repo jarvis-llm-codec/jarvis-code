@@ -5,6 +5,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from jlc_agentic import recall_budget, recall_snippets, recall_trace
 from jlc_agentic.retriever import JLCRetriever
 try:
     from jarvis_sidecar.raw_store import extract_turn_numbers
@@ -127,9 +128,9 @@ async def _run_queries(
                     },
                 }
         result = await retriever.hybrid_search(
-            conv_id=conv_id,
             query=item["query"],
             top_k=item["top_k"],
+            session_id=conv_id,
         )
         return {
             "query": item["query"],
@@ -140,6 +141,71 @@ async def _run_queries(
     return await asyncio.gather(*(_one(item) for item in normalized))
 
 
+def _cap_result_fragments(results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    remaining = recall_budget.evidence_token_budget()
+    per_fragment = recall_budget.fragment_token_budget(remaining)
+    out: list[dict[str, Any]] = []
+    caps: list[dict[str, Any]] = []
+    snippets: list[dict[str, Any]] = []
+    for result_item in results:
+        item = dict(result_item)
+        result = item.get("result")
+        if not isinstance(result, dict):
+            out.append(item)
+            continue
+        fragments = [frag for frag in (result.get("fragments") or []) if isinstance(frag, dict)]
+        snippet_fragments, snippet_meta = recall_snippets.snippet_fragments(
+            fragments,
+            query=str(item.get("query") or ""),
+        )
+        capped_fragments, cap_meta = recall_budget.cap_fragments(
+            snippet_fragments,
+            total_budget_tokens=remaining,
+            per_fragment_tokens=per_fragment,
+        )
+        cap_meta = dict(cap_meta)
+        cap_meta["snippet"] = snippet_meta
+        remaining = max(0, remaining - int(cap_meta.get("served_tokens") or 0))
+        capped_result = dict(result)
+        capped_result["fragments"] = capped_fragments
+        capped_result["served_policy"] = (
+            cap_meta["served_policy"]
+            if cap_meta["served_policy"] == "capped"
+            else snippet_meta["served_policy"]
+        )
+        capped_result["cap"] = cap_meta
+        capped_result["snippet"] = snippet_meta
+        item["result"] = capped_result
+        caps.append(cap_meta)
+        snippets.append(snippet_meta)
+        out.append(item)
+    original_tokens = sum(int(cap.get("original_tokens") or 0) for cap in caps)
+    served_tokens = sum(int(cap.get("served_tokens") or 0) for cap in caps)
+    truncated = any(bool(cap.get("truncated")) for cap in caps)
+    snipped = any(bool(meta.get("truncated")) for meta in snippets)
+    return out, {
+        "served_policy": "capped" if truncated else "snipped" if snipped else "full",
+        "budget_tokens": recall_budget.evidence_token_budget(),
+        "per_fragment_budget_tokens": per_fragment,
+        "original_tokens": original_tokens,
+        "served_tokens": served_tokens,
+        "truncated_tokens": max(0, original_tokens - served_tokens),
+        "truncated": truncated,
+        "snippet": {
+            "served_policy": "snipped" if snipped else "full",
+            "original_chars": sum(int(meta.get("original_chars") or 0) for meta in snippets),
+            "served_chars": sum(int(meta.get("served_chars") or 0) for meta in snippets),
+            "truncated_chars": sum(
+                max(0, int(meta.get("original_chars") or 0) - int(meta.get("served_chars") or 0))
+                for meta in snippets
+            ),
+            "truncated": snipped,
+            "results": snippets,
+        },
+        "results": caps,
+    }
+
+
 def handler(
     queries: list[str | dict[str, Any]] | str | None = None,
     top_k: int = 5,
@@ -147,6 +213,7 @@ def handler(
     conv_id: str = "conversation",
     storage_root: str | None = None,
     retriever: JLCRetriever | None = None,
+    trace_surface: str = "recall_tool",
 ) -> dict:
     """Run batched retriever hybrid_search and return query-separated fragments.
 
@@ -169,4 +236,54 @@ def handler(
     if not normalized:
         return {"ok": False, "results": [], "error": "queries must contain at least one query"}
     results = asyncio.run(_run_queries(retriever, conv_id=conv_id, normalized=normalized))
-    return {"ok": True, "results": results, "query_count": len(results)}
+    results, cap_meta = _cap_result_fragments(results)
+    candidates: list[dict[str, Any]] = []
+    served_turns: list[Any] = []
+    for result_item in results:
+        result = result_item.get("result") if isinstance(result_item, dict) else None
+        if not isinstance(result, dict):
+            continue
+        for rank, frag in enumerate(result.get("fragments") or [], start=1):
+            if not isinstance(frag, dict):
+                continue
+            served_turns.append(frag.get("turn"))
+            candidates.append({
+                "query": result_item.get("query"),
+                "rank": rank,
+                "turn": frag.get("turn"),
+                "score": frag.get("score", 0.0),
+                "source": result.get("source", "hybrid"),
+                "user_chars": len(str(frag.get("user", ""))),
+                "assistant_chars": len(str(frag.get("assistant", ""))),
+            })
+    recall_trace.emit(
+        "recall_trace",
+        surface=trace_surface,
+        conv_id=conv_id,
+        query_count=len(results),
+        queries=[
+            {
+                "query_sha256": recall_trace.sha256_text(item["query"]),
+                "query_preview": recall_trace.preview_text(item["query"]),
+                "top_k": item["top_k"],
+            }
+            for item in normalized
+        ],
+        candidates=candidates,
+        served_turns=served_turns,
+        served_chars=sum(
+            len(str(frag.get("user", ""))) + len(str(frag.get("assistant", "")))
+            for result_item in results
+            for frag in ((result_item.get("result") or {}).get("fragments") or [])
+            if isinstance(frag, dict)
+        ),
+        served_policy=cap_meta["served_policy"],
+        cap=cap_meta,
+    )
+    return {
+        "ok": True,
+        "results": results,
+        "query_count": len(results),
+        "served_policy": cap_meta["served_policy"],
+        "cap": cap_meta,
+    }

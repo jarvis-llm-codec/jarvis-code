@@ -54,3 +54,4 @@
 {"ts":"2026-07-06T08:20:33.564Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
 {"ts":"2026-07-06T08:22:00.059Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
 {"ts":"2026-07-06T08:27:21.031Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}
+{"ts":"2026-07-06T21:13:56.460Z","map_id":"m_seed","seq":1,"kind":"verdict","feature_id":"f1","verdict":"pass","evidence":"npm test green","rejections_after":0,"stage_after":"normal"}

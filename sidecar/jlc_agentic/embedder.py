@@ -23,6 +23,34 @@ def configure_hf_public_download_env() -> None:
 configure_hf_public_download_env()
 
 
+def resolve_embedder_device(requested: str) -> str:
+    """Resolve the configured device to a concrete torch device.
+
+    "auto" picks cuda when torch can actually see one, else cpu. An explicit
+    "cuda" request on a machine without CUDA falls back to cpu with a loud
+    stderr warning instead of crashing the encode pipeline.
+    """
+    device = (requested or "auto").strip().lower()
+    if device == "cpu":
+        return "cpu"
+    try:
+        import torch
+
+        cuda_ok = bool(torch.cuda.is_available())
+    except Exception:
+        cuda_ok = False
+    if device == "auto":
+        return "cuda" if cuda_ok else "cpu"
+    if device.startswith("cuda") and not cuda_ok:
+        print(
+            f"[jlc:embedder] device={requested} requested but torch.cuda.is_available()=False "
+            "(cpu-only torch wheel or missing NVIDIA driver) — falling back to cpu",
+            file=sys.stderr,
+        )
+        return "cpu"
+    return device
+
+
 class LocalEmbedder:
     """Lazy-loading sentence-transformers wrapper for BAAI/bge-m3 (dim=1024)."""
 
@@ -30,11 +58,11 @@ class LocalEmbedder:
         self,
         model_name: str = "BAAI/bge-m3",
         cache_dir: str | None = None,
-        device: str = "cpu",
+        device: str = "auto",
     ) -> None:
         self._model_name = model_name
         self._cache_dir = str(Path(cache_dir).expanduser()) if cache_dir else None
-        self._device = device
+        self._device = resolve_embedder_device(device)
         self._model: Any | None = None
         self._load_failed = False
         # Dim is detected from the model after lazy load; 1024 is the bge-m3
@@ -74,6 +102,10 @@ class LocalEmbedder:
                     self._dim = detected
             except Exception:
                 pass
+            print(
+                f"[jlc:embedder] {self._model_name} loaded on device={self._device} (dim={self._dim})",
+                file=sys.stderr,
+            )
             return self._model
         except Exception as exc:
             # Distinguish permanent (CUDA missing, no module) from transient

@@ -18,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from . import recall_budget, recall_snippets, recall_trace
+
 try:
     from jarvis_sidecar.file_locks import cross_process_file_lock, locked_append_text, locked_atomic_write_text
 except Exception:  # pragma: no cover - standalone jlc_agentic mode
@@ -663,6 +665,7 @@ class JarvisAgentic:
             self._embedder = LocalEmbedder(
                 model_name=self.config.embedder.model_name,
                 cache_dir=self.config.embedder.cache_dir,
+                device=self.config.embedder.device,
             )
             # Inject embedder into retriever/jre that were created with None
             self.retriever._embedder = self._embedder
@@ -1024,6 +1027,7 @@ class JarvisAgentic:
                     return self._format_recall_fragments(
                         fragments=fragments,
                         confidence="HIGH",
+                        query=query,
                         source="turn_number",
                     )
         if callable(extract_local_dates):
@@ -1035,6 +1039,7 @@ class JarvisAgentic:
                     return self._format_recall_fragments(
                         fragments=fragments,
                         confidence="HIGH",
+                        query=query,
                         source="date",
                     )
         result_holder: list[Any] = []
@@ -1070,21 +1075,26 @@ class JarvisAgentic:
         if cur_rank < min_rank:
             return _empty
 
-        return self._format_recall_fragments(fragments=fragments, confidence=confidence)
+        return self._format_recall_fragments(fragments=fragments, confidence=confidence, query=query)
 
     def _format_recall_fragments(
         self,
         *,
         fragments: list[dict[str, Any]],
         confidence: str,
+        query: str = "",
         source: str | None = None,
     ) -> dict[str, Any]:
+        snippet_fragments, snippet_meta = recall_snippets.snippet_fragments(fragments, query=query)
+        served_fragments, cap_meta = recall_budget.cap_fragments(snippet_fragments)
+        cap_meta = dict(cap_meta)
+        cap_meta["snippet"] = snippet_meta
         label = f"[Recalled context — confidence={confidence}]"
         if source:
             label = f"[Recalled context — confidence={confidence}, source={source}]"
         lines = [label]
         current_origin_window = getattr(self, "_pair8", None)
-        for frag in fragments:
+        for frag in served_fragments:
             turn = frag.get("turn", "?")
             score = frag.get("score", 0.0)
             local_date = frag.get("local_date")
@@ -1095,16 +1105,57 @@ class JarvisAgentic:
             origin_label = _origin_recall_label(frag, current_origin_window=current_origin_window)
             suffix = f" | {local_date}" if local_date else ""
             lines.append(f"--- turn {turn}{suffix} (score={score}) ---")
-            lines.append(f"Q: {origin_label}{user}")
-            lines.append(f"A: {assistant}")
+            snippet = frag.get("snippet") if not frag.get("capped") else None
+            if snippet:
+                rendered = str(snippet)
+                if origin_label and rendered.startswith("Q: "):
+                    rendered = f"Q: {origin_label}{rendered[3:]}"
+                lines.append(rendered)
+            else:
+                lines.append(f"Q: {origin_label}{user}")
+                lines.append(f"A: {assistant}")
             lines.append("")  # blank line between turns
         lines.append(
             "Use these recalled turns when answering. Cite by turn number."
         )
         text = "\n".join(lines) + "\n"
-        result: dict[str, Any] = {"text": text, "fragments": fragments, "confidence": confidence}
+        result: dict[str, Any] = {
+            "text": text,
+            "fragments": served_fragments,
+            "confidence": confidence,
+            "served_policy": (
+                cap_meta["served_policy"]
+                if cap_meta["served_policy"] == "capped"
+                else snippet_meta["served_policy"]
+            ),
+            "cap": cap_meta,
+            "snippet": snippet_meta,
+        }
         if source:
             result["source"] = source
+        recall_trace.emit(
+            "recall_trace",
+            surface="slim._format_recall_fragments",
+            source=source or "hybrid",
+            confidence=confidence,
+            candidates=[
+                {
+                    "rank": idx,
+                    "turn": frag.get("turn"),
+                    "score": frag.get("score", 0.0),
+                    "user_chars": len(str(frag.get("user", ""))),
+                    "assistant_chars": len(str(frag.get("assistant", ""))),
+                    "snippet_policy": frag.get("snippet_policy"),
+                    "snippet_method": frag.get("snippet_method"),
+                    "served_policy": cap_meta["served_policy"],
+                }
+                for idx, frag in enumerate(served_fragments, start=1)
+            ],
+            served_turns=[frag.get("turn") for frag in served_fragments],
+            served_chars=len(text),
+            served_policy=cap_meta["served_policy"],
+            cap=cap_meta,
+        )
         return result
 
 

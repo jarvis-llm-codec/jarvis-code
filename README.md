@@ -80,7 +80,7 @@ Run integrity: 0 timeouts · 0 modified test files (hash-checked) · 0 benchmark
 **Windows** (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
 ```
 
 Missing prerequisites (Node.js, Python, Git, MSVC redistributable) are installed via `winget` when available. The installer also preloads the local `BAAI/bge-m3` embedding model (~2.3 GB) unless `JARVIS_CODE_NO_MODEL_PRELOAD=1` is set.
@@ -137,7 +137,7 @@ Long session history is stored locally for recall, while the live engine keeps o
 **Windows** (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/jarvis-llm-codec/jlc/main/uninstall.ps1 | iex
+irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/uninstall.ps1 | iex
 ```
 
 Uninstall removes the install directory and command shim. User data under `~/.jarvis-code` and the model cache are kept unless explicit removal options are set.
