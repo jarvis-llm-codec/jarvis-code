@@ -22,10 +22,13 @@ irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.
 |---|---|
 | 앱 + Node 의존성 | ~580 MB |
 | Python 사이드카 (PyTorch CPU 포함) | ~1.3 GB |
+| NVIDIA CUDA PyTorch — `nvidia-smi`가 감지될 때만 | ~2.7 GB 다운로드 |
 | `bge-m3` 임베딩 모델 — **회상 담당 (필수)** | ~2.3 GB 다운로드 · 디스크 ~4.3 GB |
 | 전제조건 (Node 20+, Python 3.10+, Git, MSVC) — *없을 때만* | ~0.5 GB |
 
-**총 ≈ 6 GB** (전제조건은 없을 때만 추가). 회상은 **BM25 + bge-m3** 하이브리드(키워드 + 시맨틱)라 모델은 선택이 아니라 **핵심** — `JARVIS_CODE_NO_MODEL_PRELOAD=1`은 다운로드를 첫 사용으로 **미룰 뿐** 의존성을 없애진 않음. 메모리 데이터(`~/.jarvis-code`)는 작게 시작해 천천히 늘어남.
+**CPU 설치는 총 ≈ 6 GB, NVIDIA 설치는 여기에 ~2.7 GB가 더해질 수 있음** (전제조건은 없을 때만 추가). 회상은 **BM25 + bge-m3** 하이브리드(키워드 + 시맨틱)라 모델은 선택이 아니라 **핵심** — `JARVIS_CODE_NO_MODEL_PRELOAD=1`은 다운로드를 첫 사용으로 **미룰 뿐** 의존성을 없애진 않음. 메모리 데이터(`~/.jarvis-code`)는 작게 시작해 천천히 늘어남.
+
+`nvidia-smi`가 있고 정상 실행되면 Windows 인스톨러가 PyTorch의 `cu126` 휠 인덱스에서 CUDA PyTorch를 먼저 설치한 뒤 사이드카 의존성을 설치합니다. CPU PyTorch를 강제하려면 설치 전에 `JARVIS_CODE_CPU_ONLY=1`을 설정하세요.
 
 ---
 
@@ -33,6 +36,12 @@ irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.
 
 ```
 jarvis
+```
+
+수동/소스 설치처럼 사이드카 의존성이 미리 설치되지 않은 경우 첫 실행이 몇 분 걸릴 수 있습니다. JARVIS는 처음 세 번 실행 동안 사이드카 창을 자동으로 보여줍니다. 문제 확인이나 재설치 검증 때는 이렇게 시작하세요:
+
+```
+jarvis --sidecar-window
 ```
 
 첫 실행 시 안내해줍니다:

@@ -350,7 +350,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const getEnabledPaths = (
 			resources: Array<{ path: string; enabled: boolean; metadata: PathMetadata }>,
 		): string[] => getEnabledResources(resources).map((r) => r.path);
-		const enabledExtensions = getEnabledPaths(resolvedPaths.extensions);
+		const enabledExtensions = getEnabledResources(resolvedPaths.extensions)
+			.filter((resource) => resource.metadata.scope !== "project")
+			.map((resource) => resource.path);
 		const enabledSkillResources = getEnabledResources(resolvedPaths.skills);
 		const enabledPrompts = getEnabledPaths(resolvedPaths.prompts);
 		const enabledThemes = getEnabledPaths(resolvedPaths.themes);

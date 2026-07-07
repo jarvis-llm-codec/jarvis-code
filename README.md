@@ -83,7 +83,7 @@ Run integrity: 0 timeouts · 0 modified test files (hash-checked) · 0 benchmark
 irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
 ```
 
-Missing prerequisites (Node.js, Python, Git, MSVC redistributable) are installed via `winget` when available. The installer also preloads the local `BAAI/bge-m3` embedding model (~2.3 GB) unless `JARVIS_CODE_NO_MODEL_PRELOAD=1` is set.
+Missing prerequisites (Node.js, Python, Git, MSVC redistributable) are installed via `winget` when available. The installer also preloads the local `BAAI/bge-m3` embedding model (~2.3 GB) unless `JARVIS_CODE_NO_MODEL_PRELOAD=1` is set. On NVIDIA machines, the Windows installer detects `nvidia-smi` and installs CUDA PyTorch from PyTorch's `cu126` wheel index before the rest of the sidecar dependencies; set `JARVIS_CODE_CPU_ONLY=1` before install to force CPU PyTorch.
 
 > After install, **open a new terminal** so the `jarvis` command is on your PATH.
 
@@ -98,12 +98,19 @@ Everything installs under `%LOCALAPPDATA%\JARVIS-Code`. Rough footprint on a fre
 | App — engine + sidecar + skills/theme | ~16 MB |
 | Node dependencies | ~560 MB |
 | Python sidecar (incl. PyTorch, CPU) | ~1.3 GB |
+| NVIDIA CUDA PyTorch — *only when `nvidia-smi` is detected* | ~2.7 GB download |
 | `bge-m3` embedding model — **powers recall (required)** | ~2.3 GB download · ~4.3 GB on disk |
 | Prerequisites — Node 20+, Python 3.10+, Git, MSVC — *only if missing* | ~0.5 GB |
 
-**Total ≈ 6 GB** (plus prerequisites if you don't already have them). Recall runs on a **BM25 + bge-m3** hybrid — keyword search plus semantic embeddings — so the model is core, not optional; `JARVIS_CODE_NO_MODEL_PRELOAD=1` only **defers** its download to first use. Your memory data under `~/.jarvis-code` starts small and grows slowly with use.
+**Total ≈ 6 GB on CPU installs; NVIDIA installs can be ~2.7 GB larger** (plus prerequisites if you don't already have them). Recall runs on a **BM25 + bge-m3** hybrid — keyword search plus semantic embeddings — so the model is core, not optional; `JARVIS_CODE_NO_MODEL_PRELOAD=1` only **defers** its download to first use. Your memory data under `~/.jarvis-code` starts small and grows slowly with use.
 
 ## ▶️ First run
+
+First launch may take several minutes if dependencies were not preinstalled, especially after a manual/source install. The first three launches automatically show the sidecar window so you can see setup progress. For troubleshooting or reinstall verification, you can always run:
+
+```bash
+jarvis --sidecar-window
+```
 
 JARVIS CODE needs one LLM credential before it opens.
 

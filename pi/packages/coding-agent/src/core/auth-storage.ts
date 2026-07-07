@@ -14,8 +14,9 @@ import {
 	type OAuthProviderId,
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { dirname, join } from "path";
+import { randomUUID } from "crypto";
+import fs from "fs";
+import { basename, dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
@@ -44,6 +45,40 @@ type LockResult<T> = {
 	next?: string;
 };
 
+const AUTH_FILE_MODE = 0o600;
+const AUTH_FILE_WRITE_OPTIONS = { encoding: "utf-8", mode: AUTH_FILE_MODE } as const;
+
+function isErrorWithCode(error: unknown, code: string): boolean {
+	return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
+}
+
+function createAuthFileIfMissing(authPath: string): void {
+	try {
+		fs.writeFileSync(authPath, "{}", { ...AUTH_FILE_WRITE_OPTIONS, flag: "wx" });
+		fs.chmodSync(authPath, AUTH_FILE_MODE);
+	} catch (error) {
+		if (!isErrorWithCode(error, "EEXIST")) {
+			throw error;
+		}
+	}
+}
+
+function writeAuthFileAtomic(authPath: string, content: string): void {
+	const dir = dirname(authPath);
+	const tempPath = join(dir, `.${basename(authPath)}.${process.pid}.${randomUUID()}.tmp`);
+
+	try {
+		fs.writeFileSync(tempPath, content, { ...AUTH_FILE_WRITE_OPTIONS, flag: "wx" });
+		fs.chmodSync(tempPath, AUTH_FILE_MODE);
+		fs.renameSync(tempPath, authPath);
+	} catch (error) {
+		try {
+			fs.rmSync(tempPath, { force: true });
+		} catch {}
+		throw error;
+	}
+}
+
 export interface AuthStorageBackend {
 	withLock<T>(fn: (current: string | undefined) => LockResult<T>): T;
 	withLockAsync<T>(fn: (current: string | undefined) => Promise<LockResult<T>>): Promise<T>;
@@ -54,15 +89,14 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 
 	private ensureParentDir(): void {
 		const dir = dirname(this.authPath);
-		if (!existsSync(dir)) {
-			mkdirSync(dir, { recursive: true, mode: 0o700 });
+		if (!fs.existsSync(dir)) {
+			fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 		}
 	}
 
 	private ensureFileExists(): void {
-		if (!existsSync(this.authPath)) {
-			writeFileSync(this.authPath, "{}", "utf-8");
-			chmodSync(this.authPath, 0o600);
+		if (!fs.existsSync(this.authPath)) {
+			createAuthFileIfMissing(this.authPath);
 		}
 	}
 
@@ -100,11 +134,10 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		let release: (() => void) | undefined;
 		try {
 			release = this.acquireLockSyncWithRetry(this.authPath);
-			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
+			const current = fs.existsSync(this.authPath) ? fs.readFileSync(this.authPath, "utf-8") : undefined;
 			const { result, next } = fn(current);
 			if (next !== undefined) {
-				writeFileSync(this.authPath, next, "utf-8");
-				chmodSync(this.authPath, 0o600);
+				writeAuthFileAtomic(this.authPath, next);
 			}
 			return result;
 		} finally {
@@ -144,12 +177,11 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			});
 
 			throwIfCompromised();
-			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
+			const current = fs.existsSync(this.authPath) ? fs.readFileSync(this.authPath, "utf-8") : undefined;
 			const { result, next } = await fn(current);
 			throwIfCompromised();
 			if (next !== undefined) {
-				writeFileSync(this.authPath, next, "utf-8");
-				chmodSync(this.authPath, 0o600);
+				writeAuthFileAtomic(this.authPath, next);
 			}
 			throwIfCompromised();
 			return result;

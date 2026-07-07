@@ -38,6 +38,11 @@ IMAGE_EXTENSION_PATH = PI_ROOT / "packages" / "coding-agent" / "examples" / "ext
 DOCTOR_SCRIPT = ROOT / "scripts" / "jarvis-doctor.py"
 AUTH_SCRIPT = ROOT / "scripts" / "jarvis-auth.py"
 MAX_WINDOW_LABEL_CHARS = 32
+AUTO_SIDECAR_WINDOW_RUNS = 3
+FIRST_RUN_COUNT_PATH = DATA_DIR / "first_run_count.json"
+PYTORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu126"
+PYTORCH_CUDA_INSTALL_NOTE = "~2.7 GB, several minutes"
+SIDECAR_REQUIREMENTS_INSTALL_NOTE = "~1.3 GB, first run only, takes minutes"
 
 AUTH_COMMANDS = {
     "gpt-login",
@@ -87,6 +92,7 @@ BUILT_IN_MODEL_PROVIDERS = {
     "xiaomi-token-plan-ams",
     "xiaomi-token-plan-sgp",
 }
+SIDECAR_ROUTED_MODEL_PROVIDERS = {"anthropic-agent-sdk"}
 
 
 def is_windows() -> bool:
@@ -107,6 +113,48 @@ def tsx_path() -> Path:
 
 def truthy(value: str | None) -> bool:
     return value is not None and value.lower() in {"1", "true", "yes", "on"}
+
+
+def cpu_only_requested() -> bool:
+    return truthy(os.environ.get("JARVIS_CODE_CPU_ONLY"))
+
+
+def detect_nvidia_gpu() -> str | None:
+    """Return an NVIDIA GPU name when nvidia-smi exists and runs successfully."""
+    if cpu_only_requested():
+        return None
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return None
+    try:
+        result = subprocess.run(
+            [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            name = line.strip()
+            if name:
+                return name
+        return "NVIDIA GPU"
+    try:
+        probe = subprocess.run(
+            [nvidia_smi],
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return "NVIDIA GPU" if probe.returncode == 0 else None
 
 
 def sanitize_window_label(value: str | None) -> str | None:
@@ -231,13 +279,15 @@ def model_registered_in_pi_models(provider: str, model: str) -> bool:
 
 
 def launchable_config_model(provider: str, model: str) -> bool:
+    if provider in SIDECAR_ROUTED_MODEL_PROVIDERS:
+        return False
     if provider in BUILT_IN_MODEL_PROVIDERS:
         return True
     return model_registered_in_pi_models(provider, model)
 
 
 def sidecar_routed_provider(provider: str) -> bool:
-    return provider == "anthropic-agent-sdk"
+    return provider in SIDECAR_ROUTED_MODEL_PROVIDERS
 
 
 def sidecar_routed_launch_args(provider: str, model: str, config_path: Path) -> list[str]:
@@ -549,6 +599,45 @@ def run_checked(command: list[str], cwd: Path | None = None) -> None:
         raise SystemExit(result.returncode)
 
 
+def install_sidecar_requirements(py: Path) -> None:
+    print(f"[jarvis] installing sidecar requirements ({SIDECAR_REQUIREMENTS_INSTALL_NOTE})")
+    run_checked(
+        [
+            str(py),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--quiet",
+            "--upgrade",
+            "pip",
+            "setuptools<82",
+            "wheel",
+        ],
+    )
+    gpu_name = detect_nvidia_gpu()
+    if gpu_name:
+        print(
+            f"[jarvis] NVIDIA GPU detected ({gpu_name}) - installing CUDA PyTorch "
+            f"({PYTORCH_CUDA_INSTALL_NOTE})",
+        )
+        run_checked(
+            [
+                str(py),
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--index-url",
+                PYTORCH_CUDA_INDEX_URL,
+                "torch",
+            ],
+        )
+    elif cpu_only_requested():
+        print("[jarvis] JARVIS_CODE_CPU_ONLY=1 - using CPU PyTorch packages")
+    run_checked([str(py), "-m", "pip", "install", "--disable-pip-version-check", "-r", str(SIDECAR_ROOT / "requirements.txt")])
+
+
 def ensure_sidecar_venv() -> Path:
     py = venv_python()
     if py.exists():
@@ -560,10 +649,45 @@ def ensure_sidecar_venv() -> Path:
     if not py.exists():
         raise SystemExit(f"failed to create sidecar venv at {SIDECAR_VENV}")
 
-    print("[jarvis] installing sidecar requirements")
-    run_checked([str(py), "-m", "pip", "install", "--disable-pip-version-check", "--quiet", "--upgrade", "pip", "setuptools<82", "wheel"])
-    run_checked([str(py), "-m", "pip", "install", "--disable-pip-version-check", "-r", str(SIDECAR_ROOT / "requirements.txt")])
+    install_sidecar_requirements(py)
     return py
+
+
+def _read_first_run_count() -> int:
+    try:
+        data = json.loads(FIRST_RUN_COUNT_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    try:
+        value = int(data.get("count", 0))
+    except (AttributeError, TypeError, ValueError):
+        return 0
+    return max(0, value)
+
+
+def _write_first_run_count(count: int) -> None:
+    payload = {
+        "count": count,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    try:
+        FIRST_RUN_COUNT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        FIRST_RUN_COUNT_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def apply_first_run_sidecar_window(args: list[str]) -> None:
+    if skip_sidecar(args):
+        return
+    previous_count = _read_first_run_count()
+    _write_first_run_count(previous_count + 1)
+    if previous_count < AUTO_SIDECAR_WINDOW_RUNS:
+        os.environ["JARVIS_SHOW_SIDECAR_WINDOW"] = "1"
+        print(
+            f"[jarvis] showing sidecar window for first-run visibility "
+            f"({previous_count + 1}/{AUTO_SIDECAR_WINDOW_RUNS})",
+        )
 
 
 def sidecar_env() -> dict[str, str]:
@@ -613,15 +737,19 @@ def start_sidecar(args: list[str]) -> subprocess.Popen[str] | None:
         return None
 
     py = ensure_sidecar_venv()
-    proc = subprocess.Popen(
-        [str(py), "-m", "jarvis_sidecar"],
-        cwd=str(SIDECAR_ROOT),
-        env=sidecar_env(),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
+    show_sidecar_window = truthy(os.environ.get("JARVIS_SHOW_SIDECAR_WINDOW"))
+    popen_kwargs: dict[str, object] = {
+        "cwd": str(SIDECAR_ROOT),
+        "env": sidecar_env(),
+        "stdin": subprocess.DEVNULL,
+        "text": True,
+    }
+    if show_sidecar_window and is_windows():
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    else:
+        popen_kwargs["stdout"] = subprocess.DEVNULL
+        popen_kwargs["stderr"] = subprocess.DEVNULL
+    proc = subprocess.Popen([str(py), "-m", "jarvis_sidecar"], **popen_kwargs)
 
     deadline = time.time() + 20
     while time.time() < deadline:
@@ -736,6 +864,7 @@ def main(argv: Iterable[str]) -> int:
             auth_code = run_auth_preflight()
             if auth_code != 0:
                 return auth_code
+            apply_first_run_sidecar_window(args)
         sidecar_proc = start_sidecar(args)
         return run_agent(args, config_path)
     finally:

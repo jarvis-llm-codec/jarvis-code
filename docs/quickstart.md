@@ -22,10 +22,13 @@ Everything lands under `%LOCALAPPDATA%\JARVIS-Code`. Rough sizes on a fresh mach
 |---|---|
 | App + Node dependencies | ~580 MB |
 | Python sidecar (incl. PyTorch, CPU) | ~1.3 GB |
+| NVIDIA CUDA PyTorch — *only when `nvidia-smi` is detected* | ~2.7 GB download |
 | `bge-m3` embedding model — **powers recall (required)** | ~2.3 GB download · ~4.3 GB on disk |
 | Prerequisites (Node 20+, Python 3.10+, Git, MSVC) — *only if missing* | ~0.5 GB |
 
-**≈ 6 GB total** (plus prerequisites if missing). Recall is a **BM25 + bge-m3** hybrid — keyword + semantic — so the model is core, not optional; `JARVIS_CODE_NO_MODEL_PRELOAD=1` only defers its download to first use. Memory data under `~/.jarvis-code` starts small and grows slowly.
+**≈ 6 GB total on CPU installs; NVIDIA installs can be ~2.7 GB larger** (plus prerequisites if missing). Recall is a **BM25 + bge-m3** hybrid — keyword + semantic — so the model is core, not optional; `JARVIS_CODE_NO_MODEL_PRELOAD=1` only defers its download to first use. Memory data under `~/.jarvis-code` starts small and grows slowly.
+
+If `nvidia-smi` is present and working, the Windows installer installs CUDA PyTorch from PyTorch's `cu126` wheel index before the rest of the sidecar requirements. To force CPU PyTorch, set `JARVIS_CODE_CPU_ONLY=1` before installing.
 
 ---
 
@@ -33,6 +36,12 @@ Everything lands under `%LOCALAPPDATA%\JARVIS-Code`. Rough sizes on a fresh mach
 
 ```
 jarvis
+```
+
+First launch can take several minutes if the sidecar dependencies were not already installed, especially after a manual/source install. JARVIS automatically shows the sidecar window for the first three launches. For troubleshooting, start with:
+
+```
+jarvis --sidecar-window
 ```
 
 On first launch it walks you through:

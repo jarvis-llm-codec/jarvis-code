@@ -67,6 +67,41 @@ function Test-RequireModelPreload {
     return $RequireModelPreload -or ($env:JARVIS_CODE_REQUIRE_MODEL_PRELOAD -eq "1")
 }
 
+$PyTorchCudaIndexUrl = "https://download.pytorch.org/whl/cu126"
+$PyTorchCudaInstallNote = "~2.7 GB, several minutes"
+$SidecarRequirementsInstallNote = "~1.3 GB, first run only, takes minutes"
+
+function Test-JarvisTruthy {
+    param([AllowEmptyString()][string] $Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    return @("1", "true", "yes", "on") -contains $Value.ToLowerInvariant()
+}
+
+function Test-JarvisCpuOnlyInstall {
+    return Test-JarvisTruthy -Value $env:JARVIS_CODE_CPU_ONLY
+}
+
+function Get-JarvisNvidiaGpuName {
+    if (Test-JarvisCpuOnlyInstall) { return $null }
+    $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if (-not $nvidiaSmi) { return $null }
+    try {
+        $names = @(& $nvidiaSmi.Source --query-gpu=name --format=csv,noheader 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+            foreach ($name in $names) {
+                $trimmed = ([string]$name).Trim()
+                if ($trimmed) { return $trimmed }
+            }
+            return "NVIDIA GPU"
+        }
+        $null = & $nvidiaSmi.Source 2>$null
+        if ($LASTEXITCODE -eq 0) { return "NVIDIA GPU" }
+    } catch {
+        return $null
+    }
+    return $null
+}
+
 function Update-ProcessPath {
     $parts = @()
     foreach ($scope in @("Machine", "User")) {
@@ -464,9 +499,19 @@ function Install-SidecarVenv {
         Invoke-Python -Python $python -CommandArgs @("-m", "venv", $venvDir)
         if ($LASTEXITCODE -ne 0) { throw "python -m venv failed with exit code $LASTEXITCODE" }
     }
-    Write-Step "installing sidecar Python dependencies"
+    Write-Step "installing sidecar Python dependencies ($SidecarRequirementsInstallNote)"
     & $venvPython -m pip install --disable-pip-version-check --quiet --upgrade pip "setuptools<82" wheel
     if ($LASTEXITCODE -ne 0) { throw "pip bootstrap failed with exit code $LASTEXITCODE" }
+    $nvidiaGpuName = Get-JarvisNvidiaGpuName
+    if ($nvidiaGpuName) {
+        Write-Step "NVIDIA GPU detected ($nvidiaGpuName) - installing CUDA PyTorch ($PyTorchCudaInstallNote)"
+        & $venvPython -m pip install --disable-pip-version-check --index-url $PyTorchCudaIndexUrl torch
+        if ($LASTEXITCODE -ne 0) {
+            throw "CUDA PyTorch install failed with exit code $LASTEXITCODE. Set JARVIS_CODE_CPU_ONLY=1 to force CPU PyTorch."
+        }
+    } elseif (Test-JarvisCpuOnlyInstall) {
+        Write-Step "JARVIS_CODE_CPU_ONLY=1 - using CPU PyTorch packages"
+    }
     & $venvPython -m pip install --disable-pip-version-check -r (Join-Path $sidecarRoot "requirements.txt")
     if ($LASTEXITCODE -ne 0) { throw "pip install failed with exit code $LASTEXITCODE" }
 }

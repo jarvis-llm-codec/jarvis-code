@@ -21,6 +21,42 @@ $FaceExtensionPath = Join-Path $PiRoot "packages\coding-agent\examples\extension
 $ImageExtensionPath = Join-Path $PiRoot "packages\coding-agent\examples\extensions\jarvis-image.ts"
 $DataDir = Join-Path $Root "data"
 $WrapperLogPath = Join-Path $DataDir "jarvis-wrapper.log"
+$FirstRunCountPath = Join-Path $DataDir "first_run_count.json"
+$AutoSidecarWindowRuns = 3
+$PyTorchCudaIndexUrl = "https://download.pytorch.org/whl/cu126"
+$PyTorchCudaInstallNote = "~2.7 GB, several minutes"
+$SidecarRequirementsInstallNote = "~1.3 GB, first run only, takes minutes"
+
+function Test-JarvisTruthy {
+    param([AllowEmptyString()][string] $Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    return @("1", "true", "yes", "on") -contains $Value.ToLowerInvariant()
+}
+
+function Test-JarvisCpuOnlyInstall {
+    return Test-JarvisTruthy -Value $env:JARVIS_CODE_CPU_ONLY
+}
+
+function Get-JarvisNvidiaGpuName {
+    if (Test-JarvisCpuOnlyInstall) { return $null }
+    $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if (-not $nvidiaSmi) { return $null }
+    try {
+        $names = @(& $nvidiaSmi.Source --query-gpu=name --format=csv,noheader 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+            foreach ($name in $names) {
+                $trimmed = ([string]$name).Trim()
+                if ($trimmed) { return $trimmed }
+            }
+            return "NVIDIA GPU"
+        }
+        $null = & $nvidiaSmi.Source 2>$null
+        if ($LASTEXITCODE -eq 0) { return "NVIDIA GPU" }
+    } catch {
+        return $null
+    }
+    return $null
+}
 
 function Get-JarvisPairRuntimePrefix {
     param([string] $PairId)
@@ -216,6 +252,46 @@ function Read-JarvisRuntimeLabel {
     }
 }
 
+function Get-JarvisFirstRunCount {
+    if (-not (Test-Path $FirstRunCountPath)) { return 0 }
+    try {
+        $payload = Get-Content -LiteralPath $FirstRunCountPath -Raw | ConvertFrom-Json
+        $count = 0
+        if ([int]::TryParse([string]$payload.count, [ref]$count) -and $count -gt 0) {
+            return $count
+        }
+    } catch {
+        return 0
+    }
+    return 0
+}
+
+function Set-JarvisFirstRunCount {
+    param([int] $Count)
+    try {
+        if (-not (Test-Path $DataDir)) {
+            New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+        }
+        $payload = [ordered]@{
+            count = $Count
+            updated_at = (Get-Date).ToUniversalTime().ToString("o")
+        }
+        Write-Utf8NoBomFile -Path $FirstRunCountPath -Content (($payload | ConvertTo-Json -Depth 3) + "`n")
+    } catch {
+    }
+}
+
+function Enable-FirstRunSidecarWindow {
+    if ($SkipSidecar) { return }
+    $previousCount = Get-JarvisFirstRunCount
+    Set-JarvisFirstRunCount -Count ($previousCount + 1)
+    if ($previousCount -lt $AutoSidecarWindowRuns) {
+        $script:ShowSidecarWindow = $true
+        $env:JARVIS_SHOW_SIDECAR_WINDOW = "1"
+        Write-Host "[jarvis] showing sidecar window for first-run visibility ($($previousCount + 1)/$AutoSidecarWindowRuns)"
+    }
+}
+
 function Initialize-JarvisPairId {
     if (-not $env:JARVIS_PAIR_ID) {
         $env:JARVIS_PAIR_ID = [guid]::NewGuid().ToString()
@@ -257,7 +333,12 @@ if (-not $WindowLabel) {
 }
 $AuthScript = Join-Path $Root "scripts\jarvis-auth.py"
 $DryRun = $env:JARVIS_WRAPPER_DRY_RUN -eq "1"
-$SkipSidecar = $DryRun -or ($RemainingArgs -contains "--help") -or ($RemainingArgs -contains "-h") -or ($RemainingArgs -contains "--version") -or ($RemainingArgs -contains "-v")
+$SkipSidecar = $DryRun -or
+    ($RemainingArgs.Count -gt 0 -and $RemainingArgs[0] -eq "kill-all") -or
+    ($RemainingArgs -contains "--help") -or
+    ($RemainingArgs -contains "-h") -or
+    ($RemainingArgs -contains "--version") -or
+    ($RemainingArgs -contains "-v")
 $EnableExtensionDiscovery = $env:JARVIS_ENABLE_EXTENSION_DISCOVERY -eq "1"
 $HasProviderArg = ($RemainingArgs -contains "--provider") -or (@($RemainingArgs | Where-Object { $_ -like "--provider=*" }).Count -gt 0)
 $HasModelArg = ($RemainingArgs -contains "--model") -or (@($RemainingArgs | Where-Object { $_ -like "--model=*" }).Count -gt 0)
@@ -602,6 +683,7 @@ function Test-LaunchableConfigModel {
         [string] $Model
     )
     if (-not $Provider -or -not $Model) { return $false }
+    if (Test-SidecarRoutedProvider -Provider $Provider) { return $false }
     if (Test-BuiltInProvider -Provider $Provider) { return $true }
     return Test-RegisteredPiModel -Provider $Provider -Model $Model
 }
@@ -688,7 +770,7 @@ if (-not $HasProviderArg -and -not $HasModelArg) {
 }
 $NormalizedRemainingArgs = @()
 $RecentTurnsOverride = $null
-$ShowSidecarWindow = $false
+$ShowSidecarWindow = Test-JarvisTruthy -Value $env:JARVIS_SHOW_SIDECAR_WINDOW
 for ($i = 0; $i -lt $RemainingArgs.Count; $i++) {
     $arg = $RemainingArgs[$i]
     if ($StripCliChatModel -and ($arg -eq "--provider" -or $arg -eq "--model") -and ($i + 1) -lt $RemainingArgs.Count) {
@@ -734,6 +816,7 @@ for ($i = 0; $i -lt $RemainingArgs.Count; $i++) {
     }
     if ($arg -eq "--sidecar-window") {
         $ShowSidecarWindow = $true
+        $env:JARVIS_SHOW_SIDECAR_WINDOW = "1"
         continue
     }
     if ($arg -eq "--yolo") {
@@ -1291,10 +1374,21 @@ function Initialize-SidecarVenv {
         return $null
     }
 
-    Write-Host "[jarvis] Installing sidecar requirements (this can take a minute)..."
+    Write-Host "[jarvis] Installing sidecar requirements ($SidecarRequirementsInstallNote)..."
     & $SidecarVenvPython -m pip install --disable-pip-version-check --quiet --upgrade pip "setuptools<82" wheel
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "pip upgrade in sidecar venv failed (exit=$LASTEXITCODE); requirements install will still be attempted."
+    }
+    $nvidiaGpuName = Get-JarvisNvidiaGpuName
+    if ($nvidiaGpuName) {
+        Write-Host "[jarvis] NVIDIA GPU detected ($nvidiaGpuName) - installing CUDA PyTorch ($PyTorchCudaInstallNote)..."
+        & $SidecarVenvPython -m pip install --disable-pip-version-check --index-url $PyTorchCudaIndexUrl torch
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "CUDA PyTorch install failed (exit=$LASTEXITCODE). Delete '$SidecarVenvDir' and re-run to retry, or set JARVIS_CODE_CPU_ONLY=1 to use CPU PyTorch."
+            return $null
+        }
+    } elseif (Test-JarvisCpuOnlyInstall) {
+        Write-Host "[jarvis] JARVIS_CODE_CPU_ONLY=1 - using CPU PyTorch packages"
     }
     & $SidecarVenvPython -m pip install --disable-pip-version-check -r $SidecarRequirements
     if ($LASTEXITCODE -ne 0) {
@@ -1523,6 +1617,10 @@ if ((-not $SkipSidecar) -and $env:JARVIS_AUTH_PREFLIGHT -ne "0") {
 try {
     Write-WrapperLog "wrapper start pid=$PID args=$($RemainingArgs -join ' ')"
     if (-not $SkipSidecar) {
+        Enable-FirstRunSidecarWindow
+        if ($ShowSidecarWindow) {
+            Stop-ExistingSidecarForVisibleWindow -Port $Port
+        }
         $portAllocationMutex = New-Object System.Threading.Mutex($false, "JARVIS_CODE_SIDECAR_PORT_ALLOC")
         $portAllocationLockHeld = $false
         try {

@@ -41,6 +41,21 @@ Node dependencies for the internal agent engine. It also preloads the local
 failure does not abort install by default; run `jarvis doctor --preload-embedder`
 to retry and inspect the error.
 
+On Windows, if `nvidia-smi` is present and runs successfully, the installer
+installs CUDA PyTorch from PyTorch's `cu126` wheel index before installing the
+remaining sidecar requirements. Expect an additional ~2.7 GB download and several
+minutes on NVIDIA machines. To force the CPU PyTorch path:
+
+```powershell
+$env:JARVIS_CODE_CPU_ONLY = "1"
+irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
+```
+
+Manual/source installs may defer sidecar dependency installation until the first
+`jarvis` run. The first launch can take several minutes; run
+`jarvis --sidecar-window` to keep the sidecar setup window visible while it
+installs.
+
 Skip model preload when needed:
 
 ```powershell

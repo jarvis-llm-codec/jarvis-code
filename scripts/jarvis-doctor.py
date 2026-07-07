@@ -27,6 +27,7 @@ WINDOWS_VC_REDIST_MESSAGE = (
     "Microsoft Visual C++ Redistributable (x64) is required for the memory/embedding layer: "
     "https://aka.ms/vs/17/release/vc_redist.x64.exe"
 )
+PYTORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu126"
 
 
 def config_summary_line() -> str:
@@ -119,6 +120,34 @@ def command_version(command: str, args: list[str]) -> tuple[bool, str]:
     if code != 0:
         return False, err or out or f"{command} exited {code}"
     return True, out or found
+
+
+def truthy(value: str | None) -> bool:
+    return value is not None and value.lower() in {"1", "true", "yes", "on"}
+
+
+def cpu_only_requested() -> bool:
+    return truthy(os.environ.get("JARVIS_CODE_CPU_ONLY"))
+
+
+def detect_nvidia_gpu() -> str | None:
+    if cpu_only_requested():
+        return None
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return None
+    code, out, _err = run_capture(
+        [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
+        timeout=10,
+    )
+    if code == 0:
+        for line in out.splitlines():
+            name = line.strip()
+            if name:
+                return name
+        return "NVIDIA GPU"
+    code, _out, _err = run_capture([nvidia_smi], timeout=10)
+    return "NVIDIA GPU" if code == 0 else None
 
 
 def check_node(checks: list[Check]) -> None:
@@ -216,6 +245,51 @@ def check_python_packages(checks: list[Check], py: Path | None) -> None:
         return
     for label, status in result.items():
         add(checks, f"python:{label}", "ok" if status == "ok" else "fail", status)
+
+
+def check_torch_cuda(checks: list[Check], py: Path | None) -> None:
+    if py is None:
+        return
+    gpu_name = detect_nvidia_gpu()
+    if not gpu_name:
+        return
+    code = (
+        "import json\n"
+        "try:\n"
+        "    import torch\n"
+        "    print(json.dumps({'ok': True, 'cuda_available': bool(torch.cuda.is_available()), "
+        "'torch_version': getattr(torch, '__version__', ''), 'cuda_version': getattr(torch.version, 'cuda', None)}))\n"
+        "except Exception as exc:\n"
+        "    print(json.dumps({'ok': False, 'error': f'{type(exc).__name__}: {exc}'}))\n"
+    )
+    exit_code, out, err = run_capture([str(py), "-c", code], timeout=60)
+    if exit_code != 0:
+        add(checks, "torch:cuda", "warn", err or out or f"torch CUDA probe exited {exit_code}")
+        return
+    try:
+        payload = json.loads(out)
+    except json.JSONDecodeError:
+        add(checks, "torch:cuda", "warn", out)
+        return
+    if not payload.get("ok"):
+        add(checks, "torch:cuda", "warn", str(payload.get("error") or "torch import failed"))
+        return
+    torch_version = str(payload.get("torch_version") or "unknown")
+    cuda_version = str(payload.get("cuda_version") or "none")
+    if payload.get("cuda_available"):
+        add(checks, "torch:cuda", "ok", f"{gpu_name}; torch {torch_version}; cuda {cuda_version}")
+        return
+    add(
+        checks,
+        "torch:cuda",
+        "warn",
+        (
+            f"NVIDIA GPU detected ({gpu_name}) but torch.cuda.is_available() is False "
+            f"(torch {torch_version}; cuda {cuda_version}). To reinstall CUDA PyTorch, run "
+            f"`{py} -m pip install --index-url {PYTORCH_CUDA_INDEX_URL} --force-reinstall torch`; "
+            "set JARVIS_CODE_CPU_ONLY=1 to keep CPU PyTorch intentionally."
+        ),
+    )
 
 
 def check_embedder(checks: list[Check], py: Path | None, *, preload: bool, require: bool, skip_load: bool) -> None:
@@ -370,6 +444,7 @@ def main() -> int:
     check_windows_vc_redist(checks)
     py = check_python_venv(checks)
     check_python_packages(checks, py)
+    check_torch_cuda(checks, py)
     check_embedder(
         checks,
         py,
