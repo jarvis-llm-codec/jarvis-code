@@ -10,6 +10,9 @@
 [![Built on](https://img.shields.io/badge/Built_on-Pi_MIT-ff8800)](NOTICE.md)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%2FLinux%20beta-5b5b66)](#-install)
 [![Web](https://img.shields.io/badge/web-jlc--codec.org-0088ff)](https://jlc-codec.org)
+[![Demo](https://img.shields.io/badge/%F0%9F%8E%AE_demo-play-ff4488)](https://jarvis-llm-codec.github.io/jarvis-code/geometry-wars-3d.html)
+
+**[🎮 Play a demo built with JARVIS Code →](https://jarvis-llm-codec.github.io/jarvis-code/geometry-wars-3d.html)**
 
 </div>
 
