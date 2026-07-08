@@ -747,7 +747,8 @@ const Fl = () => ++Nl,
     energy: 0,
     weaponLevel: 1,
     lives: fe.player.maxLives,
-    shield: 0
+    shield: 0,
+    hitCount: 0
   }),
   Bl = (i, e, t, n) => {
     if (!i.alive) return;
@@ -792,47 +793,48 @@ const Fl = () => ++Nl,
   },
   zl = (i, e) =>
     !e || !i.alive || i.fireCooldown > 0 ? !1 : ((i.fireCooldown = i.fireInterval), !0),
-  qr = (i, e, t) =>
-    !i.alive || i.invuln > 0
-      ? !1
-      : (t.events.push({ type: "hit-player", pos: { ...i.pos }, damage: e }),
-        i.lives > 0
-          ? ((i.lives -= 1),
-            (i.hp = i.maxHp),
-            (i.alive = !0),
-            (i.invuln = fe.player.shieldTime),
-            (i.shield = fe.player.shieldTime),
-            (i.weaponLevel = Math.max(1, i.weaponLevel - 1)),
-            t.events.push({ type: "revive", pos: { ...i.pos } }),
-            t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 2)),
-            i.lives <= 0
-              ? ((i.hp = 0),
-                (i.alive = !1),
-                (t.gameOver = !0),
-                t.events.push({
-                  type: "explode",
-                  pos: { ...i.pos },
-                  radius: 3,
-                  strength: 1.4,
-                  color: 3399167
-                }),
-                t.events.push({ type: "game-over", pos: { ...i.pos } }),
-                t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 2.5)),
-                !0)
-              : !0)
-          : ((i.hp = 0),
-            (i.alive = !1),
-            (t.gameOver = !0),
-            t.events.push({
-              type: "explode",
-              pos: { ...i.pos },
-              radius: 3,
-              strength: 1.4,
-              color: 3399167
-            }),
-            t.events.push({ type: "game-over", pos: { ...i.pos } }),
-            t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 2.5)),
-            !0));
+  qr = (i, e, t) => {
+    if (!i.alive || i.invuln > 0) return !1;
+    t.events.push({ type: "hit-player", pos: { ...i.pos }, damage: e });
+    const killPlayer = () => {
+      ((i.hp = 0),
+        (i.alive = !1),
+        (i.hitCount = 0),
+        (t.gameOver = !0),
+        t.events.push({
+          type: "explode",
+          pos: { ...i.pos },
+          radius: 3,
+          strength: 1.4,
+          color: 3399167
+        }),
+        t.events.push({ type: "game-over", pos: { ...i.pos } }),
+        t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 2.5)));
+    };
+    if (i.lives <= 0) return (killPlayer(), !0);
+    i.hitCount = (i.hitCount || 0) + 1;
+    if (i.hitCount < 3) {
+      // first/second hit of the trio: no life lost, brief shield + knockback
+      ((i.hp = i.maxHp),
+        (i.alive = !0),
+        (i.invuln = fe.player.shieldTime),
+        (i.shield = fe.player.shieldTime),
+        t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 1.5)));
+      return !0;
+    }
+    // third hit: consume one life
+    ((i.hitCount = 0),
+      (i.lives -= 1),
+      (i.hp = i.maxHp),
+      (i.alive = !0),
+      (i.invuln = fe.player.shieldTime),
+      (i.shield = fe.player.shieldTime),
+      (i.weaponLevel = Math.max(1, i.weaponLevel - 1)),
+      t.events.push({ type: "revive", pos: { ...i.pos } }),
+      t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 2)));
+    if (i.lives <= 0) return (killPlayer(), !0);
+    return !0;
+  };
 let Gl = 2e5;
 const Vl = () => ++Gl,
   // Bullet factory with optional overrides (kind/speed/life/damage/radius/pierce)
@@ -1053,10 +1055,21 @@ const Yl = () => ++ql,
       if (it.life <= 0) it.dead = !0;
     }
     const p = world.player;
+    const magnetRadius = 6.5;
     if (p.alive) {
       for (const it of world.items) {
         if (it.dead) continue;
-        if (Math.hypot(it.pos.x - p.pos.x, it.pos.z - p.pos.z) <= p.radius + it.radius + 0.5) {
+        const dx = p.pos.x - it.pos.x;
+        const dz = p.pos.z - it.pos.z;
+        const dist = Math.hypot(dx, dz);
+        // magnet: pull items toward player when within magnetRadius
+        if (dist <= magnetRadius && dist > 0.001) {
+          const pull = 1 - dist / magnetRadius; // 0..1, stronger when closer
+          const mag = 14 * pull * pull;
+          it.vel.x += (dx / dist) * mag * dt;
+          it.vel.z += (dz / dist) * mag * dt;
+        }
+        if (dist <= p.radius + it.radius + 0.5) {
           it.dead = !0;
           applyItem(p, it.kind, world);
           world.events.push({ type: "pickup", pos: { ...it.pos }, kind: it.kind });
@@ -6442,6 +6455,9 @@ class Sg {
       (this.renderer = new xg(e, fr)),
       this.input.attach(e),
       this.updateMuteIcon(),
+      t.overlay.addEventListener("pointerdown", () => {
+        if (this.shownGameOver) this.restart();
+      }),
       (this.loop = wl(
         {
           step: (s) => this.step(s),
@@ -6499,7 +6515,7 @@ class Sg {
     }
     this.world.gameOver &&
       !this.shownGameOver &&
-      ((this.shownGameOver = !0), this.showOverlay("게임 오버", "R을 눌러 재시작"));
+      ((this.shownGameOver = !0), this.showOverlay("게임 오버", "R을 누르거나 터치하여 재시작"));
   }
   playerBulletCount() {
     let e = 0;
