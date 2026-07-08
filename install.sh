@@ -12,6 +12,8 @@ START_DIR=$(pwd -P)
 PYTORCH_CUDA_INDEX_URL="https://download.pytorch.org/whl/cu126"
 PYTORCH_CUDA_INSTALL_NOTE="~2.7 GB, several minutes"
 SIDECAR_REQUIREMENTS_INSTALL_NOTE="~1.3 GB, first run only, takes minutes"
+NODE_VERSION="v20.20.2"
+NODE_DIST_BASE_URL="https://nodejs.org/dist"
 
 log() {
   printf '[jarvis-install] %s\n' "$1"
@@ -57,7 +59,69 @@ print_prereq_help() {
   fi
 }
 
+linux_node_arch() {
+  machine=$(uname -m 2>/dev/null || printf 'unknown')
+  case "$machine" in
+    x86_64|amd64) printf 'x64\n' ;;
+    aarch64|arm64) printf 'arm64\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+prepend_bundled_node_path() {
+  bundled_node_bin="$INSTALL_DIR/node/bin"
+  if [ -x "$bundled_node_bin/node" ]; then
+    PATH="$bundled_node_bin:$PATH"
+    export PATH
+  fi
+}
+
+install_bundled_node() {
+  if is_macos; then
+    return 1
+  fi
+  if ! arch=$(linux_node_arch); then
+    machine=$(uname -m 2>/dev/null || printf 'unknown')
+    printf 'Automatic bundled Node.js install does not support Linux architecture: %s\n' "$machine" >&2
+    return 1
+  fi
+
+  ensure_download_tools
+  node_name="node-$NODE_VERSION-linux-$arch"
+  node_url="$NODE_DIST_BASE_URL/$NODE_VERSION/$node_name.tar.xz"
+  node_dir="$INSTALL_DIR/node"
+  tmp_dir="$INSTALL_DIR/.node-install-tmp"
+  archive="$tmp_dir/$node_name.tar.xz"
+  extract_dir="$tmp_dir/extract"
+
+  rm -rf "$tmp_dir"
+  mkdir -p "$extract_dir"
+  log "installing bundled Node.js $NODE_VERSION for linux-$arch"
+  if ! curl -fsSL "$node_url" -o "$archive"; then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  if ! tar -xJf "$archive" -C "$extract_dir" --strip-components=1; then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  if [ ! -x "$extract_dir/bin/node" ] || ! "$extract_dir/bin/node" --version >/dev/null 2>&1; then
+    printf 'Downloaded Node.js archive did not contain a working node binary.\n' >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  rm -rf "$node_dir"
+  if ! mv "$extract_dir" "$node_dir"; then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  rm -rf "$tmp_dir"
+  prepend_bundled_node_path
+  assert_node_version >/dev/null 2>&1
+}
+
 install_node() {
+  prepend_bundled_node_path
   if command -v node >/dev/null 2>&1; then
     if assert_node_version >/dev/null 2>&1; then
       return 0
@@ -71,12 +135,43 @@ install_node() {
   if is_macos && command -v brew >/dev/null 2>&1; then
     log "attempting automatic Node.js install with Homebrew"
     brew install node || log "Homebrew Node.js install failed; checking PATH anyway"
+  elif install_bundled_node; then
+    return 0
   fi
 
   if ! command -v node >/dev/null 2>&1 || ! assert_node_version >/dev/null 2>&1; then
     printf 'JARVIS Code requires Node.js 20 or newer.\n' >&2
-    print_prereq_help "Node.js 20+" "node" "Install Node.js 20+ with your distro package manager, nvm, fnm, or from https://nodejs.org, then retry."
+    print_prereq_help "Node.js 20+" "node" "Automatic bundled Node.js install failed. Install Node.js 20+ from https://nodejs.org, then retry."
     exit 1
+  fi
+}
+
+run_privileged() {
+  if [ "$(id -u 2>/dev/null || printf '1')" = "0" ]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    return 1
+  fi
+}
+
+install_python_with_package_manager() {
+  if command -v apt-get >/dev/null 2>&1; then
+    run_privileged apt-get update || return 1
+    run_privileged apt-get install -y python3.13 python3.13-venv || \
+      run_privileged apt-get install -y python3.12 python3.12-venv || \
+      run_privileged apt-get install -y python3.11 python3.11-venv || \
+      run_privileged apt-get install -y python3.10 python3.10-venv || \
+      run_privileged apt-get install -y python3 python3-venv
+  elif command -v dnf >/dev/null 2>&1; then
+    run_privileged dnf install -y python3 python3-pip
+  elif command -v yum >/dev/null 2>&1; then
+    run_privileged yum install -y python3 python3-pip
+  elif command -v pacman >/dev/null 2>&1; then
+    run_privileged pacman -Sy --noconfirm python
+  else
+    return 1
   fi
 }
 
@@ -89,6 +184,9 @@ install_python() {
   if is_macos && command -v brew >/dev/null 2>&1; then
     log "attempting automatic Python install with Homebrew"
     brew install python || log "Homebrew Python install failed; checking PATH anyway"
+  elif ! is_macos; then
+    log "attempting automatic Python install with package manager"
+    install_python_with_package_manager || log "automatic Python install failed; checking PATH anyway"
   fi
 
   if ! find_python >/dev/null 2>&1; then
@@ -120,14 +218,14 @@ install_git() {
   if command -v brew >/dev/null 2>&1; then
     brew install git
   elif command -v apt-get >/dev/null 2>&1; then
-    sudo apt-get update
-    sudo apt-get install -y git
+    run_privileged apt-get update
+    run_privileged apt-get install -y git
   elif command -v dnf >/dev/null 2>&1; then
-    sudo dnf install -y git
+    run_privileged dnf install -y git
   elif command -v yum >/dev/null 2>&1; then
-    sudo yum install -y git
+    run_privileged yum install -y git
   elif command -v pacman >/dev/null 2>&1; then
-    sudo pacman -Sy --noconfirm git
+    run_privileged pacman -Sy --noconfirm git
   else
     printf 'JARVIS Code requires Git, and no supported package manager was found.\n' >&2
     exit 1
@@ -182,12 +280,12 @@ ensure_python_venv() {
   pyver=$("$py" -c 'import sys; print("python%d.%d" % sys.version_info[:2])' 2>/dev/null || printf 'python3')
   log "Python venv/ensurepip not available; attempting automatic install of ${pyver}-venv"
   if command -v apt-get >/dev/null 2>&1; then
-    sudo apt-get update
-    sudo apt-get install -y "${pyver}-venv" || sudo apt-get install -y python3-venv
+    run_privileged apt-get update
+    run_privileged apt-get install -y "${pyver}-venv" || run_privileged apt-get install -y python3-venv
   elif command -v dnf >/dev/null 2>&1; then
-    sudo dnf install -y python3 python3-pip
+    run_privileged dnf install -y python3 python3-pip
   elif command -v yum >/dev/null 2>&1; then
-    sudo yum install -y python3 python3-pip
+    run_privileged yum install -y python3 python3-pip
   elif command -v pacman >/dev/null 2>&1; then
     : # Arch's python package already includes venv and ensurepip
   elif command -v brew >/dev/null 2>&1; then
@@ -299,6 +397,7 @@ copy_package() {
       --exclude '_internal' \
       --exclude 'data' \
       --exclude 'pi-agent' \
+      --exclude 'node' \
       --exclude 'pi/node_modules' \
       --exclude 'sidecar/.venv' \
       --exclude '.pytest_cache' \
@@ -311,6 +410,7 @@ copy_package() {
       --exclude './_internal' \
       --exclude './data' \
       --exclude './pi-agent' \
+      --exclude './node' \
       --exclude './pi/node_modules' \
       --exclude './sidecar/.venv' \
       --exclude './.pytest_cache' \
@@ -484,20 +584,15 @@ install_command() {
   esac
 }
 
+INSTALL_DIR=$(absolute_path "$INSTALL_DIR")
+mkdir -p "$INSTALL_DIR"
+
 log "platform: $(uname -s 2>/dev/null || printf unknown) $(uname -m 2>/dev/null || printf unknown)"
-install_node
-node_version=$(assert_node_version)
-log "using Node $node_version"
-ensure_npm
-log "using npm $(npm --version)"
 install_python
 install_git
 log "using $(git --version)"
 
-INSTALL_DIR=$(absolute_path "$INSTALL_DIR")
 src_dir=$(script_dir)
-mkdir -p "$INSTALL_DIR"
-
 if is_local_package "$src_dir"; then
   log "installing from local package $src_dir"
   copy_package "$src_dir" "$INSTALL_DIR"
@@ -505,6 +600,12 @@ else
   ensure_download_tools
   download_package "$INSTALL_DIR"
 fi
+
+install_node
+node_version=$(assert_node_version)
+log "using Node $node_version"
+ensure_npm
+log "using npm $(npm --version)"
 
 mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/pi-agent"
 bootstrap_default_resources "$INSTALL_DIR"

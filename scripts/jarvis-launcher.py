@@ -126,6 +126,12 @@ def cpu_only_requested() -> bool:
     return truthy(os.environ.get("JARVIS_CODE_CPU_ONLY"))
 
 
+def configure_bundled_node_path() -> None:
+    node_bin = ROOT / "node" / "bin"
+    if node_bin.is_dir():
+        os.environ["PATH"] = f"{node_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+
+
 def detect_nvidia_gpu() -> str | None:
     """Return an NVIDIA GPU name when nvidia-smi exists and runs successfully."""
     if cpu_only_requested():
@@ -468,6 +474,7 @@ def configure_env(args: list[str]) -> Path:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PI_AGENT_DIR.mkdir(parents=True, exist_ok=True)
     bootstrap_default_resources()
+    configure_bundled_node_path()
 
     config_path = Path(os.environ.get("JARVIS_CODE_CONFIG", str(Path.home() / ".jarvis-code" / "config.yaml")))
     port = os.environ.get("JARVIS_SIDECAR_PORT", "8765")

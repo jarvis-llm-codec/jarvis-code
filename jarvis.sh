@@ -14,6 +14,11 @@ while [ -h "$SCRIPT_PATH" ]; do
 done
 ROOT_DIR=$(CDPATH= cd "$(dirname "$SCRIPT_PATH")" && pwd -P)
 
+if [ -d "$ROOT_DIR/node/bin" ]; then
+  PATH="$ROOT_DIR/node/bin:$PATH"
+  export PATH
+fi
+
 find_python() {
   # Keep the candidate list in sync with install.sh: PATH order can hide a
   # new-enough interpreter behind an old one.
