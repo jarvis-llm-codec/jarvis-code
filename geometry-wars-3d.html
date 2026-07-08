@@ -822,7 +822,7 @@ const Fl = () => ++Nl,
         t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 1.5)));
       return !0;
     }
-    // third hit: consume one life
+    // third hit: consume one life -> respawn at arena center for a clean restart
     ((i.hitCount = 0),
       (i.lives -= 1),
       (i.hp = i.maxHp),
@@ -830,8 +830,10 @@ const Fl = () => ++Nl,
       (i.invuln = fe.player.shieldTime),
       (i.shield = fe.player.shieldTime),
       (i.weaponLevel = Math.max(1, i.weaponLevel - 1)),
+      (i.pos = { x: 0, y: 0, z: 0 }),
+      (i.vel = { x: 0, y: 0, z: 0 }),
       t.events.push({ type: "revive", pos: { ...i.pos } }),
-      t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 2)));
+      t.impulses.push(Lo(0, 0, fe.grid.impulseStrength * 2)));
     if (i.lives <= 0) return (killPlayer(), !0);
     return !0;
   };
