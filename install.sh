@@ -264,6 +264,13 @@ raise SystemExit(1)
 PY
 }
 
+run_pip_with_tmp() {
+  venv_py=$1
+  pip_tmp=$2
+  shift 2
+  TMPDIR="$pip_tmp" "$venv_py" -m pip "$@"
+}
+
 script_dir() {
   # This works for local script execution. When piped through sh, the installer
   # falls back to downloading the release archive.
@@ -372,15 +379,28 @@ install_sidecar_venv() {
     printf 'Sidecar venv has no working pip at %s. Install the Python venv package (e.g. python3-venv) and retry.\n' "$venv_py" >&2
     exit 1
   fi
+  pip_tmp="$sidecar/.piptmp"
+  rm -rf "$pip_tmp"
+  mkdir -p "$pip_tmp"
   log "installing sidecar Python dependencies ($SIDECAR_REQUIREMENTS_INSTALL_NOTE)"
-  "$venv_py" -m pip install --disable-pip-version-check --quiet --upgrade pip 'setuptools<82' wheel
+  if ! run_pip_with_tmp "$venv_py" "$pip_tmp" install --disable-pip-version-check --quiet --upgrade pip 'setuptools<82' wheel; then
+    rm -rf "$pip_tmp"
+    exit 1
+  fi
   if gpu_name=$(detect_nvidia_gpu "$venv_py"); then
     log "NVIDIA GPU detected ($gpu_name) - installing CUDA PyTorch ($PYTORCH_CUDA_INSTALL_NOTE)"
-    "$venv_py" -m pip install --disable-pip-version-check --index-url "$PYTORCH_CUDA_INDEX_URL" torch
+    if ! run_pip_with_tmp "$venv_py" "$pip_tmp" install --disable-pip-version-check --index-url "$PYTORCH_CUDA_INDEX_URL" torch; then
+      rm -rf "$pip_tmp"
+      exit 1
+    fi
   elif cpu_only_requested; then
     log "JARVIS_CODE_CPU_ONLY=1 - using CPU PyTorch packages"
   fi
-  "$venv_py" -m pip install --disable-pip-version-check -r "$sidecar/requirements.txt"
+  if ! run_pip_with_tmp "$venv_py" "$pip_tmp" install --disable-pip-version-check -r "$sidecar/requirements.txt"; then
+    rm -rf "$pip_tmp"
+    exit 1
+  fi
+  rm -rf "$pip_tmp"
 }
 
 preload_embedder_model() {

@@ -599,34 +599,20 @@ def find_host_python() -> str:
     return sys.executable
 
 
-def run_checked(command: list[str], cwd: Path | None = None) -> None:
-    result = subprocess.run(command, cwd=str(cwd) if cwd else None)
+def run_checked(command: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+    result = subprocess.run(command, cwd=str(cwd) if cwd else None, env=env)
     if result.returncode != 0:
         raise SystemExit(result.returncode)
 
 
 def install_sidecar_requirements(py: Path) -> None:
+    pip_tmp = SIDECAR_ROOT / ".piptmp"
+    shutil.rmtree(pip_tmp, ignore_errors=True)
+    pip_tmp.mkdir(parents=True, exist_ok=True)
+    pip_env = os.environ.copy()
+    pip_env["TMPDIR"] = str(pip_tmp)
     print(f"[jarvis] installing sidecar requirements ({SIDECAR_REQUIREMENTS_INSTALL_NOTE})")
-    run_checked(
-        [
-            str(py),
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--quiet",
-            "--upgrade",
-            "pip",
-            "setuptools<82",
-            "wheel",
-        ],
-    )
-    gpu_name = detect_nvidia_gpu()
-    if gpu_name:
-        print(
-            f"[jarvis] NVIDIA GPU detected ({gpu_name}) - installing CUDA PyTorch "
-            f"({PYTORCH_CUDA_INSTALL_NOTE})",
-        )
+    try:
         run_checked(
             [
                 str(py),
@@ -634,14 +620,41 @@ def install_sidecar_requirements(py: Path) -> None:
                 "pip",
                 "install",
                 "--disable-pip-version-check",
-                "--index-url",
-                PYTORCH_CUDA_INDEX_URL,
-                "torch",
+                "--quiet",
+                "--upgrade",
+                "pip",
+                "setuptools<82",
+                "wheel",
             ],
+            env=pip_env,
         )
-    elif cpu_only_requested():
-        print("[jarvis] JARVIS_CODE_CPU_ONLY=1 - using CPU PyTorch packages")
-    run_checked([str(py), "-m", "pip", "install", "--disable-pip-version-check", "-r", str(SIDECAR_ROOT / "requirements.txt")])
+        gpu_name = detect_nvidia_gpu()
+        if gpu_name:
+            print(
+                f"[jarvis] NVIDIA GPU detected ({gpu_name}) - installing CUDA PyTorch "
+                f"({PYTORCH_CUDA_INSTALL_NOTE})",
+            )
+            run_checked(
+                [
+                    str(py),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "--index-url",
+                    PYTORCH_CUDA_INDEX_URL,
+                    "torch",
+                ],
+                env=pip_env,
+            )
+        elif cpu_only_requested():
+            print("[jarvis] JARVIS_CODE_CPU_ONLY=1 - using CPU PyTorch packages")
+        run_checked(
+            [str(py), "-m", "pip", "install", "--disable-pip-version-check", "-r", str(SIDECAR_ROOT / "requirements.txt")],
+            env=pip_env,
+        )
+    finally:
+        shutil.rmtree(pip_tmp, ignore_errors=True)
 
 
 def ensure_sidecar_venv() -> Path:
