@@ -63,26 +63,55 @@ def _clear_screen() -> None:
 
 def _read_key() -> str:
     """Return one of: 'up', 'down', 'left', 'right', 'enter', 'esc', 'other'."""
-    if not _IS_WINDOWS:
-        return 'enter'
-    import msvcrt  # noqa: PLC0415
-    ch = msvcrt.getch()
-    if ch in (b'\xe0', b'\x00'):
-        ch2 = msvcrt.getch()
-        if ch2 == b'H':
-            return 'up'
-        if ch2 == b'P':
-            return 'down'
-        if ch2 == b'K':
-            return 'left'
-        if ch2 == b'M':
-            return 'right'
+    if _IS_WINDOWS:
+        import msvcrt  # noqa: PLC0415
+        ch = msvcrt.getch()
+        if ch in (b'\xe0', b'\x00'):
+            ch2 = msvcrt.getch()
+            if ch2 == b'H':
+                return 'up'
+            if ch2 == b'P':
+                return 'down'
+            if ch2 == b'K':
+                return 'left'
+            if ch2 == b'M':
+                return 'right'
+            return 'other'
+        if ch == b'\r':
+            return 'enter'
+        if ch in (b'\x1b', b'\x03'):
+            return 'esc'
         return 'other'
-    if ch == b'\r':
-        return 'enter'
-    if ch in (b'\x1b', b'\x03'):
-        return 'esc'
-    return 'other'
+
+    # POSIX (Linux/macOS): put the terminal in raw mode, read one keystroke,
+    # and decode ANSI arrow sequences (ESC '[' 'A'..'D'). Without this the
+    # menu is unusable on Linux/macOS — every prompt would auto-confirm.
+    import select  # noqa: PLC0415
+    import termios  # noqa: PLC0415
+    import tty  # noqa: PLC0415
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = os.read(fd, 1)
+        if ch == b'\x1b':
+            # Distinguish a lone ESC (cancel) from an arrow escape sequence.
+            # Arrow bytes arrive together; a bare ESC has nothing following it.
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if not ready:
+                return 'esc'
+            if os.read(fd, 1) != b'[':
+                return 'esc'
+            code = os.read(fd, 1)
+            return {b'A': 'up', b'B': 'down', b'C': 'right', b'D': 'left'}.get(code, 'other')
+        if ch in (b'\r', b'\n'):
+            return 'enter'
+        if ch == b'\x03':  # Ctrl-C
+            return 'esc'
+        return 'other'
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def arrow_select(title: str, items: list[tuple[str, bool]], start_idx: int = 0, allow_back: bool = False) -> int | None:
