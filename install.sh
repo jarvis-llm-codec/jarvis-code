@@ -8,6 +8,10 @@ BRANCH=${JARVIS_CODE_BRANCH:-main}
 ARCHIVE_URL=${JARVIS_CODE_ARCHIVE_URL:-}
 NO_MODEL_PRELOAD=${JARVIS_CODE_NO_MODEL_PRELOAD:-0}
 REQUIRE_MODEL_PRELOAD=${JARVIS_CODE_REQUIRE_MODEL_PRELOAD:-0}
+START_DIR=$(pwd -P)
+PYTORCH_CUDA_INDEX_URL="https://download.pytorch.org/whl/cu126"
+PYTORCH_CUDA_INSTALL_NOTE="~2.7 GB, several minutes"
+SIDECAR_REQUIREMENTS_INSTALL_NOTE="~1.3 GB, first run only, takes minutes"
 
 log() {
   printf '[jarvis-install] %s\n' "$1"
@@ -16,8 +20,96 @@ log() {
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     printf 'JARVIS Code requires %s.\n' "$1" >&2
+    if [ $# -gt 1 ] && [ -n "$2" ]; then
+      printf '%s\n' "$2" >&2
+    fi
     exit 1
   fi
+}
+
+platform_name() {
+  uname -s 2>/dev/null || printf 'unknown'
+}
+
+absolute_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$START_DIR" "$1" ;;
+  esac
+}
+
+is_macos() {
+  [ "$(platform_name)" = "Darwin" ]
+}
+
+print_prereq_help() {
+  name=$1
+  mac_pkg=$2
+  linux_hint=$3
+  if is_macos; then
+    if command -v brew >/dev/null 2>&1; then
+      printf 'Install it with Homebrew: brew install %s\n' "$mac_pkg" >&2
+    else
+      printf 'Install Homebrew from https://brew.sh or install %s manually, then retry.\n' "$name" >&2
+    fi
+  else
+    printf '%s\n' "$linux_hint" >&2
+  fi
+}
+
+install_node() {
+  if command -v node >/dev/null 2>&1; then
+    if assert_node_version >/dev/null 2>&1; then
+      return 0
+    fi
+    found=$(node --version 2>/dev/null || printf 'unknown')
+    log "Node.js found but too old: $found"
+  else
+    log "Node.js not found"
+  fi
+
+  if is_macos && command -v brew >/dev/null 2>&1; then
+    log "attempting automatic Node.js install with Homebrew"
+    brew install node || log "Homebrew Node.js install failed; checking PATH anyway"
+  fi
+
+  if ! command -v node >/dev/null 2>&1 || ! assert_node_version >/dev/null 2>&1; then
+    printf 'JARVIS Code requires Node.js 20 or newer.\n' >&2
+    print_prereq_help "Node.js 20+" "node" "Install Node.js 20+ with your distro package manager, nvm, fnm, or from https://nodejs.org, then retry."
+    exit 1
+  fi
+}
+
+install_python() {
+  if find_python >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log "Python 3.10+ not found"
+  if is_macos && command -v brew >/dev/null 2>&1; then
+    log "attempting automatic Python install with Homebrew"
+    brew install python || log "Homebrew Python install failed; checking PATH anyway"
+  fi
+
+  if ! find_python >/dev/null 2>&1; then
+    printf 'JARVIS Code requires Python 3.10 or newer with venv/ensurepip.\n' >&2
+    print_prereq_help "Python 3.10+" "python" "Install Python 3.10+ plus the venv package (for example python3-venv on Debian/Ubuntu), then retry."
+    exit 1
+  fi
+}
+
+ensure_download_tools() {
+  need_cmd curl "curl is required when install.sh downloads the release archive."
+  need_cmd tar "tar is required to extract the downloaded release archive."
+}
+
+ensure_npm() {
+  if command -v npm >/dev/null 2>&1; then
+    return 0
+  fi
+  printf 'JARVIS Code requires npm. Node.js was found, but npm is not on PATH.\n' >&2
+  print_prereq_help "npm" "node" "Install npm using your Node.js 20+ distribution, then retry."
+  exit 1
 }
 
 install_git() {
@@ -52,18 +144,22 @@ assert_node_version() {
   case "$major" in
     ''|*[!0-9]*)
       printf 'Could not parse Node.js version: %s\n' "$ver" >&2
-      exit 1
+      return 1
       ;;
   esac
   if [ "$major" -lt 20 ]; then
     printf 'Node.js 20 or newer is required; found %s\n' "$ver" >&2
-    exit 1
+    return 1
   fi
   printf '%s\n' "$ver"
 }
 
 find_python() {
-  for candidate in python3 python; do
+  # PATH order can hide a new-enough interpreter behind an old one (for
+  # example Apple's /usr/bin/python3 shadowing Homebrew python), so try
+  # versioned names and the common Homebrew locations too.
+  for candidate in python3 python python3.13 python3.12 python3.11 python3.10 \
+    /opt/homebrew/bin/python3 /usr/local/bin/python3; do
     if command -v "$candidate" >/dev/null 2>&1; then
       if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
         printf '%s\n' "$candidate"
@@ -95,12 +191,77 @@ ensure_python_venv() {
   elif command -v pacman >/dev/null 2>&1; then
     : # Arch's python package already includes venv and ensurepip
   elif command -v brew >/dev/null 2>&1; then
-    : # Homebrew's python includes venv and ensurepip
+    log "attempting Homebrew Python repair for venv/ensurepip"
+    brew install python || log "Homebrew Python repair failed; checking venv/ensurepip anyway"
+    if new_py=$(find_python); then
+      py=$new_py
+    fi
   fi
   if ! "$py" -c 'import ensurepip' >/dev/null 2>&1; then
-    printf 'JARVIS Code requires the Python venv module with ensurepip. Install %s-venv (Debian/Ubuntu) or the equivalent and retry.\n' "$pyver" >&2
+    if is_macos; then
+      printf 'JARVIS Code requires Python venv/ensurepip. Install or repair Homebrew Python (`brew install python`) and retry.\n' >&2
+    else
+      printf 'JARVIS Code requires the Python venv module with ensurepip. Install %s-venv (Debian/Ubuntu) or the equivalent and retry.\n' "$pyver" >&2
+    fi
     exit 1
   fi
+}
+
+cpu_only_requested() {
+  case "${JARVIS_CODE_CPU_ONLY:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+detect_nvidia_gpu() {
+  py=$1
+  if cpu_only_requested; then
+    return 1
+  fi
+  nvidia_smi=$(command -v nvidia-smi 2>/dev/null || true)
+  if [ -z "$nvidia_smi" ]; then
+    return 1
+  fi
+  "$py" - "$nvidia_smi" <<'PY'
+import subprocess
+import sys
+
+nvidia_smi = sys.argv[1]
+try:
+    result = subprocess.run(
+        [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+except (OSError, subprocess.TimeoutExpired):
+    raise SystemExit(1)
+if result.returncode == 0:
+    for line in result.stdout.splitlines():
+        name = line.strip()
+        if name:
+            print(name)
+            raise SystemExit(0)
+    print("NVIDIA GPU")
+    raise SystemExit(0)
+try:
+    probe = subprocess.run(
+        [nvidia_smi],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=10,
+        check=False,
+    )
+except (OSError, subprocess.TimeoutExpired):
+    raise SystemExit(1)
+if probe.returncode == 0:
+    print("NVIDIA GPU")
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 script_dir() {
@@ -211,8 +372,14 @@ install_sidecar_venv() {
     printf 'Sidecar venv has no working pip at %s. Install the Python venv package (e.g. python3-venv) and retry.\n' "$venv_py" >&2
     exit 1
   fi
-  log "installing sidecar Python dependencies"
+  log "installing sidecar Python dependencies ($SIDECAR_REQUIREMENTS_INSTALL_NOTE)"
   "$venv_py" -m pip install --disable-pip-version-check --quiet --upgrade pip 'setuptools<82' wheel
+  if gpu_name=$(detect_nvidia_gpu "$venv_py"); then
+    log "NVIDIA GPU detected ($gpu_name) - installing CUDA PyTorch ($PYTORCH_CUDA_INSTALL_NOTE)"
+    "$venv_py" -m pip install --disable-pip-version-check --index-url "$PYTORCH_CUDA_INDEX_URL" torch
+  elif cpu_only_requested; then
+    log "JARVIS_CODE_CPU_ONLY=1 - using CPU PyTorch packages"
+  fi
   "$venv_py" -m pip install --disable-pip-version-check -r "$sidecar/requirements.txt"
 }
 
@@ -287,6 +454,7 @@ install_command() {
   root=$1
   chmod +x "$root/jarvis.sh"
   bin_dir=${JARVIS_CODE_BIN_DIR:-"$HOME/.local/bin"}
+  bin_dir=$(absolute_path "$bin_dir")
   mkdir -p "$bin_dir"
   ln -sfn "$root/jarvis.sh" "$bin_dir/jarvis"
   log "installed command shim at $bin_dir/jarvis"
@@ -296,12 +464,17 @@ install_command() {
   esac
 }
 
-need_cmd node
+log "platform: $(uname -s 2>/dev/null || printf unknown) $(uname -m 2>/dev/null || printf unknown)"
+install_node
 node_version=$(assert_node_version)
 log "using Node $node_version"
+ensure_npm
+log "using npm $(npm --version)"
+install_python
 install_git
 log "using $(git --version)"
 
+INSTALL_DIR=$(absolute_path "$INSTALL_DIR")
 src_dir=$(script_dir)
 mkdir -p "$INSTALL_DIR"
 
@@ -309,6 +482,7 @@ if is_local_package "$src_dir"; then
   log "installing from local package $src_dir"
   copy_package "$src_dir" "$INSTALL_DIR"
 else
+  ensure_download_tools
   download_package "$INSTALL_DIR"
 fi
 

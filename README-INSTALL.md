@@ -8,7 +8,13 @@
 - Microsoft Visual C++ 2015-2022 Redistributable (x64), auto-installed on
   Windows when `winget` is available
 - PowerShell on Windows
-- `curl`, `tar`, and a POSIX shell on macOS/Linux
+- macOS/Linux: Node.js 20+, npm, Python 3.10+ with `venv`/`ensurepip`, Git,
+  `curl`, `tar`, and a POSIX shell
+
+On macOS, the POSIX installer can use Homebrew to install missing Git, Node.js,
+or Python. If Homebrew is not installed, install those prerequisites manually
+first. On Linux, use your distribution package manager; Debian/Ubuntu users may
+need the matching `python3-venv` package.
 
 ## One-Line Install
 
@@ -43,8 +49,21 @@ by the local torch/sentence-transformers stack. Set
 `JARVIS_CODE_NO_PREREQ_INSTALL=1` or pass `-NoPrereqInstall` to skip automatic
 prerequisite installation.
 
+On Windows and Linux, if `nvidia-smi` is present and runs successfully, the
+installer installs CUDA PyTorch from PyTorch's `cu126` wheel index before the
+remaining sidecar requirements. Expect an additional ~2.7 GB download and
+several minutes on NVIDIA machines. Set `JARVIS_CODE_CPU_ONLY=1` before install
+to force CPU PyTorch.
+
 Set `JARVIS_CODE_NO_MODEL_PRELOAD=1` or pass `-NoModelPreload` on Windows to
-skip the bge-m3 preload and let the first JARVIS memory warmup download it.
+skip the bge-m3 preload and let the first JARVIS memory warmup download it. For
+macOS/Linux one-line installs, put environment variables on the `sh` side of the
+pipe so the installer process receives them:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | env JARVIS_CODE_NO_MODEL_PRELOAD=1 sh
+```
+
 Set `JARVIS_CODE_REQUIRE_MODEL_PRELOAD=1` or pass `-RequireModelPreload` on
 Windows to make preload failure abort installation.
 
@@ -67,8 +86,8 @@ iex ((curl.exe -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-c
 macOS/Linux:
 
 ```bash
-JARVIS_CODE_REPO=jarvis-llm-codec/jarvis-code \
-curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | \
+  env JARVIS_CODE_REPO=jarvis-llm-codec/jarvis-code sh
 ```
 
 Install location defaults:
@@ -77,6 +96,38 @@ Install location defaults:
 - macOS/Linux: `$HOME/.local/share/jarvis-code`
 
 Override with `JARVIS_CODE_INSTALL_DIR`.
+
+For example, a no-model-preload install into a custom macOS/Linux prefix:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | \
+  env JARVIS_CODE_INSTALL_DIR="$HOME/.local/share/jarvis-code" \
+      JARVIS_CODE_BIN_DIR="$HOME/.local/bin" \
+      JARVIS_CODE_NO_MODEL_PRELOAD=1 \
+      sh
+```
+
+## macOS/Linux Beta Support Notes
+
+The macOS/Linux path supports a single interactive `jarvis` session with the
+local sidecar and JLC extensions loaded. These commands should work after
+install:
+
+```bash
+jarvis --help
+jarvis doctor --skip-sidecar
+jarvis
+```
+
+Known beta limitations:
+
+- Windows remains the most complete, first-class entrypoint today.
+- macOS/Linux multi-window spawning and visible sidecar windows need more
+  real-machine validation than the single-window path.
+- `JARVIS_CODE_NO_MODEL_PRELOAD=1` only defers the `BAAI/bge-m3` model download;
+  memory recall will download/use it on first warmup.
+- If `$HOME/.local/bin` is not on your PATH, open a new terminal or add it to
+  your shell profile before running `jarvis`.
 
 ## Manual Source Install
 

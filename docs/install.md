@@ -1,7 +1,8 @@
 # Install
 
-JARVIS Code supports Windows, macOS, and Linux through platform-specific
-installers and a shared Python launcher.
+JARVIS Code supports Windows as the first-class install path. macOS/Linux
+support is available in beta through the POSIX installer and shared Python
+launcher.
 
 ## Windows
 
@@ -24,16 +25,20 @@ curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/i
 ## Requirements
 
 - Node.js 20 or newer
+- npm
 - Python 3.10 or newer
+- Python `venv`/`ensurepip` support
 - Git
+- `curl`, `tar`, and a POSIX shell on macOS/Linux
 - Microsoft Visual C++ 2015-2022 Redistributable (x64) on Windows
 - Internet access for first install
 
 On Windows, the installer attempts to install missing Node.js, Python, Git, and
 Microsoft Visual C++ Redistributable (x64) automatically with `winget`. The VC++
-runtime is required by torch for local embedding support. On macOS/Linux, the
-installer attempts to install Git with a supported package manager when it is
-missing.
+runtime is required by torch for local embedding support. On macOS, the POSIX
+installer can use Homebrew to install missing Git, Node.js, or Python. On Linux,
+install missing prerequisites with your distribution package manager; Debian and
+Ubuntu users may need `python3-venv` for `python -m venv`.
 
 The installer creates a Python virtual environment for the sidecar and installs
 Node dependencies for the internal agent engine. It also preloads the local
@@ -41,7 +46,7 @@ Node dependencies for the internal agent engine. It also preloads the local
 failure does not abort install by default; run `jarvis doctor --preload-embedder`
 to retry and inspect the error.
 
-On Windows, if `nvidia-smi` is present and runs successfully, the installer
+On Windows and Linux, if `nvidia-smi` is present and runs successfully, the installer
 installs CUDA PyTorch from PyTorch's `cu126` wheel index before installing the
 remaining sidecar requirements. Expect an additional ~2.7 GB download and several
 minutes on NVIDIA machines. To force the CPU PyTorch path:
@@ -49,6 +54,12 @@ minutes on NVIDIA machines. To force the CPU PyTorch path:
 ```powershell
 $env:JARVIS_CODE_CPU_ONLY = "1"
 irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
+```
+
+On Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | env JARVIS_CODE_CPU_ONLY=1 sh
 ```
 
 Manual/source installs may defer sidecar dependency installation until the first
@@ -61,6 +72,20 @@ Skip model preload when needed:
 ```powershell
 $env:JARVIS_CODE_NO_MODEL_PRELOAD = "1"
 irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
+```
+
+On macOS/Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | env JARVIS_CODE_NO_MODEL_PRELOAD=1 sh
+```
+
+For a quick macOS/Linux installer smoke check that does not require a running
+sidecar:
+
+```bash
+jarvis --help
+jarvis doctor --skip-sidecar
 ```
 
 Run diagnostics after install:

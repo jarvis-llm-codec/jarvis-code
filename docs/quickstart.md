@@ -6,17 +6,27 @@ This gets you from zero to a working coding session. For the full install refere
 
 ## 1. Install
 
-**Windows** (supported today) — in PowerShell:
+**Windows** (first-class) — in PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
 ```
 
-**macOS · Linux** — installer is being finalized (**coming soon**). Until then, install from source — see [install.md](install.md).
+**macOS · Linux** (beta/basic support) — in a POSIX shell:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | sh
+```
+
+To defer the large embedding model download until first memory use:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | env JARVIS_CODE_NO_MODEL_PRELOAD=1 sh
+```
 
 ### What gets installed & how big
 
-Everything lands under `%LOCALAPPDATA%\JARVIS-Code`. Rough sizes on a fresh machine:
+Windows lands under `%LOCALAPPDATA%\JARVIS-Code`; macOS/Linux lands under `$HOME/.local/share/jarvis-code`. Rough sizes on a fresh machine:
 
 | Component | Size |
 |---|---|
@@ -24,11 +34,11 @@ Everything lands under `%LOCALAPPDATA%\JARVIS-Code`. Rough sizes on a fresh mach
 | Python sidecar (incl. PyTorch, CPU) | ~1.3 GB |
 | NVIDIA CUDA PyTorch — *only when `nvidia-smi` is detected* | ~2.7 GB download |
 | `bge-m3` embedding model — **powers recall (required)** | ~2.3 GB download · ~4.3 GB on disk |
-| Prerequisites (Node 20+, Python 3.10+, Git, MSVC) — *only if missing* | ~0.5 GB |
+| Prerequisites (Node 20+, Python 3.10+, Git, MSVC on Windows) — *only if missing* | ~0.5 GB |
 
 **≈ 6 GB total on CPU installs; NVIDIA installs can be ~2.7 GB larger** (plus prerequisites if missing). Recall is a **BM25 + bge-m3** hybrid — keyword + semantic — so the model is core, not optional; `JARVIS_CODE_NO_MODEL_PRELOAD=1` only defers its download to first use. Memory data under `~/.jarvis-code` starts small and grows slowly.
 
-If `nvidia-smi` is present and working, the Windows installer installs CUDA PyTorch from PyTorch's `cu126` wheel index before the rest of the sidecar requirements. To force CPU PyTorch, set `JARVIS_CODE_CPU_ONLY=1` before installing.
+If `nvidia-smi` is present and working on Windows/Linux, the installer installs CUDA PyTorch from PyTorch's `cu126` wheel index before the rest of the sidecar requirements. To force CPU PyTorch, set `JARVIS_CODE_CPU_ONLY=1` before installing.
 
 ---
 

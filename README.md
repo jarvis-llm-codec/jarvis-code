@@ -8,7 +8,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-0088ff)](LICENSE)
 [![Built on](https://img.shields.io/badge/Built_on-Pi_MIT-ff8800)](NOTICE.md)
-[![Platform](https://img.shields.io/badge/Platform-Windows-5b5b66)](#-install)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%2FLinux%20beta-5b5b66)](#-install)
 [![Web](https://img.shields.io/badge/web-jlc--codec.org-0088ff)](https://jlc-codec.org)
 
 </div>
@@ -75,7 +75,7 @@ Run integrity: 0 timeouts · 0 modified test files (hash-checked) · 0 benchmark
 
 ## 🚀 Install
 
-> **Windows is first-class today. macOS / Linux are coming soon.**
+> **Windows is first-class today. macOS / Linux basic support is available in beta.**
 
 **Windows** (PowerShell):
 
@@ -83,7 +83,23 @@ Run integrity: 0 timeouts · 0 modified test files (hash-checked) · 0 benchmark
 irm https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.ps1 | iex
 ```
 
-Missing prerequisites (Node.js, Python, Git, MSVC redistributable) are installed via `winget` when available. The installer also preloads the local `BAAI/bge-m3` embedding model (~2.3 GB) unless `JARVIS_CODE_NO_MODEL_PRELOAD=1` is set. On NVIDIA machines, the Windows installer detects `nvidia-smi` and installs CUDA PyTorch from PyTorch's `cu126` wheel index before the rest of the sidecar dependencies; set `JARVIS_CODE_CPU_ONLY=1` before install to force CPU PyTorch.
+Missing prerequisites (Node.js, Python, Git, MSVC redistributable) are installed via `winget` when available. The installer also preloads the local `BAAI/bge-m3` embedding model (~2.3 GB) unless `JARVIS_CODE_NO_MODEL_PRELOAD=1` is set.
+
+**macOS / Linux** (beta, POSIX shell):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | sh
+```
+
+For a faster first install that defers the large embedding-model download until first memory use:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | env JARVIS_CODE_NO_MODEL_PRELOAD=1 sh
+```
+
+macOS/Linux requires Node.js 20+, npm, Python 3.10+ with `venv`/`ensurepip`, Git, `curl`, and `tar`. On macOS the installer can use Homebrew for missing Git, Node.js, or Python. On Linux, install missing prerequisites with your distribution package manager if the installer reports them missing.
+
+On NVIDIA Windows/Linux machines, the installer detects `nvidia-smi` and installs CUDA PyTorch from PyTorch's `cu126` wheel index before the rest of the sidecar dependencies; set `JARVIS_CODE_CPU_ONLY=1` before install to force CPU PyTorch.
 
 > After install, **open a new terminal** so the `jarvis` command is on your PATH.
 
@@ -91,7 +107,7 @@ Manual / advanced install: [README-INSTALL.md](README-INSTALL.md).
 
 ## 💾 What gets installed & how big
 
-Everything installs under `%LOCALAPPDATA%\JARVIS-Code`. Rough footprint on a fresh machine:
+Windows installs under `%LOCALAPPDATA%\JARVIS-Code`; macOS/Linux installs under `$HOME/.local/share/jarvis-code`. Rough footprint on a fresh machine:
 
 | Component | Size |
 |---|---|
@@ -100,7 +116,7 @@ Everything installs under `%LOCALAPPDATA%\JARVIS-Code`. Rough footprint on a fre
 | Python sidecar (incl. PyTorch, CPU) | ~1.3 GB |
 | NVIDIA CUDA PyTorch — *only when `nvidia-smi` is detected* | ~2.7 GB download |
 | `bge-m3` embedding model — **powers recall (required)** | ~2.3 GB download · ~4.3 GB on disk |
-| Prerequisites — Node 20+, Python 3.10+, Git, MSVC — *only if missing* | ~0.5 GB |
+| Prerequisites — Node 20+, Python 3.10+, Git, MSVC on Windows — *only if missing* | ~0.5 GB |
 
 **Total ≈ 6 GB on CPU installs; NVIDIA installs can be ~2.7 GB larger** (plus prerequisites if you don't already have them). Recall runs on a **BM25 + bge-m3** hybrid — keyword search plus semantic embeddings — so the model is core, not optional; `JARVIS_CODE_NO_MODEL_PRELOAD=1` only **defers** its download to first use. Your memory data under `~/.jarvis-code` starts small and grows slowly with use.
 
