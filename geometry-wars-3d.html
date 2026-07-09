@@ -219,7 +219,7 @@ const fe = {
       energyPerKill: 2.2,
       skillCost: 100,
       skillDamage: 12,
-      skillRadius: 7,
+      skillRadius: 14,
       maxWeaponLevel: 5,
       shieldTime: 1.4
     },
@@ -925,9 +925,9 @@ const Vl = () => ++Gl,
       r = fe.player.skillRadius;
     world.events.push({ type: "skill", pos: { ...i.pos }, radius: r, color: 1703935 });
     world.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 4));
-    // 300 particles in one frame violates the no-single-frame-spike rule
+    // 600 particles in one NOVA use would violate the no-single-frame-spike rule
     // (OMM-007); stagger through pendingBursts like boss death.
-    world.pendingBursts.push({ pos: { ...i.pos }, remaining: fe.particles.perBigKill * 2, color: 1703935, perFrame: 130 });
+    world.pendingBursts.push({ pos: { ...i.pos }, remaining: fe.particles.perBigKill * 4, color: 1703935, perFrame: 130 });
     for (const en of world.enemies) {
       if (en.dead) continue;
       if (Math.hypot(en.pos.x - i.pos.x, en.pos.z - i.pos.z) <= r + en.radius) {
