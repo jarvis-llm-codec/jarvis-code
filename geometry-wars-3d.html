@@ -259,12 +259,15 @@ const fe = {
       spawnRingPad: 2
     },
     particles: {
-      perKill: 26,
-      perBigKill: 60,
-      maxParticles: 3e3,
-      lifespan: 1.1,
-      damping: 0.92,
-      speed: 14
+      perKill: 64,
+      perBigKill: 150,
+      maxParticles: 5e3,
+      lifespan: 1.5,
+      damping: 0.9,
+      speed: 17,
+      muzzle: 8,
+      pickup: 30,
+      hitPlayer: 26
     },
     camera: {
       fovBase: 62,
@@ -274,7 +277,7 @@ const fe = {
       rollAmp: 0.18,
       shakeLambda: 8
     },
-    grid: { impulseStrength: 6 },
+    grid: { impulseStrength: 6, maxImpulses: 20 },
     items: {
       radius: 0.5,
       lifespan: 12,
@@ -295,6 +298,14 @@ const fe = {
       firstDelay: 42,
       interval: 52,
       intervalMin: 38,
+      postThirdIntervalCut: 5,
+      postThirdIntervalMin: 26,
+      postThirdHpGrowth: 0.45,
+      postThirdSpeedGrowth: 0.08,
+      postThirdFireAccel: 0.13,
+      postThirdBulletSpeedGrowth: 0.09,
+      postThirdDamageGrowth: 2,
+      postThirdExtraBullets: 2,
       mini: {
         radius: 2.2,
         hp: 70,
@@ -570,7 +581,7 @@ const fe = {
           };
           bb = mkB(
             "joy-btn",
-            "부스트",
+            "BOOST",
             () => {
               tb = !0;
             },
@@ -584,7 +595,7 @@ const fe = {
           bm = mkB("joy-btn3", "R", () => {
             l = !0;
           });
-          bs = mkB("joy-btn4", "폭탄", () => {
+          bs = mkB("joy-btn4", "BOMB", () => {
             sk = !0;
           });
           document.body.appendChild(bb);
@@ -698,6 +709,10 @@ const fe = {
       const s = n.age + e;
       s >= n.lifespan || t.push({ ...n, age: s });
     }
+    // Cap live ripple count so render-side O(N*M) impulse sampling (grid verts
+    // + entities + camera) stays bounded. Impulses are appended over time, so
+    // the most recent (strongest) are last; drop oldest from the front.
+    if (t.length > fe.grid.maxImpulses) t.splice(0, t.length - fe.grid.maxImpulses);
     return t;
   },
   Do = (i) => {
@@ -796,6 +811,7 @@ const Fl = () => ++Nl,
   qr = (i, e, t) => {
     if (!i.alive || i.invuln > 0) return !1;
     t.events.push({ type: "hit-player", pos: { ...i.pos }, damage: e });
+    ic(i.pos, fe.particles.hitPlayer, 0xff3a4a, t);
     const killPlayer = () => {
       ((i.hp = 0),
         (i.alive = !1),
@@ -909,7 +925,9 @@ const Vl = () => ++Gl,
       r = fe.player.skillRadius;
     world.events.push({ type: "skill", pos: { ...i.pos }, radius: r, color: 1703935 });
     world.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 4));
-    ic(i.pos, fe.particles.perBigKill * 2, 1703935, world);
+    // 300 particles in one frame violates the no-single-frame-spike rule
+    // (OMM-007); stagger through pendingBursts like boss death.
+    world.pendingBursts.push({ pos: { ...i.pos }, remaining: fe.particles.perBigKill * 2, color: 1703935, perFrame: 130 });
     for (const en of world.enemies) {
       if (en.dead) continue;
       if (Math.hypot(en.pos.x - i.pos.x, en.pos.z - i.pos.z) <= r + en.radius) {
@@ -1074,6 +1092,11 @@ const Yl = () => ++ql,
         if (dist <= p.radius + it.radius + 0.5) {
           it.dead = !0;
           applyItem(p, it.kind, world);
+          // Route pickup burst through pendingBursts so multi-pickups in one
+          // frame (e.g. 6 boss drops grabbed together) can't spawn 180+ bright
+          // additive particles in a single frame -> GPU/bloom stall. The
+          // global drain budget in Jr keeps total per-frame spawn bounded.
+          world.pendingBursts.push({ pos: { ...it.pos }, remaining: fe.particles.pickup, color: fe.items.colors[it.kind] ?? 16777215, perFrame: 40 });
           world.events.push({ type: "pickup", pos: { ...it.pos }, kind: it.kind });
         }
       }
@@ -1109,24 +1132,42 @@ const Yl = () => ++ql,
     }
   },
   // ---------------- Boss ----------------
+  bossRageForNumber = (bossNumber) => {
+    const level = Math.max(0, bossNumber - 3),
+      cfg = fe.boss;
+    return {
+      level,
+      hpMul: 1 + level * cfg.postThirdHpGrowth,
+      speedMul: Math.min(1.75, 1 + level * cfg.postThirdSpeedGrowth),
+      fireMul: Math.max(0.42, 1 - level * cfg.postThirdFireAccel),
+      bulletSpeedMul: Math.min(1.7, 1 + level * cfg.postThirdBulletSpeedGrowth),
+      damageAdd: level * cfg.postThirdDamageGrowth,
+      extraBullets: Math.min(12, level * cfg.postThirdExtraBullets)
+    };
+  },
   bossForWave = (wave) =>
     wave % 10 === 0 ? "big" : wave % 10 === fe.boss.miniWave ? "mini" : null,
-  makeBoss = (type, world) => {
+  makeBoss = (type, world, bossNumber = 1) => {
     const b = fe.boss[type],
-      e = Kl("singularity", { x: 0, y: 0, z: 0 }, world);
+      rage = bossRageForNumber(bossNumber),
+      e = Kl("singularity", { x: 0, y: 0, z: 0 }, world),
+      hp = Math.ceil(b.hp * rage.hpMul);
     e.kind = "boss";
     e.bossType = type;
+    e.bossNumber = bossNumber;
+    e.rageLevel = rage.level;
     e.radius = b.radius;
-    e.hp = b.hp;
-    e.maxHp = b.hp;
-    e.score = b.score;
-    e.speed = b.speed;
+    e.hp = hp;
+    e.maxHp = hp;
+    e.score = Math.round(b.score * (1 + rage.level * 0.25));
+    e.speed = b.speed * rage.speedMul;
     e.color = b.color;
-    e.fireCooldown = 1.6;
-    e.fireInterval = b.fireInterval;
-    e.bulletSpeed = b.bulletSpeed;
+    e.fireCooldown = rage.level > 0 ? Math.min(0.9, b.fireInterval * rage.fireMul) : 1.6;
+    e.fireInterval = b.fireInterval * rage.fireMul;
+    e.bulletSpeed = b.bulletSpeed * rage.bulletSpeedMul;
     e.bulletLife = b.bulletLife;
-    e.bulletDamage = b.bulletDamage;
+    e.bulletDamage = b.bulletDamage + rage.damageAdd;
+    e.extraBullets = rage.extraBullets;
     e.phase = 0;
     e.behaviorTimer = 0;
     e.dead = !1;
@@ -1159,10 +1200,12 @@ const Yl = () => ++ql,
     if (b.fireCooldown <= 0) {
       b.fireCooldown = b.fireInterval;
       const aimed = { x: toP.x / d, z: toP.z / d },
-        n = b.bossType === "big" ? 14 : 10;
+        n = (b.bossType === "big" ? 14 : 10) + (b.extraBullets || 0);
       if (b.bossType === "big" && Math.floor(b.behaviorTimer) % 2 === 0) {
-        for (let i = -1; i <= 1; i++) {
-          const ang = i * 0.16,
+        const lanes = Math.min(7, 3 + Math.floor((b.extraBullets || 0) / 2)),
+          mid = (lanes - 1) / 2;
+        for (let lane = 0; lane < lanes; lane++) {
+          const ang = (lane - mid) * 0.16,
             ca = Math.cos(ang),
             sa = Math.sin(ang),
             dir = { x: aimed.x * ca - aimed.z * sa, z: aimed.x * sa + aimed.z * ca };
@@ -1200,7 +1243,7 @@ const Yl = () => ++ql,
       b.dead = !0;
       world.player.score += b.score;
       world.player.energy = fe.player.maxEnergy;
-      ic(b.pos, fe.particles.perBigKill * 3, b.color, world);
+      world.pendingBursts.push({ pos: { ...b.pos }, remaining: fe.particles.perBigKill * 6, color: b.color, perFrame: 130 });
       world.impulses.push(Lo(b.pos.x, b.pos.z, fe.grid.impulseStrength * 4));
       sys.shake = pc(sys.shake, 1);
       world.trauma = 1;
@@ -1216,7 +1259,10 @@ const Yl = () => ++ql,
       }
       if (world.bossActiveWave) world.bossDefeatedWaves.add(world.bossActiveWave);
       sys.spawn.bossIndex = (sys.spawn.bossIndex || 0) + 1;
-      const _ni = Math.max(fe.boss.intervalMin, fe.boss.interval - sys.spawn.bossIndex * 2.5);
+      const _defeated = sys.spawn.bossIndex || 0,
+        _spike = Math.max(0, _defeated - 2),
+        _min = _spike > 0 ? fe.boss.postThirdIntervalMin : fe.boss.intervalMin,
+        _ni = Math.max(_min, fe.boss.interval - _defeated * 2.5 - _spike * fe.boss.postThirdIntervalCut);
       sys.spawn.bossTimer = _ni;
       sys.spawn.bossTimerMax = _ni;
       world.boss = null;
@@ -1241,24 +1287,45 @@ const nc = () => ++tc,
     if (n.particles.length > r.maxParticles) return;
     const o = r.speed,
       a = r.lifespan,
-      l = 0.16,
-      c = 0.35;
+      pool = Xt.sparkPool;
     for (let u = 0; u < e && !(n.particles.length >= r.maxParticles); u++) {
-      const h = n.rng.next() * Math.PI * 2,
-        f = o * (0.4 + n.rng.next() * 0.6),
-        p = (n.rng.next() - 0.5) * 2 * o * c,
-        g = n.rng.chance(0.5) ? t : n.rng.pick(Xt.sparkPool);
+      const tier = n.rng.next(),
+        h = n.rng.next() * Math.PI * 2,
+        baseCol = n.rng.chance(0.62) ? t : n.rng.pick(pool);
+      let rad, life, spd, vy, col;
+      if (tier < 0.16) {
+        // bright hot core flash
+        rad = 0.3 + n.rng.next() * 0.18;
+        life = a * (0.35 + n.rng.next() * 0.25);
+        spd = o * (0.9 + n.rng.next() * 0.6);
+        vy = (n.rng.next() - 0.5) * 2 * o * 0.5;
+        col = n.rng.chance(0.7) ? 16777215 : baseCol;
+      } else if (tier < 0.6) {
+        // fast streak
+        rad = 0.1 + n.rng.next() * 0.08;
+        life = a * (0.55 + n.rng.next() * 0.5);
+        spd = o * (0.7 + n.rng.next() * 0.9);
+        vy = (n.rng.next() - 0.4) * 2 * o * 0.4;
+        col = baseCol;
+      } else {
+        // slow drifting ember
+        rad = 0.14 + n.rng.next() * 0.1;
+        life = a * (0.8 + n.rng.next() * 0.7);
+        spd = o * (0.2 + n.rng.next() * 0.45);
+        vy = (n.rng.next() - 0.5) * 2 * o * 0.25;
+        col = baseCol;
+      }
       n.particles.push({
         id: nc(),
         tag: "particle",
         pos: { ...i },
-        vel: { x: Math.cos(h) * f, y: p, z: Math.sin(h) * f },
-        radius: l,
-        life: a * (0.5 + n.rng.next() * 0.5),
-        lifespan: a,
+        vel: { x: Math.cos(h) * spd, y: vy, z: Math.sin(h) * spd },
+        radius: rad,
+        life: life,
+        lifespan: life,
         damping: r.damping,
-        color: g,
-        size: l
+        color: col,
+        size: rad
       });
     }
   },
@@ -1427,6 +1494,7 @@ const Kr = (i, e, t, n) => {
         bossActiveWave: 0,
         bossDefeatedWaves: new Set(),
         spawnState: { timer: 0, wave: 1, budget: fe.spawn.waveBudgetGrowth, toSpawn: 0 },
+        pendingBursts: [],
         trauma: 0,
         gameOver: !1,
         nextId: 1
@@ -1484,11 +1552,12 @@ const Kr = (i, e, t, n) => {
       if (!i.boss) {
         e.spawn.bossTimer = Math.max(0, e.spawn.bossTimer - n);
         if (e.spawn.bossTimer <= 0) {
-          const bt = (e.spawn.bossIndex % 3 === 2) ? "big" : "mini";
-          i.boss = makeBoss(bt, i);
+          const bossNumber = (e.spawn.bossIndex || 0) + 1,
+            bt = (e.spawn.bossIndex % 3 === 2) ? "big" : "mini";
+          i.boss = makeBoss(bt, i, bossNumber);
           i.bossActiveWave = e.spawn.wave;
           e.spawn.bossTimer = fe.boss.interval;
-          i.events.push({ type: "boss-spawn", pos: { ...i.boss.pos }, bossType: bt });
+          i.events.push({ type: "boss-spawn", pos: { ...i.boss.pos }, bossType: bt, bossNumber, rageLevel: i.boss.rageLevel });
         }
       }
       if (i.boss && !i.boss.dead) stepBoss(i, e, n);
@@ -1572,6 +1641,23 @@ const Kr = (i, e, t, n) => {
   },
   Jr = (i, e) => {
     for (const t of i.particles) sc(t, e);
+    if (i.pendingBursts.length) {
+      const kept = [];
+      // Global per-frame spawn budget across ALL bursts. Prevents a single
+      // frame from spawning 150+ bright additive particles when several bursts
+      // overlap (boss death + multi-pickup + NOVA) -> bloom/GPU stall.
+      let budget = 150;
+      for (const br of i.pendingBursts) {
+        const n = Math.min(br.perFrame, br.remaining, budget);
+        if (n > 0) {
+          ic(br.pos, n, br.color, i);
+          br.remaining -= n;
+          budget -= n;
+        }
+        if (br.remaining > 0) kept.push(br);
+      }
+      i.pendingBursts = kept;
+    }
     ((i.particles = i.particles.filter((t) => t.life > 0)),
       (i.bullets = i.bullets.filter((t) => Xl(t, i.arenaRadius))),
       (i.enemies = i.enemies.filter((t) => !t.dead)),
@@ -5398,6 +5484,21 @@ class mg {
       }
     }
     ((this.positions = new Float32Array(e)), (this.basePositions = new Float32Array(e)));
+    // Precompute constant per-vertex world (x,z) sample coords for Uo. These
+    // depend only on basePositions (fixed sphere geometry); recomputing
+    // acos/atan2/cos/sin per vertex every frame was pure waste and a big
+    // chunk of the per-frame grid cost. (OMM-009 grid O(verts*impulses))
+    {
+      const bp = this.basePositions, c = Pn.radius, vc = bp.length / 3;
+      ((this.vertWX = new Float32Array(vc)), (this.vertWZ = new Float32Array(vc)));
+      for (let r = 0, i = 0; r < bp.length; r += 3, i++) {
+        const o = bp[r], a = bp[r + 1], l = bp[r + 2];
+        const h = Math.acos(Math.max(-1, Math.min(1, a / c))) / Pn.capHalfAngle,
+          f = Math.atan2(l, o);
+        ((this.vertWX[i] = Math.cos(f) * h * fe.worldBounds),
+          (this.vertWZ[i] = Math.sin(f) * h * fe.worldBounds));
+      }
+    }
     const s = new Rt();
     (s.setAttribute("position", new Nt(this.positions, 3)),
       (this.material = new ml({
@@ -5411,20 +5512,16 @@ class mg {
   update(e) {
     const t = this.positions,
       n = this.basePositions,
+      wx = this.vertWX,
+      wz = this.vertWZ,
+      c = Pn.radius,
+      y = 1 / c,
       s = Math.min(1.6, Il(e));
-    for (let r = 0; r < t.length; r += 3) {
+    for (let r = 0, i = 0; r < t.length; r += 3, i++) {
       const o = n[r],
         a = n[r + 1],
         l = n[r + 2],
-        c = Pn.radius,
-        h = Math.acos(Math.max(-1, Math.min(1, a / c))) / Pn.capHalfAngle,
-        f = Math.atan2(l, o),
-        p = Math.cos(f) * h,
-        g = Math.sin(f) * h,
-        _ = p * fe.worldBounds,
-        m = g * fe.worldBounds,
-        d = Uo(e, _, m),
-        y = 1 / c;
+        d = Uo(e, wx[i], wz[i]);
       ((t[r] = o + o * y * d), (t[r + 1] = a + a * y * d), (t[r + 2] = l + l * y * d));
     }
     ((this.mesh.geometry.getAttribute("position").needsUpdate = !0),
@@ -5454,26 +5551,25 @@ class gg {
   }
   update(e) {
     const t = Math.min(this.max, e.length),
-      n = new R();
+      wb = fe.worldBounds;
     for (let s = 0; s < t; s++) {
       const r = e[s];
-      (ws(r.pos.x, r.pos.z, this.impulses, n), this.dummy.position.set(n.x, n.y + r.pos.y, n.z));
+      // Particle sparks render at their sphere-surface base position + own
+      // vertical offset only. Do NOT sample every live impulse here: that made
+      // the renderer O(particles x impulses) per frame, so a boss-death +
+      // multi-pickup spike (1000+ particles x 100+ impulses) stalled the tab.
+      const sp = Li(r.pos.x / wb, r.pos.z / wb, Pn);
+      this.dummy.position.set(sp.x, sp.y + r.pos.y, sp.z);
       const o = Math.max(0, Math.min(1, r.life / r.lifespan)),
-        a = r.size * (0.5 + o * 0.8);
+        a = r.size * (0.4 + o * 1.35);
       (this.dummy.scale.set(a, a, a),
-        this.dummy.rotation.set(r.life * 2, r.life * 1.3, 0),
+        this.dummy.rotation.set(r.life * 3.2, r.life * 2.1, r.life * 1.4),
         this.dummy.updateMatrix(),
         this.mesh.setMatrixAt(s, this.dummy.matrix),
         this.color.setHex(r.color));
-      const l = o;
-      (this.color.multiplyScalar(l), this.mesh.setColorAt(s, this.color));
+      (this.color.multiplyScalar(0.5 + o * 1.6), this.mesh.setColorAt(s, this.color));
     }
-    for (let s = t; s < this.mesh.count; s++)
-      (this.dummy.position.set(0, -9999, 0),
-        this.dummy.scale.set(0, 0, 0),
-        this.dummy.updateMatrix(),
-        this.mesh.setMatrixAt(s, this.dummy.matrix));
-    ((this.mesh.count = Math.max(this.mesh.count, t)),
+    ((this.mesh.count = t),
       (this.mesh.instanceMatrix.needsUpdate = !0),
       this.mesh.instanceColor && (this.mesh.instanceColor.needsUpdate = !0));
   }
@@ -5721,7 +5817,7 @@ class xg {
       this.scene.add(this.entities.group),
       (this.composer = new hg(this.renderer)),
       this.composer.addPass(new fg(this.scene, this.camera.camera)),
-      (this.bloom = new li(new oe(e.clientWidth, e.clientHeight), 1.4, 0.6, 0)),
+      (this.bloom = new li(new oe(e.clientWidth, e.clientHeight), 1.4, 0.6, 0.32)),
       this.composer.addPass(this.bloom),
       window.addEventListener("resize", this.onResize));
   }
@@ -5757,7 +5853,7 @@ class Mg {
       (this.muted = !1),
       (this.started = !1),
       (this.noiseBuffer = null),
-      (this.bpm = 108),
+      (this.bpm = 128),
       (this.nextNoteTime = 0),
       (this.step16 = 0),
       (this.bar = 0),
@@ -5767,12 +5863,20 @@ class Mg {
       (this.lastFire = -1 / 0),
       (this.lastSpawn = -1 / 0),
       (this.spawnAccum = 0),
-      (this.chords = [
-        [220, 261.63, 329.63],
-        [174.61, 220, 261.63],
-        [261.63, 329.63, 392],
-        [196, 246.94, 293.66]
-      ]));
+      (this.normalChords = [
+        [130.81, 155.56, 196],
+        [103.83, 130.81, 155.56],
+        [155.56, 196, 233.08],
+        [116.54, 146.83, 174.61]
+      ]),
+      (this.bossChords = [
+        [130.81, 155.56, 196],
+        [146.83, 174.61, 207.65],
+        [130.81, 155.56, 196],
+        [196, 233.08, 293.66]
+      ]),
+      (this.chords = this.normalChords),
+      (this.bossMode = !1));
   }
   async resume() {
     this.ctx || this.initContext();
@@ -5794,6 +5898,17 @@ class Mg {
   }
   isMuted() {
     return this.muted;
+  }
+  setBossMode(e) {
+    if (e === this.bossMode) return;
+    this.bossMode = e;
+    this.bpm = e ? 142 : 128;
+    this.chords = e ? this.bossChords : this.normalChords;
+    if (this.bgmBus && this.ctx) {
+      const t = this.ctx.currentTime;
+      (this.bgmBus.gain.cancelScheduledValues(t),
+        this.bgmBus.gain.setTargetAtTime(e ? us.bgm * 1.6 : us.bgm, t, 0.4));
+    }
   }
   dispose() {
     (this.schedulerTimer != null &&
@@ -6286,18 +6401,31 @@ class Mg {
     const s = this.ctx,
       r = this.bgmBus,
       o = this.chords[t],
-      a = o[0];
-    (e % 4 === 0 && this.bassNote(a / 2, n, (60 / this.bpm) * 0.9, r, s),
-      (e === 6 || e === 14) && this.bassNote(a / 2, n, (60 / this.bpm) * 0.3, r, s, 0.5));
-    const l = o[e % o.length] * (e >= 8 ? 2 : 1);
-    if ((this.arpNote(l, n, (60 / this.bpm / 4) * 0.9, r, s), e === 0)) {
-      const c = (60 / this.bpm) * 4 * 0.98;
-      for (const u of o) this.padNote(u, n, c, r, s);
+      a = o[0],
+      boss = this.bossMode,
+      sd = 60 / this.bpm / 4;
+    if (boss) {
+      this.bassNote(a / 2, n, sd * 0.85, r, s, e % 2 === 0 ? 1 : 0.6);
+      e % 2 === 1 && this.stabNote(o[2] * 2, n, r, s);
+      const l = o[e % o.length] * (e >= 8 ? 2 : 1.5);
+      this.arpNote(l, n, sd * 0.7, r, s);
+      e % 2 === 0 && this.kick(n, r, s);
+      (e === 4 || e === 12) && this.snare(n, r, s);
+      e % 2 === 0 && this.hat(n, r, s, !1);
+      this.hat(n, r, s, !0);
+    } else {
+      (e % 4 === 0 && this.bassNote(a / 2, n, (60 / this.bpm) * 0.9, r, s),
+        (e === 6 || e === 14) && this.bassNote(a / 2, n, (60 / this.bpm) * 0.3, r, s, 0.5));
+      const l = o[e % o.length] * (e >= 8 ? 2 : 1);
+      if ((this.arpNote(l, n, sd * 0.9, r, s), e === 0)) {
+        const c = (60 / this.bpm) * 4 * 0.98;
+        for (const u of o) this.padNote(u, n, c, r, s);
+      }
+      (e % 4 === 0 && this.kick(n, r, s),
+        (e === 4 || e === 12) && this.snare(n, r, s),
+        e % 2 === 0 && this.hat(n, r, s, !1),
+        e % 4 === 2 && this.hat(n, r, s, !0));
     }
-    (e % 4 === 0 && this.kick(n, r, s),
-      (e === 4 || e === 12) && this.snare(n, r, s),
-      e % 2 === 0 && this.hat(n, r, s, !1),
-      e % 4 === 2 && this.hat(n, r, s, !0));
   }
   bassNote(e, t, n, s, r, o = 1) {
     const a = r.createOscillator();
@@ -6352,6 +6480,30 @@ class Mg {
       a.start(t),
       o.stop(t + n + 0.02),
       a.stop(t + n + 0.02));
+  }
+  stabNote(e, t, n, s) {
+    const r = s.createOscillator(),
+      o = s.createOscillator(),
+      a = s.createBiquadFilter(),
+      l = s.createGain();
+    ((r.type = "sawtooth"),
+      (r.frequency.value = e),
+      (o.type = "square"),
+      (o.frequency.value = e * 1.03),
+      (a.type = "bandpass"),
+      a.frequency.setValueAtTime(e * 2, t),
+      (a.Q.value = 3),
+      l.gain.setValueAtTime(1e-4, t),
+      l.gain.exponentialRampToValueAtTime(0.12, t + 0.004),
+      l.gain.exponentialRampToValueAtTime(1e-4, t + 0.12),
+      r.connect(a),
+      o.connect(a),
+      a.connect(l),
+      l.connect(n),
+      r.start(t),
+      o.start(t),
+      r.stop(t + 0.14),
+      o.stop(t + 0.14));
   }
   padNote(e, t, n, s, r) {
     const o = r.createOscillator();
@@ -6476,7 +6628,7 @@ class Sg {
   start() {
     ((this.paused = !0),
       this.loop.start(),
-      this.showOverlay("GEOMETRY WARS 3D", "시작하려면 클릭 또는 아무 키나 누르세요"),
+      this.showOverlay("GEOMETRY WARS 3D", "Click or press any key to start"),
       (this._begin = () => {
         if (this._began) return;
         this._began = !0;
@@ -6505,6 +6657,7 @@ class Sg {
       return;
     const n = this.playerBulletCount(),
       s = xc(this.world, this.systems, t, e);
+    this.audioStarted && this.audio.setBossMode(!!(this.world.boss && !this.world.boss.dead));
     if ((this.updateHud(), this.audioStarted && !this.muted)) {
       const r = this.world.player.pos.x,
         o = this.world.arenaRadius;
@@ -6517,7 +6670,7 @@ class Sg {
     }
     this.world.gameOver &&
       !this.shownGameOver &&
-      ((this.shownGameOver = !0), this.showOverlay("게임 오버", "R을 누르거나 터치하여 재시작"));
+      ((this.shownGameOver = !0), this.showOverlay("GAME OVER", "Press R or tap to restart"));
   }
   playerBulletCount() {
     let e = 0;
@@ -6560,14 +6713,14 @@ class Sg {
       (this.hud.energyFill.style.opacity = full ? "1" : "0.65"),
         this.hud.energyWrap.classList.toggle("ready", full);
     }
-    if (this.hud.weapon) this.hud.weapon.textContent = "무기 Lv" + p.weaponLevel;
+    if (this.hud.weapon) this.hud.weapon.textContent = "WPN Lv" + p.weaponLevel;
     if (this.hud.lives) this.hud.lives.textContent = "♥".repeat(Math.max(0, p.lives));
     if (this.hud.bossBar) {
       const b = this.world.boss;
       if (b && !b.dead) {
         (this.hud.bossBar.style.display = "flex"),
           (this.hud.bossFill.style.width = Math.max(0, (b.hp / b.maxHp) * 100) + "%"),
-          (this.hud.bossLabel.textContent = b.bossType === "big" ? "⚠ 메가 보스" : "⚠ 미니 보스");
+          (this.hud.bossLabel.textContent = b.bossType === "big" ? "⚠ MEGA BOSS" : "⚠ MINI BOSS");
       } else this.hud.bossBar.style.display = "none";
     }
     if (this.hud.bossTimer) {
@@ -6581,7 +6734,7 @@ class Sg {
         const frac = Math.max(0, Math.min(1, 1 - t / max));
         this.hud.bossTimer.style.display = "flex";
         this.hud.bossTimerFill.style.width = (frac * 100) + "%";
-        this.hud.bossTimerLabel.textContent = "다음 보스 " + Math.ceil(t) + "s";
+        this.hud.bossTimerLabel.textContent = "Next Boss " + Math.ceil(t) + "s";
         this.hud.bossTimerFill.style.background =
           frac > 0.7 ? "linear-gradient(90deg, #ff2bd6, #ff3a4a)" :
           frac > 0.4 ? "linear-gradient(90deg, #ff7733, #ff8a3a)" :
@@ -6646,21 +6799,21 @@ yg();
       <div id="hud-mute">&#128266;</div>
     </div>
     <div id="hud-boss">
-      <div id="hud-boss-label">⚠ 보스</div>
+      <div id="hud-boss-label">⚠ BOSS</div>
       <div id="hud-boss-track"><div id="hud-boss-fill"></div></div>
     </div>
     <div id="hud-bosstimer">
-      <div id="hud-bosstimer-label">다음 보스</div>
+      <div id="hud-bosstimer-label">Next Boss</div>
       <div id="hud-bosstimer-track"><div id="hud-bosstimer-fill"></div></div>
     </div>
     <div id="help">
-      WASD / 방향키 — 이동 &nbsp;•&nbsp; 마우스 — 조준 &nbsp;•&nbsp; 클릭/스페이스 길게 — 발사<br />
-      SHIFT — 부스트 &nbsp;•&nbsp; Q / F — 폭탄(노바) &nbsp;•&nbsp; P — 일시정지 &nbsp;•&nbsp; M — 음소거 &nbsp;•&nbsp; R — 재시작<br />
-      터치: 왼쪽 — 이동 &nbsp;•&nbsp; 오른쪽 — 조준+발사 &nbsp;•&nbsp; 부스트 / 폭탄 / II / R 버튼
+      WASD / Arrow Keys — Move &nbsp;•&nbsp; Mouse — Aim &nbsp;•&nbsp; Hold Click/Space — Fire<br />
+      SHIFT — Boost &nbsp;•&nbsp; Q / F — Bomb (Nova) &nbsp;•&nbsp; P — Pause &nbsp;•&nbsp; M — Mute &nbsp;•&nbsp; R — Restart<br />
+      Touch: Left — Move &nbsp;•&nbsp; Right — Aim+Fire &nbsp;•&nbsp; Boost / Bomb / II / R Buttons
     </div>
     <div id="overlay">
       <h1 id="overlay-title">GEOMETRY WARS 3D</h1>
-      <p id="overlay-hint">시작하려면 클릭 또는 아무 키나 누르세요</p>
+      <p id="overlay-hint">Click or press any key to start</p>
     </div>
   </body>
 </html>
