@@ -283,6 +283,8 @@ const fe = {
       lifespan: 12,
       dropChance: 0.22,
       bossDropCount: 6,
+      magnetRadius: 11,
+      magnetPull: 36,
       colors: {
         heal: 0x33ff88,
         boost: 0xff2bd6,
@@ -1075,7 +1077,8 @@ const Yl = () => ++ql,
       if (it.life <= 0) it.dead = !0;
     }
     const p = world.player;
-    const magnetRadius = 6.5;
+    const magnetRadius = fe.items.magnetRadius;
+    const magnetPull = fe.items.magnetPull;
     if (p.alive) {
       for (const it of world.items) {
         if (it.dead) continue;
@@ -1085,7 +1088,7 @@ const Yl = () => ++ql,
         // magnet: pull items toward player when within magnetRadius
         if (dist <= magnetRadius && dist > 0.001) {
           const pull = 1 - dist / magnetRadius; // 0..1, stronger when closer
-          const mag = 14 * pull * pull;
+          const mag = magnetPull * pull * (0.25 + 0.75 * pull);
           it.vel.x += (dx / dist) * mag * dt;
           it.vel.z += (dz / dist) * mag * dt;
         }
