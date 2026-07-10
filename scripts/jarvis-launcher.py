@@ -308,6 +308,16 @@ def sidecar_routed_launch_args(provider: str, model: str, config_path: Path) -> 
     encoder = read_encoder_role_from_config(config_path)
     if encoder and launchable_config_model(encoder[0], encoder[1]):
         return ["--provider", encoder[0], "--model", encoder[1]]
+    # Both chat and encoder are sidecar-routed (e.g. anthropic-agent-sdk/*). The
+    # sidecar drives all LLM work; Pi only needs a window-init shell that
+    # resolves without a key, so launch Pi on the encoder's sidecar provider
+    # (registered in pi-agent/models.json as a keyless openai-completions shim)
+    # instead of throwing. Parity port of jarvis.ps1
+    # Resolve-SidecarRoutedChatLaunchArgs — without this branch a chat+encoder
+    # pair both on the Claude subscription launched fine on Windows but crashed
+    # the macOS/Linux launcher at window open. (2026-07-10, live user report)
+    if encoder and sidecar_routed_provider(encoder[0]):
+        return ["--provider", encoder[0], "--model", encoder[1]]
     raise RuntimeError(
         f"Provider {provider}/{model} is sidecar-routed or not Pi-launchable; "
         "roles.encoder must be a Pi-launchable provider/model before opening the window."
