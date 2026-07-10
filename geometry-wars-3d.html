@@ -7674,7 +7674,7 @@ const GWLB = (() => {
       return;
     }
     if (isProfane(name) || isProfane(comment)) {
-      msg.textContent = "🚫 KEEP IT CLEAN — 욕설은 등록 불가!";
+      msg.textContent = "🚫 KEEP IT CLEAN!";
       return;
     }
     ((btn.disabled = true), (msg.textContent = "SUBMITTING…"));
@@ -7688,7 +7688,7 @@ const GWLB = (() => {
     } catch (err) {
       const blocked = /submit 4/.test(String(err && err.message));
       ((btn.disabled = false),
-        (msg.textContent = blocked ? "🚫 BLOCKED — 표현을 바꿔봐!" : "⚠ SUBMIT FAILED — TAP TO RETRY"));
+        (msg.textContent = blocked ? "🚫 BLOCKED — TRY NICER WORDS" : "⚠ SUBMIT FAILED — TAP TO RETRY"));
     }
   }
   function blocking() {
@@ -7792,7 +7792,7 @@ yg();
         <div id="gw-final">SCORE 0</div>
         <div id="gw-entry">
           <input id="gw-name" maxlength="12" placeholder="YOUR NAME" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="done" />
-          <input id="gw-comment" maxlength="40" placeholder="한 줄 소감 (선택)" autocomplete="off" spellcheck="false" enterkeyhint="done" />
+          <input id="gw-comment" maxlength="40" placeholder="ONE-LINE COMMENT (OPTIONAL)" autocomplete="off" spellcheck="false" enterkeyhint="done" />
           <button id="gw-submit-btn" class="gw-btn" style="min-width: 130px" type="button">REGISTER</button>
         </div>
         <div id="gw-entry-msg"></div>
