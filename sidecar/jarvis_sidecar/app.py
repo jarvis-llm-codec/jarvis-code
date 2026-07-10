@@ -3906,9 +3906,24 @@ def llmsetting_apply(req: LLMSettingApplyRequest) -> dict[str, Any]:
     applied_encoder = llm_split_model_spec(current.get("encoder"))
     if applied_chat is None or applied_subagent is None or applied_router is None or applied_encoder is None:
         return {"ok": False, "error": "applied roles could not be read back from config.yaml"}
+    # Re-pin the live chat override to the newly applied pick. jarvis.ps1 pins
+    # the launch-time chat model into JARVIS_CHAT_MODEL_OVERRIDE (per process),
+    # and _apply_chat_model_override() re-applies that env value on EVERY
+    # get_llm("chat") resolution — so rewriting config.yaml alone cannot move a
+    # running session off the old chat provider. Before this fix, switching e.g.
+    # anthropic-agent-sdk -> openai-codex mid-session kept every chat turn
+    # resolving (and billing) Claude until a full restart re-derived the
+    # override from config. Only touch the env var when it is already set: a
+    # Pi-native launch has no pin, and creating one here would break direct
+    # config.yaml swaps (2026-06-22 audit behavior). Guarding on `chat is not
+    # None` keeps encoder/router-only applies from flipping a spawned worker's
+    # CLI-pinned chat to the inherited config value. (2026-07-10, reported by
+    # Core: Claude usage kept draining after a mid-session switch to Codex.)
+    if chat is not None and os.environ.get("JARVIS_CHAT_MODEL_OVERRIDE", "").strip():
+        os.environ["JARVIS_CHAT_MODEL_OVERRIDE"] = f"{applied_chat[0]}/{applied_chat[1]}"
     # Refresh in-process caches so the running sidecar picks up the new roles
-    # without needing a restart. Chat goes through _LazyChatLLM so the module
-    # cache invalidation inside reload_encoder_llm() covers it too; encoder is
+    # without needing a restart. Chat re-keys through get_llm()'s cache token
+    # (config content + JARVIS_CHAT_MODEL_OVERRIDE, re-pinned above); encoder is
     # bound to the long-lived slim/JLCEncoder instance and must be swapped.
     global _agent_last_error
     global _agent_last_error_ts

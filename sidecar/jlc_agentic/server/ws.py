@@ -380,6 +380,27 @@ def _preview_for_log(value: Any, limit: int = 500) -> str:
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
+def _refresh_chat_turn_for_model_switch(
+    chat_turn: ChatTurn,
+    built_llm: Any,
+    rebuild: Callable[[], ChatTurn],
+) -> tuple[ChatTurn, Any]:
+    """Rebuild the session's ChatTurn when the chat role was re-pointed live.
+
+    /llmsetting/apply can switch the chat model mid-session (config.yaml +
+    JARVIS_CHAT_MODEL_OVERRIDE re-pin), but this WS session captured
+    get_llm("chat") in a long-lived ChatTurn at connect time — without this
+    check a model switch would keep the session on, and billing, the OLD
+    provider until reconnect. (2026-07-10, reported by Core: Claude usage kept
+    draining after a mid-session switch to Codex.) get_llm() is cached, so the
+    identity probe costs nothing on the unchanged path.
+    """
+    current = get_llm("chat")
+    if current is built_llm:
+        return chat_turn, built_llm
+    return rebuild(), current
+
+
 def _build_chat_turn(slim: JarvisAgentic, emit: Callable[[Outbound], None], conv_id: str, project_path: str | None, content_filter: _ToolArgContentFilter, think_parser: _ThinkTagParser, should_cancel: Callable[[], bool] | None = None) -> ChatTurn:
     dispatcher = get_dispatcher(conv_id=conv_id, storage_root=str(slim.jhb_root), project_root=project_path, retriever=slim.retriever)
     llm = get_llm("chat")
@@ -562,10 +583,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 sys.stderr.write(f"[jarvis-ui] websocket enqueue failed: {type(exc).__name__}: {exc}\n")
                 sys.stderr.flush()
 
+        chat_turn_llm = get_llm("chat")
         chat_turn = _build_chat_turn(slim, emit_from_thread, conv_id, project_path, content_filter, think_parser, should_cancel=cancel_event.is_set)
 
+        def _rebuild_chat_turn() -> ChatTurn:
+            return _build_chat_turn(slim, emit_from_thread, conv_id, project_path, content_filter, think_parser, should_cancel=cancel_event.is_set)
+
         async def _execute_turn(text: str, turn_id: str, route: str = "") -> None:
+            nonlocal chat_turn, chat_turn_llm
             try:
+                # Pick up a mid-session /llmsetting/apply chat switch before the
+                # turn runs (see _refresh_chat_turn_for_model_switch docstring).
+                chat_turn, chat_turn_llm = _refresh_chat_turn_for_model_switch(
+                    chat_turn, chat_turn_llm, _rebuild_chat_turn
+                )
                 conn.messages.append({"role": "user", "content": text})
                 refresh_mixer_tokens(ui_state.mixer, message_text=text, jhb_token=jhb_token)
                 await emit({"type": "user_echo", "text": text, "turn_id": turn_id})
