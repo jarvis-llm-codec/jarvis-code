@@ -271,11 +271,19 @@ const fe = {
     },
     camera: {
       fovBase: 62,
-      fovBoost: 78,
-      traumaDecay: 1.4,
-      shakeAmp: 1.6,
-      rollAmp: 0.18,
-      shakeLambda: 8
+      fovBoost: 62,
+      traumaDecay: 2.2,
+      shakeAmp: 0.55,
+      rollAmp: 0,
+      shakeLambda: 8,
+      eventWobbleDecay: 1.25,
+      eventWobbleShift: 0.42,
+      eventWobbleRoll: 0.012,
+      eventWobbleFov: 1.6,
+      eventEntityShift: 0.32,
+      eventEntityLift: 0.16,
+      eventEntityRoll: 0.035,
+      eventEntityScale: 0.025
     },
     grid: { impulseStrength: 6, maxImpulses: 20 },
     items: {
@@ -703,7 +711,8 @@ const fe = {
     age: 0,
     lifespan: n?.lifespan ?? 2.4,
     wavelength: n?.wavelength ?? 14,
-    speed: n?.speed ?? 60
+    speed: n?.speed ?? 60,
+    coupleEntities: n?.coupleEntities ?? !1
   }),
   Ul = (i, e) => {
     const t = [];
@@ -711,9 +720,10 @@ const fe = {
       const s = n.age + e;
       s >= n.lifespan || t.push({ ...n, age: s });
     }
-    // Cap live ripple count so render-side O(N*M) impulse sampling (grid verts
-    // + entities + camera) stays bounded. Impulses are appended over time, so
-    // the most recent (strongest) are last; drop oldest from the front.
+    // Cap live ripple count so the grid's O(vertices x impulses) sampling stays
+    // bounded. Ordinary ripples remain grid-only; major death ripples can opt
+    // into moving entities with the exact same sampled surface displacement.
+    // Keep the most recent impulses by dropping the oldest from the front.
     if (t.length > fe.grid.maxImpulses) t.splice(0, t.length - fe.grid.maxImpulses);
     return t;
   },
@@ -722,21 +732,22 @@ const fe = {
       t = Math.max(0, 1 - e);
     return i.strength * t * t;
   },
-  Uo = (i, e, t) => {
-    let n = 0;
-    for (const s of i) {
-      const r = e - s.x,
-        o = t - s.z,
-        a = Math.hypot(r, o),
-        l = s.age * s.speed,
-        c = a - l;
-      if (Math.abs(c) > s.wavelength * 2) continue;
-      const u = (c / s.wavelength) * Math.PI * 2,
-        h = Math.exp(-(c * c) / (2 * s.wavelength * s.wavelength)),
-        f = Do(s) * h;
-      n += Math.sin(u) * f;
+  Uo = (i, e, t, n = !1) => {
+    let s = 0;
+    for (const r of i) {
+      if (n && !r.coupleEntities) continue;
+      const o = e - r.x,
+        a = t - r.z,
+        l = Math.hypot(o, a),
+        c = r.age * r.speed,
+        u = l - c;
+      if (Math.abs(u) > r.wavelength * 2) continue;
+      const h = (u / r.wavelength) * Math.PI * 2,
+        f = Math.exp(-(u * u) / (2 * r.wavelength * r.wavelength)),
+        p = Do(r) * f;
+      s += Math.sin(h) * p;
     }
-    return n;
+    return s;
   },
   Il = (i) => {
     let e = 0;
@@ -827,7 +838,7 @@ const Fl = () => ++Nl,
           color: 3399167
         }),
         t.events.push({ type: "game-over", pos: { ...i.pos } }),
-        t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 2.5)));
+        t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 2.5, { coupleEntities: !0 })));
     };
     if (i.lives <= 0) return (killPlayer(), !0);
     i.hitCount = (i.hitCount || 0) + 1;
@@ -840,18 +851,20 @@ const Fl = () => ++Nl,
         t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 1.5)));
       return !0;
     }
-    // third hit: consume one life -> respawn at arena center for a clean restart
+    // third hit: consume one life, but recover exactly where the hit happened.
+    // Resetting pos to arena center felt like an unintended teleport and also
+    // detached the event ripple from the player. Stop momentum only.
     ((i.hitCount = 0),
       (i.lives -= 1),
+      (t.eventWobble = Math.max(t.eventWobble || 0, 0.72)),
       (i.hp = i.maxHp),
       (i.alive = !0),
       (i.invuln = fe.player.shieldTime),
       (i.shield = fe.player.shieldTime),
       (i.weaponLevel = Math.max(1, i.weaponLevel - 1)),
-      (i.pos = { x: 0, y: 0, z: 0 }),
       (i.vel = { x: 0, y: 0, z: 0 }),
       t.events.push({ type: "revive", pos: { ...i.pos } }),
-      t.impulses.push(Lo(0, 0, fe.grid.impulseStrength * 2)));
+      t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 2, { coupleEntities: !0 })));
     if (i.lives <= 0) return (killPlayer(), !0);
     return !0;
   };
@@ -1247,9 +1260,10 @@ const Yl = () => ++ql,
       world.player.score += b.score;
       world.player.energy = fe.player.maxEnergy;
       world.pendingBursts.push({ pos: { ...b.pos }, remaining: fe.particles.perBigKill * 6, color: b.color, perFrame: 130 });
-      world.impulses.push(Lo(b.pos.x, b.pos.z, fe.grid.impulseStrength * 4));
+      world.impulses.push(Lo(b.pos.x, b.pos.z, fe.grid.impulseStrength * 4, { coupleEntities: !0 }));
       sys.shake = pc(sys.shake, 1);
       world.trauma = 1;
+      world.eventWobble = 1;
       world.events.push({ type: "boss-dead", pos: { ...b.pos }, score: b.score });
       for (let i = 0; i < fe.items.bossDropCount; i++) {
         const a = world.rng.next() * Math.PI * 2,
@@ -1499,6 +1513,7 @@ const Kr = (i, e, t, n) => {
         spawnState: { timer: 0, wave: 1, budget: fe.spawn.waveBudgetGrowth, toSpawn: 0 },
         pendingBursts: [],
         trauma: 0,
+        eventWobble: 0,
         gameOver: !1,
         nextId: 1
       },
@@ -1639,6 +1654,7 @@ const Kr = (i, e, t, n) => {
       (e.score = oc(e.score, n)),
       (e.shake = mc(e.shake, n)),
       (i.trauma = e.shake.trauma),
+      (i.eventWobble = Math.max(0, (i.eventWobble || 0) - n * fe.camera.eventWobbleDecay)),
       i.events
     );
   },
@@ -5459,7 +5475,7 @@ void main() {
 						lerpBloomFactor(bloomFactors[2]) * vec4(bloomTintColors[2], 1.0) * texture2D(blurTexture3, vUv) +
 						lerpBloomFactor(bloomFactors[3]) * vec4(bloomTintColors[3], 1.0) * texture2D(blurTexture4, vUv) +
 						lerpBloomFactor(bloomFactors[4]) * vec4(bloomTintColors[4], 1.0) * texture2D(blurTexture5, vUv) );
-				}`})}}li.BlurDirectionX=new oe(1,0);li.BlurDirectionY=new oe(0,1);const Li=(i,e,t)=>{const s=Math.min(1,Math.hypot(i,e))*t.capHalfAngle,r=Math.atan2(e,i),o=Math.sin(s),a=Math.cos(s),l=Math.cos(r),c=Math.sin(r),u=t.radius*o*l,h=t.radius*o*c,f=t.radius*a,p=1/t.radius;return{x:u,y:f,z:h,nx:u*p,ny:f*p,nz:h*p}},Pn={radius:fe.sphereRadius,capHalfAngle:fe.capHalfAngle};new R;const ws=(i,e,t,n)=>{const s=fe.worldBounds,r=i/s,o=e/s,a=Li(r,o,Pn),l=Uo(t,i,e);return n.set(a.x,a.y+l,a.z),n},pg=(i,e,t)=>{const n=fe.worldBounds,s=Li(i/n,e/n,Pn);return t.set(s.nx,s.ny,s.nz)},hr=(i,e,t,n,s,r,o)=>{ws(i,e,t,n),pg(i,e,o);const a=fe.worldBounds,l=Li(i/a,e/a,Pn),c=Li(i/a,(e+.4)/a,Pn);s.set(c.x-l.x,c.y-l.y,c.z-l.z).normalize(),r.crossVectors(o,s).normalize(),s.crossVectors(r,o).normalize()};
+				}`})}}li.BlurDirectionX=new oe(1,0);li.BlurDirectionY=new oe(0,1);const Li=(i,e,t)=>{const s=Math.min(1,Math.hypot(i,e))*t.capHalfAngle,r=Math.atan2(e,i),o=Math.sin(s),a=Math.cos(s),l=Math.cos(r),c=Math.sin(r),u=t.radius*o*l,h=t.radius*o*c,f=t.radius*a,p=1/t.radius;return{x:u,y:f,z:h,nx:u*p,ny:f*p,nz:h*p}},Pn={radius:fe.sphereRadius,capHalfAngle:fe.capHalfAngle};new R;const ws=(i,e,t,n)=>{const s=fe.worldBounds,r=i/s,o=e/s,a=Li(r,o,Pn),l=Uo(t,i,e,!0);return n.set(a.x+a.nx*l,a.y+a.ny*l,a.z+a.nz*l),n},pg=(i,e,t)=>{const n=fe.worldBounds,s=Li(i/n,e/n,Pn);return t.set(s.nx,s.ny,s.nz)},hr=(i,e,t,n,s,r,o)=>{ws(i,e,t,n),pg(i,e,o);const a=fe.worldBounds,l=Li(i/a,e/a,Pn),c=Li(i/a,(e+.4)/a,Pn);s.set(c.x-l.x,c.y-l.y,c.z-l.z).normalize(),r.crossVectors(o,s).normalize(),s.crossVectors(r,o).normalize()};
 class mg {
   constructor() {
     this.seg = 48;
@@ -5527,6 +5543,8 @@ class mg {
         d = Uo(e, wx[i], wz[i]);
       ((t[r] = o + o * y * d), (t[r + 1] = a + a * y * d), (t[r + 2] = l + l * y * d));
     }
+    // The renderer's shared world group owns the rigid event transform. This
+    // mesh only applies local ripple deformation, avoiding transform drift.
     ((this.mesh.geometry.getAttribute("position").needsUpdate = !0),
       (this.material.opacity = 0.45 + s * 0.4),
       this.material.color.setHex(s > 0.01 ? Xt.gridGlow : Xt.grid));
@@ -5636,17 +5654,19 @@ class _g {
       (this.bossMesh = new It(this.bossGeo, this.bossMat)),
       (this.bossMesh.visible = !1),
       this.group.add(this.bossMesh));
-    this._col = new Ve();
+    ((this._col = new Ve()), (this.lastBossVisual = null));
   }
   setImpulses(e) {
     this.impulses = e;
   }
-  update(e, t, n, s, items, boss) {
+  update(e, t, n, s, items, boss, eventWobble = 0) {
     const r = new R(),
       o = new R(),
       a = new R(),
-      l = new R();
-    (hr(e.pos.x, e.pos.z, this.impulses, r, o, a, l), this.playerMesh.position.copy(r));
+      l = new R(),
+      eventAmount = Math.max(0, Math.min(1, eventWobble));
+    (hr(e.pos.x, e.pos.z, this.impulses, r, o, a, l),
+      this.playerMesh.position.copy(r));
     const c = new R();
     (ws(e.pos.x + e.aim.x, e.pos.z + e.aim.z, this.impulses, c), o.subVectors(c, r).normalize());
     const u = new Je();
@@ -5731,17 +5751,28 @@ class _g {
     ((this.itemInst.count = Math.max(this.itemInst.count, ip)),
       (this.itemInst.instanceMatrix.needsUpdate = !0),
       this.itemInst.instanceColor && (this.itemInst.instanceColor.needsUpdate = !0));
-    // boss
-    if (boss && !boss.dead) {
+    // boss: cache a render-only snapshot so a defeated boss can wobble/fade
+    // with the death event after simulation safely clears world.boss.
+    if (boss && !boss.dead)
+      this.lastBossVisual = {
+        pos: { x: boss.pos.x, z: boss.pos.z },
+        radius: boss.radius,
+        color: boss.color,
+        bossType: boss.bossType
+      };
+    const renderBoss = boss && !boss.dead ? boss : eventAmount > 0 ? this.lastBossVisual : null,
+      bossDeathEcho = renderBoss && renderBoss !== boss;
+    if (renderBoss) {
+      const echoScale = bossDeathEcho ? 0.82 + eventAmount * 0.18 : 1;
       (this.bossMesh.visible = !0,
-        hr(boss.pos.x, boss.pos.z, this.impulses, r, o, a, l),
+        hr(renderBoss.pos.x, renderBoss.pos.z, this.impulses, r, o, a, l),
         this.bossMesh.position.copy(r),
         this.bossMesh.rotation.set(s * 0.8, s * 0.6, s * 0.4),
-        this.bossMesh.scale.setScalar(boss.radius * (1 + Math.sin(s * 4) * 0.05)),
-        this.bossMesh.material.color.setHex(boss.color),
-        (this.bossMesh.material.opacity = boss.bossType === "big" ? 1 : 0.92));
+        this.bossMesh.scale.setScalar(renderBoss.radius * echoScale * (1 + Math.sin(s * 4) * 0.05)),
+        this.bossMesh.material.color.setHex(renderBoss.color),
+        (this.bossMesh.material.opacity = (renderBoss.bossType === "big" ? 1 : 0.92) * (bossDeathEcho ? eventAmount : 1)));
     } else {
-      this.bossMesh.visible = !1;
+      ((this.bossMesh.visible = !1), (this.lastBossVisual = null));
     }
   }
   dispose() {
@@ -5774,27 +5805,39 @@ class vg {
   set trauma(e) {
     this.shakeState.trauma = e;
   }
-  update(e, t, n, s, r) {
+  update(e, t, n, s, r, eventWobble = 0) {
     const o = new R();
     ws(e.x, e.z, n, o);
-    const a = Math.hypot(t.x, t.z),
-      l = new R(e.x, 0, e.z).normalize().multiplyScalar(16),
+    const l = new R(e.x, 0, e.z).normalize().multiplyScalar(16),
       c = new R(o.x + l.x, o.y + 34, o.z + 30 + l.z),
       u = 1 - Math.exp(-6 * r);
     this.pos.lerp(c, u);
-    const h = Iu.lerp(fe.camera.fovBase, fe.camera.fovBoost, Math.min(1, a / 26));
-    ((this.fov += (h - this.fov) * (1 - Math.exp(-4 * r))),
-      (this.camera.fov = this.fov),
-      this.camera.updateProjectionMatrix(),
-      this.look.lerp(o, u),
-      (this.shakeState.trauma = this.trauma));
-    const f = gc(this.shakeState, s);
-    (this.camera.position.set(this.pos.x + f.x, this.pos.y + f.y, this.pos.z + f.z),
+    (this.look.lerp(o, u), (this.shakeState.trauma = this.trauma));
+    const f = gc(this.shakeState, s),
+      p = Math.max(0, Math.min(1, eventWobble)),
+      w = p * p,
+      wx = Math.sin(s * 18) * fe.camera.eventWobbleShift * w,
+      wy = Math.sin(s * 23 + 1.1) * fe.camera.eventWobbleShift * 0.55 * w,
+      roll = Math.sin(s * 16 + 0.4) * fe.camera.eventWobbleRoll * w;
+    (this.camera.position.set(this.pos.x + f.x + wx, this.pos.y + f.y + wy, this.pos.z + f.z),
       this.camera.up.set(0, 1, 0),
       this.camera.lookAt(this.look.x + f.x, this.look.y + f.y, this.look.z + f.z),
-      this.camera.rotateZ(f.roll));
+      this.camera.rotateZ(roll),
+      (this.camera.fov = fe.camera.fovBase + Math.sin(s * 12.5) * fe.camera.eventWobbleFov * w),
+      this.camera.updateProjectionMatrix());
   }
 }
+const setWorldEventTransform = (group, eventWobble, time) => {
+  const eventAmount = Math.max(0, Math.min(1, eventWobble)),
+    eventPower = eventAmount * eventAmount;
+  (group.position.set(
+    Math.sin(time * 18) * fe.camera.eventEntityShift * eventPower,
+    Math.sin(time * 23 + 1.1) * fe.camera.eventEntityLift * eventPower,
+    0
+  ),
+    (group.rotation.z = Math.sin(time * 16 + 0.4) * fe.camera.eventEntityRoll * eventPower),
+    group.scale.setScalar(1 + Math.sin(time * 12.5) * fe.camera.eventEntityScale * eventPower));
+};
 class xg {
   constructor(e, t) {
     ((this.onResize = () => {
@@ -5812,12 +5855,14 @@ class xg {
       (this.scene = new Vm()),
       (this.scene.fog = new Lr(Xt.bg, 0.012)),
       (this.camera = new vg(e.clientWidth / e.clientHeight, t)),
+      (this.eventGroup = new yi()),
+      this.scene.add(this.eventGroup),
       (this.grid = new mg()),
-      this.scene.add(this.grid.mesh),
+      this.eventGroup.add(this.grid.mesh),
       (this.particles = new gg()),
-      this.scene.add(this.particles.mesh),
+      this.eventGroup.add(this.particles.mesh),
       (this.entities = new _g()),
-      this.scene.add(this.entities.group),
+      this.eventGroup.add(this.entities.group),
       (this.composer = new hg(this.renderer)),
       this.composer.addPass(new fg(this.scene, this.camera.camera)),
       (this.bloom = new li(new oe(e.clientWidth, e.clientHeight), 1.4, 0.6, 0.32)),
@@ -5826,13 +5871,14 @@ class xg {
   }
   update(e, t) {
     ((this.bloom.strength = 1.4 + t.score.multiplierPulse * 0.6),
+      setWorldEventTransform(this.eventGroup, e.eventWobble, e.time),
       this.grid.update(e.impulses),
       this.particles.setImpulses(e.impulses),
       this.particles.update(e.particles),
       this.entities.setImpulses(e.impulses),
-      this.entities.update(e.player, e.enemies, e.bullets, e.time, e.items, e.boss),
+      this.entities.update(e.player, e.enemies, e.bullets, e.time, e.items, e.boss, e.eventWobble),
       (this.camera.trauma = e.trauma),
-      this.camera.update(e.player.pos, e.player.vel, e.impulses, e.time, fe.fixedStep));
+      this.camera.update(e.player.pos, e.player.vel, e.impulses, e.time, fe.fixedStep, e.eventWobble));
   }
   render() {
     this.composer.render();
