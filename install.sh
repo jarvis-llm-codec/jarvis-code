@@ -162,7 +162,6 @@ install_python_with_package_manager() {
     run_privileged apt-get install -y python3.13 python3.13-venv || \
       run_privileged apt-get install -y python3.12 python3.12-venv || \
       run_privileged apt-get install -y python3.11 python3.11-venv || \
-      run_privileged apt-get install -y python3.10 python3.10-venv || \
       run_privileged apt-get install -y python3 python3-venv
   elif command -v dnf >/dev/null 2>&1; then
     run_privileged dnf install -y python3 python3-pip
@@ -180,7 +179,7 @@ install_python() {
     return 0
   fi
 
-  log "Python 3.10+ not found"
+  log "Python 3.11+ not found"
   if is_macos && command -v brew >/dev/null 2>&1; then
     log "attempting automatic Python install with Homebrew"
     brew install python || log "Homebrew Python install failed; checking PATH anyway"
@@ -190,8 +189,8 @@ install_python() {
   fi
 
   if ! find_python >/dev/null 2>&1; then
-    printf 'JARVIS Code requires Python 3.10 or newer with venv/ensurepip.\n' >&2
-    print_prereq_help "Python 3.10+" "python" "Install Python 3.10+ plus the venv package (for example python3-venv on Debian/Ubuntu), then retry."
+    printf 'JARVIS Code requires Python 3.11 or newer with venv/ensurepip.\n' >&2
+    print_prereq_help "Python 3.11+" "python" "Install Python 3.11+ plus the venv package (for example python3-venv on Debian/Ubuntu), then retry."
     exit 1
   fi
 }
@@ -256,10 +255,10 @@ find_python() {
   # PATH order can hide a new-enough interpreter behind an old one (for
   # example Apple's /usr/bin/python3 shadowing Homebrew python), so try
   # versioned names and the common Homebrew locations too.
-  for candidate in python3 python python3.13 python3.12 python3.11 python3.10 \
+  for candidate in python3 python python3.13 python3.12 python3.11 \
     /opt/homebrew/bin/python3 /usr/local/bin/python3; do
     if command -v "$candidate" >/dev/null 2>&1; then
-      if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+      if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
         printf '%s\n' "$candidate"
         return 0
       fi
@@ -462,7 +461,7 @@ install_node_deps() {
 install_sidecar_venv() {
   root=$1
   if ! py=$(find_python); then
-    printf 'JARVIS Code requires Python 3.10 or newer.\n' >&2
+    printf 'JARVIS Code requires Python 3.11 or newer.\n' >&2
     exit 1
   fi
   sidecar="$root/sidecar"

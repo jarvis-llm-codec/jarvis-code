@@ -126,6 +126,14 @@ class LLMClient:
                 return await self._post_chat_completion(provider, system, user, max_tokens, on_chunk)
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
+                # Permanent client errors (bad request / auth / not found) do not
+                # heal with time: retrying re-sends the identical doomed request.
+                # Before this guard, an invalid API key burned 8 attempts here ×5
+                # in the encoder's outer loop = up to 40 requests and ~30min of
+                # backoff per encode. Fail fast instead. (2026-07-10 audit)
+                if status in (400, 401, 403, 404):
+                    print(f"[jlc:llm] {provider.name} HTTP {status} is permanent, not retrying", file=sys.stderr)
+                    raise
                 if status == 429:
                     ra = exc.response.headers.get("retry-after", "")
                     if ra.strip().isdigit():

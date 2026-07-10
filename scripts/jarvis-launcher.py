@@ -101,9 +101,9 @@ def is_windows() -> bool:
 
 
 def ensure_supported_python() -> None:
-    if sys.version_info < (3, 10):
+    if sys.version_info < (3, 11):
         version = ".".join(str(part) for part in sys.version_info[:3])
-        raise SystemExit(f"JARVIS Code requires Python 3.10 or newer; found {version} at {sys.executable}")
+        raise SystemExit(f"JARVIS Code requires Python 3.11 or newer; found {version} at {sys.executable}")
 
 
 def venv_python() -> Path:
@@ -611,7 +611,7 @@ def choose_port() -> None:
 
 def find_host_python() -> str:
     # The running interpreter already passed ensure_supported_python(), while
-    # whichever python3 happens to be first on PATH may be older than 3.10 and
+    # whichever python3 happens to be first on PATH may be older than 3.11 and
     # would build a broken sidecar venv.
     return sys.executable
 

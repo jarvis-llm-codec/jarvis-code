@@ -2571,7 +2571,13 @@ export class AgentSession {
 
 		const err = message.errorMessage;
 		// Match: overloaded_error, provider returned error, rate limit, 429, 500, 502, 503, 504, service unavailable, network/connection errors (including connection lost), WebSocket transport closes/errors, fetch failed, premature stream endings, HTTP/2 closed before response, terminated, retry delay exceeded
-		return /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|stream ended before message_stop|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i.test(
+		// HTTP status codes only count when they sit next to an HTTP-ish token
+		// ("HTTP 500", "status code 503", "error 429", "500 Internal Server
+		// Error") — a plain number inside a validation message like
+		// "max_tokens must be below 500" is NOT a server error and retrying it
+		// re-sends the identical doomed request with full context up to 3
+		// times. (2026-07-10 audit finding #6)
+		return /overloaded|provider.?returned.?error|rate.?limit|too many requests|(?:\bstatus\b|\bhttp\b|\bcode\b|\berror\b)[^a-z]{0,6}(?<![0-9])(?:429|500|502|503|504)(?![0-9])|(?<![0-9])(?:429|500|502|503|504)[^0-9a-z]{0,4}(?:internal|server|service|bad|gateway|unavailable|too many)|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|stream ended before message_stop|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i.test(
 			err,
 		);
 	}

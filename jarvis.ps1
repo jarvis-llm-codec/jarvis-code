@@ -1304,6 +1304,32 @@ function Stop-ExistingSidecarForVisibleWindow {
     $connections = @(Get-NetTCPConnection -LocalPort ([int]$Port) -State Listen -ErrorAction SilentlyContinue)
     if ($connections.Count -eq 0) { return }
 
+    # Multi-window guard: a LIVE sidecar answering /health on this port belongs
+    # to another running window (pair ids are per-launch, so it can never be
+    # ours at this point). Killing it here severed window A's in-flight requests
+    # and memory writes whenever window B launched with --sidecar-window — and
+    # the first three runs after install force ShowSidecarWindow on, so fresh
+    # installs hit this by just opening a second window. Leave live sidecars
+    # alone: this window picks its own free port via Select-SidecarPort and
+    # starts its own (visible) sidecar there. Only an unresponsive zombie still
+    # falls through to the restart below. Two probes because /health shares the
+    # async loop with bge-m3/encoder work and one 4s probe can time out on a
+    # perfectly live sidecar (same rationale as Wait-SidecarHealthy).
+    # (2026-07-10 audit finding #4)
+    foreach ($probe in 1..2) {
+        try {
+            $response = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 4
+            if ($response.ok -eq $true -and $response.service -eq "jarvis-jlc-sidecar") {
+                Write-Host "[jarvis] port $Port already serves a live JARVIS sidecar (pair '$($response.pair_id)'); leaving it alone — this window will use its own port."
+                return
+            }
+            break
+        } catch {
+            if ($probe -ge 2) { break }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
     $candidateIds = New-Object System.Collections.Generic.HashSet[int]
     foreach ($conn in $connections) {
         [void]$candidateIds.Add([int]$conn.OwningProcess)

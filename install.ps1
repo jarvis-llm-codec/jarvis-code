@@ -196,7 +196,7 @@ function Test-PythonVersion {
     $oldErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & $Command @BaseArgs -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" *> $null
+        & $Command @BaseArgs -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" *> $null
         return $LASTEXITCODE -eq 0
     } catch {
         return $false
@@ -236,11 +236,11 @@ function Get-PythonCommand {
     $python = Find-PythonCommand
     if ($python) { return $python }
 
-    Install-WingetPackage -PackageId "Python.Python.3.12" -DisplayName "Python 3.10 or newer"
+    Install-WingetPackage -PackageId "Python.Python.3.12" -DisplayName "Python 3.11 or newer"
     $python = Find-PythonCommand
     if ($python) { return $python }
 
-    throw "Python 3.10 or newer is required. Install it from https://www.python.org/downloads/ or run: winget install Python.Python.3.12"
+    throw "Python 3.11 or newer is required. Install it from https://www.python.org/downloads/ or run: winget install Python.Python.3.12"
 }
 
 function Invoke-Python {

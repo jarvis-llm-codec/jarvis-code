@@ -3,12 +3,12 @@
 ## Requirements
 
 - Node.js 20 or newer, auto-installed on Windows when `winget` is available
-- Python 3.10 or newer, auto-installed on Windows when `winget` is available
+- Python 3.11 or newer, auto-installed on Windows when `winget` is available
 - Git, auto-installed on Windows when `winget` is available
 - Microsoft Visual C++ 2015-2022 Redistributable (x64), auto-installed on
   Windows when `winget` is available
 - PowerShell on Windows
-- macOS/Linux: Node.js 20+, npm, Python 3.10+ with `venv`/`ensurepip`, Git,
+- macOS/Linux: Node.js 20+, npm, Python 3.11+ with `venv`/`ensurepip`, Git,
   `curl`, `tar`, and a POSIX shell
 
 On macOS, the POSIX installer can use Homebrew to install missing Git, Node.js,

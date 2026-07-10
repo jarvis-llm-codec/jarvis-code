@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/i
 
 - Node.js 20 or newer
 - npm
-- Python 3.10 or newer
+- Python 3.11 or newer
 - Python `venv`/`ensurepip` support
 - Git
 - `curl`, `tar`, and a POSIX shell on macOS/Linux

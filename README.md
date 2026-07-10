@@ -100,7 +100,7 @@ For a faster first install that defers the large embedding-model download until 
 curl -fsSL https://raw.githubusercontent.com/jarvis-llm-codec/jarvis-code/main/install.sh | env JARVIS_CODE_NO_MODEL_PRELOAD=1 sh
 ```
 
-macOS/Linux requires Node.js 20+, npm, Python 3.10+ with `venv`/`ensurepip`, Git, `curl`, and `tar`. On macOS the installer can use Homebrew for missing Git, Node.js, or Python. On Linux, install missing prerequisites with your distribution package manager if the installer reports them missing.
+macOS/Linux requires Node.js 20+, npm, Python 3.11+ with `venv`/`ensurepip`, Git, `curl`, and `tar`. On macOS the installer can use Homebrew for missing Git, Node.js, or Python. On Linux, install missing prerequisites with your distribution package manager if the installer reports them missing.
 
 On NVIDIA Windows/Linux machines, the installer detects `nvidia-smi` and installs CUDA PyTorch from PyTorch's `cu126` wheel index before the rest of the sidecar dependencies; set `JARVIS_CODE_CPU_ONLY=1` before install to force CPU PyTorch.
 
@@ -119,7 +119,7 @@ Windows installs under `%LOCALAPPDATA%\JARVIS-Code`; macOS/Linux installs under 
 | Python sidecar (incl. PyTorch, CPU) | ~1.3 GB |
 | NVIDIA CUDA PyTorch — *only when `nvidia-smi` is detected* | ~2.7 GB download |
 | `bge-m3` embedding model — **powers recall (required)** | ~2.3 GB download · ~4.3 GB on disk |
-| Prerequisites — Node 20+, Python 3.10+, Git, MSVC on Windows — *only if missing* | ~0.5 GB |
+| Prerequisites — Node 20+, Python 3.11+, Git, MSVC on Windows — *only if missing* | ~0.5 GB |
 
 **Total ≈ 6 GB on CPU installs; NVIDIA installs can be ~2.7 GB larger** (plus prerequisites if you don't already have them). Recall runs on a **BM25 + bge-m3** hybrid — keyword search plus semantic embeddings — so the model is core, not optional; `JARVIS_CODE_NO_MODEL_PRELOAD=1` only **defers** its download to first use. Your memory data under `~/.jarvis-code` starts small and grows slowly with use.
 
