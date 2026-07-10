@@ -160,6 +160,20 @@
         background: rgba(57,224,255,0.06); overflow: hidden; box-shadow: 0 0 10px rgba(57,224,255,0.2) inset; }
       #hud-bosstimer-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #39e0ff, #ff7733);
         box-shadow: 0 0 12px #39e0ff; transition: width 0.15s linear; }
+      #damage-vignette {
+        position: fixed; inset: 0; z-index: 11; pointer-events: none; opacity: 0;
+        background: radial-gradient(circle, transparent 42%, rgba(255,122,24,0.12) 68%, rgba(255,78,18,0.72) 100%);
+        mix-blend-mode: screen;
+      }
+      #damage-vignette.flash { animation: damage-flash 360ms ease-out; }
+      @keyframes damage-flash {
+        0% { opacity: 0.95; }
+        35% { opacity: 0.58; }
+        100% { opacity: 0; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #damage-vignette.flash { animation-duration: 180ms; }
+      }
     </style>
     <script type="module">
 (function () {
@@ -283,7 +297,11 @@ const fe = {
       eventEntityShift: 0.32,
       eventEntityLift: 0.16,
       eventEntityRoll: 0.035,
-      eventEntityScale: 0.025
+      eventEntityScale: 0.025,
+      zoomMin: 0.78,
+      zoomMax: 1.38,
+      zoomWheelSpeed: 0.00075,
+      zoomLambda: 7
     },
     grid: { impulseStrength: 6, maxImpulses: 20 },
     items: {
@@ -400,7 +418,9 @@ const fe = {
       l = !1,
       c = !1,
       u = null,
-      sk = !1;
+      sk = !1,
+      aimResolver = null,
+      lastResolvedAim = null;
     const isTouch = () => "ontouchstart" in window || navigator.maxTouchPoints > 0;
     const JD = 70;
     let jl, jr, kl, kr, bb, bp, bm, bs;
@@ -549,6 +569,9 @@ const fe = {
     };
     return {
       aimFromMouse: !0,
+      setMouseAimResolver(resolver) {
+        aimResolver = resolver;
+      },
       attach(S) {
         (c && x(),
           (u = S),
@@ -621,7 +644,7 @@ const fe = {
       detach() {
         x();
       },
-      snapshot() {
+      snapshot(playerPos) {
         const S = Rl();
         let C = 0,
           A = 0;
@@ -637,8 +660,13 @@ const fe = {
           (w > 0.01 && ((S.moveX = C / Math.max(1, w)), (S.moveZ = A / Math.max(1, w))),
           n && (e || t))
         ) {
-          const U = Math.hypot(e, t);
-          U > 0.001 && ((S.aimX = e / U), (S.aimZ = t / U));
+          const resolved = aimResolver && playerPos ? aimResolver(e, t, playerPos) : null;
+          if (resolved && Number.isFinite(resolved.x) && Number.isFinite(resolved.z)) lastResolvedAim = resolved;
+          const mouseAim = lastResolvedAim || (() => {
+            const U = Math.hypot(e, t);
+            return U > 0.001 ? { x: e / U, z: t / U } : null;
+          })();
+          mouseAim && ((S.aimX = mouseAim.x), (S.aimZ = mouseAim.z));
         } else (S.moveX || S.moveZ) && ((S.aimX = S.moveX), (S.aimZ = S.moveZ));
         if (ta.id !== null) {
           const U = Math.hypot(ta.dx, ta.dy);
@@ -712,6 +740,7 @@ const fe = {
     lifespan: n?.lifespan ?? 2.4,
     wavelength: n?.wavelength ?? 14,
     speed: n?.speed ?? 60,
+    eventTier: n?.eventTier ?? "ordinary",
     coupleEntities: n?.coupleEntities ?? !1
   }),
   Ul = (i, e) => {
@@ -830,6 +859,7 @@ const Fl = () => ++Nl,
         (i.alive = !1),
         (i.hitCount = 0),
         (t.gameOver = !0),
+        (t.eventWobble = Math.max(t.eventWobble || 0, 1)),
         t.events.push({
           type: "explode",
           pos: { ...i.pos },
@@ -838,7 +868,15 @@ const Fl = () => ++Nl,
           color: 3399167
         }),
         t.events.push({ type: "game-over", pos: { ...i.pos } }),
-        t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 2.5, { coupleEntities: !0 })));
+        t.impulses.push(
+          Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 3.2, {
+            lifespan: 2.8,
+            wavelength: 16,
+            speed: 48,
+            eventTier: "death",
+            coupleEntities: !0
+          })
+        ));
     };
     if (i.lives <= 0) return (killPlayer(), !0);
     i.hitCount = (i.hitCount || 0) + 1;
@@ -864,7 +902,12 @@ const Fl = () => ++Nl,
       (i.weaponLevel = Math.max(1, i.weaponLevel - 1)),
       (i.vel = { x: 0, y: 0, z: 0 }),
       t.events.push({ type: "revive", pos: { ...i.pos } }),
-      t.impulses.push(Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 2, { coupleEntities: !0 })));
+      t.impulses.push(
+        Lo(i.pos.x, i.pos.z, fe.grid.impulseStrength * 2, {
+          eventTier: "heart",
+          coupleEntities: !0
+        })
+      ));
     if (i.lives <= 0) return (killPlayer(), !0);
     return !0;
   };
@@ -982,7 +1025,7 @@ const Yl = () => ++ql,
       dead: !1
     };
   },
-  Io = (i, e) => ((i.hp -= e), i.hp <= 0 ? ((i.hp = 0), (i.dead = !0), !0) : !1),
+  Io = (i, e) => ((i.hitFlash = 0.14), (i.hp -= e), i.hp <= 0 ? ((i.hp = 0), (i.dead = !0), !0) : !1),
   Ri = (i, e, t, n) => {
     ((i.vel.x = e.x * t), (i.vel.z = e.z * t), (i.pos.x += i.vel.x * n), (i.pos.z += i.vel.z * n));
   },
@@ -1196,6 +1239,7 @@ const Yl = () => ++ql,
     b.phase += dt;
     b.behaviorTimer += dt;
     b.fireCooldown -= dt;
+    b.hitFlash = Math.max(0, (b.hitFlash || 0) - dt);
     const toP = { x: p.pos.x - b.pos.x, z: p.pos.z - b.pos.z },
       d = Math.hypot(toP.x, toP.z) || 1,
       tang = { x: -toP.z / d, z: toP.x / d };
@@ -1253,6 +1297,7 @@ const Yl = () => ++ql,
   bossHit = (b, dmg, world, sys) => {
     if (!b || b.dead) return;
     b.hp -= dmg;
+    b.hitFlash = 0.14;
     world.events.push({ type: "boss-hit", pos: { ...b.pos } });
     if (b.hp <= 0) {
       b.hp = 0;
@@ -1260,7 +1305,15 @@ const Yl = () => ++ql,
       world.player.score += b.score;
       world.player.energy = fe.player.maxEnergy;
       world.pendingBursts.push({ pos: { ...b.pos }, remaining: fe.particles.perBigKill * 6, color: b.color, perFrame: 130 });
-      world.impulses.push(Lo(b.pos.x, b.pos.z, fe.grid.impulseStrength * 4, { coupleEntities: !0 }));
+      world.impulses.push(
+        Lo(b.pos.x, b.pos.z, fe.grid.impulseStrength * 4, {
+          lifespan: 3,
+          wavelength: 18,
+          speed: 46,
+          eventTier: "death",
+          coupleEntities: !0
+        })
+      );
       sys.shake = pc(sys.shake, 1);
       world.trauma = 1;
       world.eventWobble = 1;
@@ -1525,16 +1578,24 @@ const Kr = (i, e, t, n) => {
       s = ac(e.score, t, i.player, i.time);
     ((e.score = s.sys), i.events.push(...s.events));
     i.player.energy = Math.min(fe.player.maxEnergy, i.player.energy + fe.player.energyPerKill);
-    const r = t.kind === "singularity";
-    if (
-      (ic(t.pos, r ? fe.particles.perBigKill : fe.particles.perKill, n, i),
-      i.impulses.push(Lo(t.pos.x, t.pos.z, fe.grid.impulseStrength * (r ? 2 : 1))),
-      (e.shake = pc(e.shake, r ? 0.7 : 0.18)),
+    const r = t.kind === "singularity",
+      shakeGain = { grunt: 0, wanderer: 0.05, dodger: 0.08, singularity: 0.62 }[t.kind] || 0;
+    (ic(t.pos, r ? fe.particles.perBigKill : fe.particles.perKill, n, i),
+      r &&
+        i.impulses.push(
+          Lo(t.pos.x, t.pos.z, fe.grid.impulseStrength * 2, {
+            lifespan: 1.45,
+            wavelength: 6.5,
+            speed: 18,
+            eventTier: "localBlast",
+            coupleEntities: !0
+          })
+        ),
+      shakeGain > 0 && (e.shake = pc(e.shake, shakeGain)),
       (i.trauma = e.shake.trauma),
       (e.spawn.killsThisWave += 1),
-      (e.spawn = fc(e.spawn, e.spawn.killsThisWave)),
-      i.rng.chance(fe.items.dropChance))
-    ) {
+      (e.spawn = fc(e.spawn, e.spawn.killsThisWave)));
+    if (i.rng.chance(fe.items.dropChance)) {
       const kinds = Object.keys(fe.items.colors),
         wt = { life: 5, heal: 4, weapon: 2, boost: 2, shield: 2, multiplier: 1 },
         pool = kinds.flatMap((k) => Array(wt[k] || 1).fill(k)),
@@ -1551,7 +1612,12 @@ const Kr = (i, e, t, n) => {
       }
   },
   xc = (i, e, t, n) => {
-    if (((i.events = []), i.gameOver)) return (Jr(i, n), i.events);
+    if (((i.events = []), i.gameOver))
+      return (
+        Jr(i, n),
+        (i.eventWobble = Math.max(0, (i.eventWobble || 0) - n * fe.camera.eventWobbleDecay)),
+        i.events
+      );
     (
       (i.time += n),
       Bl(i.player, t, n, i),
@@ -1583,6 +1649,7 @@ const Kr = (i, e, t, n) => {
     const r = i.bullets.filter((l) => l.owner === "player" && !l.spent);
     for (const l of i.enemies) {
       if (l.dead) continue;
+      l.hitFlash = Math.max(0, (l.hitFlash || 0) - n);
       Ql({ enemy: l, player: i.player, bullets: r, world: i, dt: n });
       const c = i.arenaRadius - l.radius,
         u = Math.hypot(l.pos.x, l.pos.z);
@@ -5637,23 +5704,88 @@ class _g {
       this.group.add(this.bulletInst));
     ((this.enemyBulletGeo = new Nr(0.24, 0.6, 5, 6)),
       this.enemyBulletGeo.rotateX(Math.PI / 2),
-      (this.enemyBulletMat = Zn(0xff3a4a)),
+      (this.enemyBulletMat = Zn(0xff243f)),
       (this.enemyBulletInst = new $n(this.enemyBulletGeo, this.enemyBulletMat, 512)),
       this.enemyBulletInst.instanceMatrix.setUsage(Mr),
       (this.enemyBulletInst.frustumCulled = !1),
       (this.enemyBulletInst.count = 0),
-      this.group.add(this.enemyBulletInst));
+      this.group.add(this.enemyBulletInst),
+      (this.enemyBulletTrailMat = new Ii({ color: 0xff6a24, blending: ii, depthWrite: !1, transparent: !0, opacity: 0.28 })),
+      (this.enemyBulletTrailInst = new $n(this.enemyBulletGeo, this.enemyBulletTrailMat, 512)),
+      this.enemyBulletTrailInst.instanceMatrix.setUsage(Mr),
+      (this.enemyBulletTrailInst.frustumCulled = !1),
+      (this.enemyBulletTrailInst.count = 0),
+      this.group.add(this.enemyBulletTrailInst));
     ((this.itemGeo = new ys(0.5, 0)),
       (this.itemInst = new $n(this.itemGeo, Zn(16777215), 128)),
       this.itemInst.instanceMatrix.setUsage(Mr),
       (this.itemInst.frustumCulled = !1),
       (this.itemInst.count = 0),
-      this.group.add(this.itemInst));
-    ((this.bossGeo = new Br(1, 1)),
-      (this.bossMat = Zn(16777215)),
-      (this.bossMesh = new It(this.bossGeo, this.bossMat)),
-      (this.bossMesh.visible = !1),
-      this.group.add(this.bossMesh));
+      this.group.add(this.itemInst),
+      (this.itemRingGeo = new Nr(0.72, 0.72, 0.08, 16, 1, !0)),
+      (this.itemRingMat = new Ii({ color: 16777215, wireframe: !0, blending: ii, depthWrite: !1, transparent: !0, opacity: 0.72 })),
+      (this.itemRingInst = new $n(this.itemRingGeo, this.itemRingMat, 128)),
+      this.itemRingInst.instanceMatrix.setUsage(Mr),
+      (this.itemRingInst.frustumCulled = !1),
+      (this.itemRingInst.count = 0),
+      this.group.add(this.itemRingInst));
+    ((this.bossGeo = {
+      armor: new zr(1, 0),
+      joint: new Br(1, 0),
+      head: new ys(1, 0)
+    }),
+      (this.bossArmorMat = new Ii({
+        color: 16777215,
+        blending: ii,
+        depthWrite: !1,
+        transparent: !0,
+        opacity: 1
+      })),
+      (this.bossJointMat = new Ii({
+        color: 0x35134d,
+        blending: ii,
+        depthWrite: !1,
+        transparent: !0,
+        opacity: 0.82
+      })),
+      (this.bossCoreMat = new Ii({
+        color: 0xfff1a8,
+        blending: ii,
+        depthWrite: !1,
+        transparent: !0,
+        opacity: 1
+      })),
+      (this.bossGroup = new yi()),
+      (this.bossGroup.visible = !1),
+      this.group.add(this.bossGroup));
+    const addBossPart = (name, geometry, material, position, scale, scatter) => {
+      const mesh = new It(geometry, material);
+      mesh.name = `golem-${name}`;
+      mesh.position.set(position[0], position[1], position[2]);
+      mesh.scale.set(scale[0], scale[1], scale[2]);
+      mesh.userData.basePosition = position;
+      mesh.userData.baseScale = scale;
+      mesh.userData.scatter = scatter;
+      this.bossGroup.add(mesh);
+      return mesh;
+    };
+    this.bossParts = {
+      torso: addBossPart("torso", this.bossGeo.armor, this.bossArmorMat, [0, 1.25, 0], [0.86, 1.18, 0.72], [0.2, 2.6, -1.2]),
+      core: addBossPart("core", this.bossGeo.joint, this.bossCoreMat, [0, 1.28, 0.72], [0.42, 0.42, 0.42], [0, 1.4, 3.4]),
+      head: addBossPart("head", this.bossGeo.head, this.bossArmorMat, [0, 2.58, 0], [0.58, 0.62, 0.58], [-0.3, 3.2, 0.8]),
+      eye: addBossPart("eye", this.bossGeo.joint, this.bossCoreMat, [0, 2.66, 0.55], [0.19, 0.12, 0.15], [0.2, 2.1, 3.8]),
+      shoulderL: addBossPart("shoulder-l", this.bossGeo.armor, this.bossArmorMat, [-1.08, 1.82, 0], [0.64, 0.56, 0.68], [-4, 2.2, -0.6]),
+      shoulderR: addBossPart("shoulder-r", this.bossGeo.armor, this.bossArmorMat, [1.08, 1.82, 0], [0.64, 0.56, 0.68], [4, 2.5, -0.4]),
+      armL: addBossPart("arm-l", this.bossGeo.joint, this.bossJointMat, [-1.38, 1.02, 0], [0.38, 0.72, 0.38], [-4.8, 0.5, 0.5]),
+      armR: addBossPart("arm-r", this.bossGeo.joint, this.bossJointMat, [1.38, 1.02, 0], [0.38, 0.72, 0.38], [4.7, 0.8, 0.8]),
+      fistL: addBossPart("fist-l", this.bossGeo.armor, this.bossArmorMat, [-1.45, 0.22, 0.06], [0.58, 0.52, 0.62], [-5.4, -1.2, 1.4]),
+      fistR: addBossPart("fist-r", this.bossGeo.armor, this.bossArmorMat, [1.45, 0.22, 0.06], [0.58, 0.52, 0.62], [5.2, -0.8, 1.7]),
+      crownL: addBossPart("crown-l", this.bossGeo.armor, this.bossArmorMat, [-0.38, 3.12, -0.05], [0.18, 0.58, 0.18], [-1.8, 4.6, -0.8]),
+      crownR: addBossPart("crown-r", this.bossGeo.armor, this.bossArmorMat, [0.38, 3.12, -0.05], [0.18, 0.58, 0.18], [2.1, 4.3, -0.5]),
+      shardL: addBossPart("shard-l", this.bossGeo.armor, this.bossArmorMat, [-1.66, 1.56, -0.18], [0.22, 0.48, 0.22], [-5.8, 3.8, -2]),
+      shardR: addBossPart("shard-r", this.bossGeo.armor, this.bossArmorMat, [1.66, 1.56, -0.18], [0.22, 0.48, 0.22], [5.9, 3.4, -1.7])
+    };
+    this.bossPartList = Object.values(this.bossParts);
     ((this._col = new Ve()), (this.lastBossVisual = null));
   }
   setImpulses(e) {
@@ -5677,14 +5809,19 @@ class _g {
     for (const g of t) {
       const _ = f[g.kind]++;
       (hr(g.pos.x, g.pos.z, this.impulses, r, o, a, l), this.dummy.position.copy(r));
-      const m = g.kind === "singularity" && g.critical ? 1 + Math.sin(s * 20) * 0.2 : 1;
-      (this.dummy.scale.setScalar(m),
+      const m = g.kind === "singularity" && g.critical ? 1 + Math.sin(s * 20) * 0.2 : 1,
+        hitPulse = g.hitFlash > 0 ? 1 + Math.sin((g.hitFlash / 0.14) * Math.PI) * 0.16 : 1;
+      (this.dummy.scale.setScalar(m * hitPulse),
         this.dummy.rotation.set(s * 1.5, s * 1.2, 0),
         this.dummy.updateMatrix(),
-        this.enemyInst[g.kind].setMatrixAt(_, this.dummy.matrix));
+        this.enemyInst[g.kind].setMatrixAt(_, this.dummy.matrix),
+        this._col.setHex(g.hitFlash > 0 ? 0xff8a33 : Si(g.kind)),
+        this.enemyInst[g.kind].setColorAt(_, this._col));
     }
     for (const g of Object.keys(this.enemyInst))
-      ((this.enemyInst[g].count = f[g]), (this.enemyInst[g].instanceMatrix.needsUpdate = !0));
+      ((this.enemyInst[g].count = f[g]),
+        (this.enemyInst[g].instanceMatrix.needsUpdate = !0),
+        this.enemyInst[g].instanceColor && (this.enemyInst[g].instanceColor.needsUpdate = !0));
     let p = 0;
     for (const g of n) {
       if (g.owner !== "player" || g.spent) continue;
@@ -5718,18 +5855,24 @@ class _g {
         m = new Je();
       (m.lookAt(new R(), _.clone().normalize(), l),
         this.dummy.quaternion.setFromRotationMatrix(m),
-        this.dummy.scale.set(1, 1, 1),
+        this.dummy.scale.set(0.72, 0.72, 1.15),
         this.dummy.updateMatrix(),
-        this.enemyBulletInst.setMatrixAt(ep++, this.dummy.matrix));
+        this.enemyBulletInst.setMatrixAt(ep, this.dummy.matrix),
+        this.dummy.scale.set(1.35, 1.35, 1.75),
+        this.dummy.updateMatrix(),
+        this.enemyBulletTrailInst.setMatrixAt(ep++, this.dummy.matrix));
     }
     for (let q = ep; q < this.enemyBulletInst.count; q++) {
       this.dummy.position.set(0, -9999, 0);
       this.dummy.scale.set(0, 0, 0);
       this.dummy.updateMatrix();
       this.enemyBulletInst.setMatrixAt(q, this.dummy.matrix);
+      this.enemyBulletTrailInst.setMatrixAt(q, this.dummy.matrix);
     }
     ((this.enemyBulletInst.count = Math.max(this.enemyBulletInst.count, ep)),
-      (this.enemyBulletInst.instanceMatrix.needsUpdate = !0));
+      (this.enemyBulletTrailInst.count = Math.max(this.enemyBulletTrailInst.count, ep)),
+      (this.enemyBulletInst.instanceMatrix.needsUpdate = !0),
+      (this.enemyBulletTrailInst.instanceMatrix.needsUpdate = !0));
     // items
     let ip = 0;
     for (const g of items || []) {
@@ -5740,17 +5883,26 @@ class _g {
         this.dummy.updateMatrix(),
         this.itemInst.setMatrixAt(ip, this.dummy.matrix),
         this._col.setHex(g.color),
-        this.itemInst.setColorAt(ip++, this._col));
+        this.itemInst.setColorAt(ip, this._col),
+        this.dummy.rotation.set(Math.PI / 2, s * 1.6 + g.bob, 0),
+        this.dummy.scale.setScalar(0.95 + yy * 0.18),
+        this.dummy.updateMatrix(),
+        this.itemRingInst.setMatrixAt(ip, this.dummy.matrix),
+        this.itemRingInst.setColorAt(ip++, this._col));
     }
     for (let q = ip; q < this.itemInst.count; q++) {
       this.dummy.position.set(0, -9999, 0);
       this.dummy.scale.set(0, 0, 0);
       this.dummy.updateMatrix();
       this.itemInst.setMatrixAt(q, this.dummy.matrix);
+      this.itemRingInst.setMatrixAt(q, this.dummy.matrix);
     }
     ((this.itemInst.count = Math.max(this.itemInst.count, ip)),
+      (this.itemRingInst.count = Math.max(this.itemRingInst.count, ip)),
       (this.itemInst.instanceMatrix.needsUpdate = !0),
-      this.itemInst.instanceColor && (this.itemInst.instanceColor.needsUpdate = !0));
+      (this.itemRingInst.instanceMatrix.needsUpdate = !0),
+      this.itemInst.instanceColor && (this.itemInst.instanceColor.needsUpdate = !0),
+      this.itemRingInst.instanceColor && (this.itemRingInst.instanceColor.needsUpdate = !0));
     // boss: cache a render-only snapshot so a defeated boss can wobble/fade
     // with the death event after simulation safely clears world.boss.
     if (boss && !boss.dead)
@@ -5758,21 +5910,89 @@ class _g {
         pos: { x: boss.pos.x, z: boss.pos.z },
         radius: boss.radius,
         color: boss.color,
-        bossType: boss.bossType
+        bossType: boss.bossType,
+        phase: boss.phase,
+        hp: boss.hp,
+        maxHp: boss.maxHp,
+        fireCooldown: boss.fireCooldown,
+        fireInterval: boss.fireInterval,
+        hitFlash: boss.hitFlash || 0,
+        rageLevel: boss.rageLevel || 0
       };
     const renderBoss = boss && !boss.dead ? boss : eventAmount > 0 ? this.lastBossVisual : null,
       bossDeathEcho = renderBoss && renderBoss !== boss;
     if (renderBoss) {
-      const echoScale = bossDeathEcho ? 0.82 + eventAmount * 0.18 : 1;
-      (this.bossMesh.visible = !0,
+      const hpRatio = Math.max(0, Math.min(1, renderBoss.hp / Math.max(1, renderBoss.maxHp))),
+        armorOpen = (1 - hpRatio) * (renderBoss.bossType === "big" ? 0.58 : 0.42),
+        phase = renderBoss.phase ?? s,
+        stride = Math.sin(phase * 3.4),
+        heavyBob = Math.abs(Math.sin(phase * 1.7)) * 0.08,
+        charge = bossDeathEcho
+          ? 0
+          : 1 - Math.max(0, Math.min(1, renderBoss.fireCooldown / Math.max(0.01, renderBoss.fireInterval))),
+        deathProgress = bossDeathEcho ? 1 - eventAmount : 0,
+        echoScale = bossDeathEcho ? 0.92 + eventAmount * 0.08 : 1,
+        size = renderBoss.radius * 0.55 * (renderBoss.bossType === "big" ? 1.04 : 1),
+        p = this.bossParts;
+      (this.bossGroup.visible = !0,
         hr(renderBoss.pos.x, renderBoss.pos.z, this.impulses, r, o, a, l),
-        this.bossMesh.position.copy(r),
-        this.bossMesh.rotation.set(s * 0.8, s * 0.6, s * 0.4),
-        this.bossMesh.scale.setScalar(renderBoss.radius * echoScale * (1 + Math.sin(s * 4) * 0.05)),
-        this.bossMesh.material.color.setHex(renderBoss.color),
-        (this.bossMesh.material.opacity = (renderBoss.bossType === "big" ? 1 : 0.92) * (bossDeathEcho ? eventAmount : 1)));
+        this.bossGroup.position.copy(r),
+        this.bossGroup.rotation.set(stride * 0.035, phase * 0.16, -stride * 0.045),
+        this.bossGroup.scale.setScalar(size * echoScale * (1 + Math.sin(phase * 4) * 0.018)));
+      p.torso.position.set(0, 1.25 + heavyBob, -armorOpen * 0.08);
+      p.torso.scale.set(0.86 + armorOpen * 0.08, 1.18, 0.72 + armorOpen * 0.12);
+      p.torso.rotation.set(stride * 0.04, phase * 0.22, -stride * 0.06);
+      p.core.position.set(0, 1.28 + heavyBob, 0.72 + armorOpen * 0.46);
+      p.core.scale.setScalar(0.42 * (1 + charge * 0.5 + (1 - hpRatio) * 0.22));
+      p.core.rotation.set(phase * 1.8, -phase * 2.2, phase * 1.4);
+      p.head.position.set(0, 2.58 + heavyBob * 0.6, armorOpen * 0.08);
+      p.head.rotation.set(stride * 0.06, -phase * 0.13, 0);
+      p.eye.position.set(0, 2.66 + heavyBob * 0.6, 0.55 + armorOpen * 0.18);
+      p.eye.scale.set(0.19 + charge * 0.09, 0.12 + charge * 0.05, 0.15 + charge * 0.08);
+      p.shoulderL.position.set(-1.08 - armorOpen * 0.5, 1.82 + stride * 0.08, 0);
+      p.shoulderR.position.set(1.08 + armorOpen * 0.5, 1.82 - stride * 0.08, 0);
+      p.shoulderL.rotation.set(phase * 0.18, phase * 0.7, stride * 0.12);
+      p.shoulderR.rotation.set(-phase * 0.18, -phase * 0.7, -stride * 0.12);
+      p.armL.position.set(-1.38 + charge * 0.28, 1.02 + charge * 0.35 - stride * 0.12, charge * 0.22);
+      p.armR.position.set(1.38 - charge * 0.28, 1.02 + charge * 0.35 + stride * 0.12, charge * 0.22);
+      p.armL.rotation.set(stride * 0.2, 0, -charge * 0.35);
+      p.armR.rotation.set(-stride * 0.2, 0, charge * 0.35);
+      p.fistL.position.set(-1.45 + charge * 0.62, 0.22 + charge * 1.02 - stride * 0.16, 0.06 + charge * 0.48);
+      p.fistR.position.set(1.45 - charge * 0.62, 0.22 + charge * 1.02 + stride * 0.16, 0.06 + charge * 0.48);
+      p.fistL.rotation.set(phase * 0.8, phase * 0.42, -charge * 0.55);
+      p.fistR.rotation.set(-phase * 0.8, -phase * 0.42, charge * 0.55);
+      const crownScale = renderBoss.bossType === "big" ? 1 + (1 - hpRatio) * 0.45 : 0.72 + (1 - hpRatio) * 0.28;
+      p.crownL.position.set(-0.38 - armorOpen * 0.22, 3.12 + armorOpen * 0.3, -0.05);
+      p.crownR.position.set(0.38 + armorOpen * 0.22, 3.12 + armorOpen * 0.3, -0.05);
+      p.crownL.scale.set(0.18 * crownScale, 0.58 * crownScale, 0.18 * crownScale);
+      p.crownR.scale.copy(p.crownL.scale);
+      p.crownL.rotation.set(0, phase * 0.5, -0.3 - armorOpen * 0.4);
+      p.crownR.rotation.set(0, -phase * 0.5, 0.3 + armorOpen * 0.4);
+      const shardOrbit = phase * 0.9;
+      p.shardL.position.set(-1.66 - armorOpen * 0.65, 1.56 + Math.sin(shardOrbit) * 0.18, -0.18 + Math.cos(shardOrbit) * 0.16);
+      p.shardR.position.set(1.66 + armorOpen * 0.65, 1.56 - Math.sin(shardOrbit) * 0.18, -0.18 - Math.cos(shardOrbit) * 0.16);
+      p.shardL.rotation.set(phase * 1.2, phase * 1.7, phase * 0.8);
+      p.shardR.rotation.set(-phase * 1.1, -phase * 1.6, -phase * 0.9);
+      if (deathProgress > 0)
+        for (const part of this.bossPartList) {
+          const scatter = part.userData.scatter;
+          part.position.x += scatter[0] * deathProgress;
+          part.position.y += scatter[1] * deathProgress - deathProgress * deathProgress * 2.2;
+          part.position.z += scatter[2] * deathProgress;
+          part.rotation.x += deathProgress * 4.2;
+          part.rotation.y += deathProgress * 5.4;
+          part.scale.multiplyScalar(1 + deathProgress * 0.16);
+        }
+      const flash = (renderBoss.hitFlash || 0) > 0,
+        alpha = (renderBoss.bossType === "big" ? 1 : 0.94) * (bossDeathEcho ? eventAmount : 1);
+      (this.bossArmorMat.color.setHex(flash ? 0xffffff : renderBoss.color),
+        this.bossJointMat.color.setHex(renderBoss.color).multiplyScalar(0.28),
+        this.bossCoreMat.color.setHex(flash ? 0xffffff : renderBoss.bossType === "big" ? 0xffe75c : 0xfff1a8),
+        (this.bossArmorMat.opacity = alpha),
+        (this.bossJointMat.opacity = alpha * 0.78),
+        (this.bossCoreMat.opacity = alpha * (0.82 + charge * 0.18)));
     } else {
-      ((this.bossMesh.visible = !1), (this.lastBossVisual = null));
+      ((this.bossGroup.visible = !1), (this.lastBossVisual = null));
     }
   }
   dispose() {
@@ -5780,9 +6000,14 @@ class _g {
     for (const e of Object.keys(this.enemyGeo))
       (this.enemyGeo[e].dispose(), this.enemyMats[e].dispose());
     (this.bulletGeo.dispose(), this.bulletMat.dispose());
-    (this.enemyBulletGeo.dispose(), this.enemyBulletMat.dispose());
-    (this.itemGeo.dispose(), this.itemInst.material.dispose());
-    (this.bossGeo.dispose(), this.bossMat.dispose());
+    (this.enemyBulletGeo.dispose(), this.enemyBulletMat.dispose(), this.enemyBulletTrailMat.dispose());
+    (this.itemGeo.dispose(), this.itemInst.material.dispose(), this.itemRingGeo.dispose(), this.itemRingMat.dispose());
+    (this.bossGeo.armor.dispose(),
+      this.bossGeo.joint.dispose(),
+      this.bossGeo.head.dispose(),
+      this.bossArmorMat.dispose(),
+      this.bossJointMat.dispose(),
+      this.bossCoreMat.dispose());
   }
 }
 class vg {
@@ -5790,6 +6015,8 @@ class vg {
     ((this.pos = new R(0, 30, 30)),
       (this.look = new R()),
       (this.fov = fe.camera.fovBase),
+      (this.zoom = 1),
+      (this.zoomTarget = 1),
       (this.camera = new Dt(fe.camera.fovBase, e, 0.1, 600)),
       (this.shakeState = { trauma: 0, seed: t }),
       this.pos.set(0, 34, 30),
@@ -5798,6 +6025,12 @@ class vg {
   }
   setAspect(e) {
     ((this.camera.aspect = e), this.camera.updateProjectionMatrix());
+  }
+  adjustZoom(deltaY) {
+    this.zoomTarget = Math.max(
+      fe.camera.zoomMin,
+      Math.min(fe.camera.zoomMax, this.zoomTarget * Math.exp(deltaY * fe.camera.zoomWheelSpeed))
+    );
   }
   get trauma() {
     return this.shakeState.trauma;
@@ -5808,9 +6041,10 @@ class vg {
   update(e, t, n, s, r, eventWobble = 0) {
     const o = new R();
     ws(e.x, e.z, n, o);
-    const l = new R(e.x, 0, e.z).normalize().multiplyScalar(16),
-      c = new R(o.x + l.x, o.y + 34, o.z + 30 + l.z),
+    const zoomEase = 1 - Math.exp(-fe.camera.zoomLambda * r),
       u = 1 - Math.exp(-6 * r);
+    this.zoom += (this.zoomTarget - this.zoom) * zoomEase;
+    const c = new R(o.x, o.y + 34 * this.zoom, o.z + 30 * this.zoom);
     this.pos.lerp(c, u);
     (this.look.lerp(o, u), (this.shakeState.trauma = this.trauma));
     const f = gc(this.shakeState, s),
@@ -5824,7 +6058,8 @@ class vg {
       this.camera.lookAt(this.look.x + f.x, this.look.y + f.y, this.look.z + f.z),
       this.camera.rotateZ(roll),
       (this.camera.fov = fe.camera.fovBase + Math.sin(s * 12.5) * fe.camera.eventWobbleFov * w),
-      this.camera.updateProjectionMatrix());
+      this.camera.updateProjectionMatrix(),
+      this.camera.updateMatrixWorld());
   }
 }
 const setWorldEventTransform = (group, eventWobble, time) => {
@@ -5867,7 +6102,41 @@ class xg {
       this.composer.addPass(new fg(this.scene, this.camera.camera)),
       (this.bloom = new li(new oe(e.clientWidth, e.clientHeight), 1.4, 0.6, 0.32)),
       this.composer.addPass(this.bloom),
+      (this.onWheel = (n) => {
+        n.preventDefault();
+        this.camera.adjustZoom(n.deltaY);
+      }),
+      this.renderer.domElement.addEventListener("wheel", this.onWheel, { passive: !1 }),
       window.addEventListener("resize", this.onResize));
+  }
+  screenToArenaAim(ndcX, ndcY, playerPos) {
+    this.camera.camera.updateMatrixWorld();
+    this.eventGroup.updateWorldMatrix(!0, !1);
+    const worldOrigin = this.camera.camera.position.clone(),
+      worldPoint = new R(ndcX, -ndcY, 0.5).unproject(this.camera.camera),
+      worldDir = worldPoint.sub(worldOrigin).normalize(),
+      localOrigin = this.eventGroup.worldToLocal(worldOrigin.clone()),
+      localPoint = this.eventGroup.worldToLocal(worldOrigin.clone().add(worldDir)),
+      localDir = localPoint.sub(localOrigin).normalize(),
+      b = localOrigin.dot(localDir),
+      c = localOrigin.lengthSq() - Pn.radius * Pn.radius,
+      disc = b * b - c;
+    if (disc < 0) return null;
+    const root = Math.sqrt(disc),
+      near = -b - root,
+      far = -b + root,
+      distance = near > 0 ? near : far;
+    if (distance <= 0) return null;
+    const hit = localOrigin.addScaledVector(localDir, distance).normalize(),
+      theta = Math.acos(Math.max(-1, Math.min(1, hit.y))),
+      radial = Math.min(1, theta / Pn.capHalfAngle) * fe.worldBounds,
+      azimuth = Math.atan2(hit.z, hit.x),
+      targetX = Math.cos(azimuth) * radial,
+      targetZ = Math.sin(azimuth) * radial,
+      dx = targetX - playerPos.x,
+      dz = targetZ - playerPos.z,
+      len = Math.hypot(dx, dz);
+    return len > 1e-4 ? { x: dx / len, z: dz / len } : null;
   }
   update(e, t) {
     ((this.bloom.strength = 1.4 + t.score.multiplierPulse * 0.6),
@@ -5885,6 +6154,7 @@ class xg {
   }
   dispose() {
     (window.removeEventListener("resize", this.onResize),
+      this.renderer.domElement.removeEventListener("wheel", this.onWheel),
       this.entities.dispose(),
       this.renderer.dispose(),
       this.renderer.domElement.remove());
@@ -6656,6 +6926,7 @@ class Sg {
     ((this.world = n.world),
       (this.systems = n.systems),
       (this.renderer = new xg(e, fr)),
+      this.input.setMouseAimResolver((x, y, playerPos) => this.renderer.screenToArenaAim(x, y, playerPos)),
       this.input.attach(e),
       this.updateMuteIcon(),
       t.overlay.addEventListener("pointerdown", () => {
@@ -6693,7 +6964,7 @@ class Sg {
   }
   step(e) {
     if (!this._began) return;
-    const t = this.input.snapshot();
+    const t = this.input.snapshot(this.world.player.pos);
     if (
       (t.pause && (this.paused = !this.paused),
       t.mute && this.toggleMute(),
@@ -6706,6 +6977,7 @@ class Sg {
       return;
     const n = this.playerBulletCount(),
       s = xc(this.world, this.systems, t, e);
+    if (s.some((event) => event.type === "hit-player")) this.flashDamage();
     this.audioStarted && this.audio.setBossMode(!!(this.world.boss && !this.world.boss.dead));
     if ((this.updateHud(), this.audioStarted && !this.muted)) {
       const r = this.world.player.pos.x,
@@ -6720,6 +6992,13 @@ class Sg {
     this.world.gameOver &&
       !this.shownGameOver &&
       ((this.shownGameOver = !0), this.showOverlay("GAME OVER", "Press R or tap to restart"));
+  }
+  flashDamage() {
+    const el = this.hud.damageVignette;
+    if (!el) return;
+    el.classList.remove("flash");
+    void el.offsetWidth;
+    el.classList.add("flash");
   }
   playerBulletCount() {
     let e = 0;
@@ -6827,7 +7106,8 @@ function yg() {
       bossLabel: document.getElementById("hud-boss-label"),
       bossTimer: document.getElementById("hud-bosstimer"),
       bossTimerFill: document.getElementById("hud-bosstimer-fill"),
-      bossTimerLabel: document.getElementById("hud-bosstimer-label")
+      bossTimerLabel: document.getElementById("hud-bosstimer-label"),
+      damageVignette: document.getElementById("damage-vignette")
     },
     t = new Sg(i, e);
   (t.start(), (window.__game = t));
@@ -6847,6 +7127,7 @@ yg();
       <div id="hud-wave">W1</div>
       <div id="hud-mute">&#128266;</div>
     </div>
+    <div id="damage-vignette" aria-hidden="true"></div>
     <div id="hud-boss">
       <div id="hud-boss-label">⚠ BOSS</div>
       <div id="hud-boss-track"><div id="hud-boss-fill"></div></div>
@@ -6857,7 +7138,7 @@ yg();
     </div>
     <div id="help">
       WASD / Arrow Keys — Move &nbsp;•&nbsp; Mouse — Aim &nbsp;•&nbsp; Hold Click/Space — Fire<br />
-      SHIFT — Boost &nbsp;•&nbsp; Q / F — Bomb (Nova) &nbsp;•&nbsp; P — Pause &nbsp;•&nbsp; M — Mute &nbsp;•&nbsp; R — Restart<br />
+      SHIFT — Boost &nbsp;•&nbsp; Wheel — Zoom &nbsp;•&nbsp; Q / F — Bomb (Nova) &nbsp;•&nbsp; P — Pause &nbsp;•&nbsp; M — Mute &nbsp;•&nbsp; R — Restart<br />
       Touch: Left — Move &nbsp;•&nbsp; Right — Aim+Fire &nbsp;•&nbsp; Boost / Bomb / II / R Buttons
     </div>
     <div id="overlay">
