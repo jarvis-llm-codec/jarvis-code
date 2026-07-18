@@ -76,6 +76,14 @@ Run integrity: 0 timeouts · 0 modified test files (hash-checked) · 0 benchmark
 
 **Honest scope** — runs are agentic (one attempt; the agent may write its *own* scratch tests, never the benchmark's). HumanEval and Exercism are in every frontier model's training data, so these scores demonstrate *scaffold-neutrality, not model intelligence*. The Polyglot subset is the easiest slice of aider's 225-task six-language set — not comparable to full-set scores. Comparison table, roadmap, and caveats: [jlc-codec.org/benchmarks](https://jlc-codec.org/benchmarks/). SWE-bench is next on the campaign.
 
+## 🤖 Built with OpenAI Codex & GPT-5.x
+
+JARVIS CODE is not just benchmarked on OpenAI models — it is **built with them**:
+
+- **OpenAI Codex (CLI, GPT-5.6)** implemented major subsystems — the AST interface extractor, the corrective guardrail ladder, and the evidence-freeze replay oracles — in an adversarial dual-review workflow: Codex and a second AI judge attack each other's conclusions, and nothing lands until it survives independent reproduction from SHA-frozen session logs. House rule: *confidence is not evidence.*
+- **GPT-5.5** (chat route) powers the benchmark campaign above, with **gpt-5.4-mini** as the encoder/router model.
+- **GPT-5.6** also served as the adversarial reviewer for our OpenAI Build Week submission — three review rounds to convergence.
+
 ## 🚀 Install
 
 > **Windows is first-class today. macOS / Linux basic support is available in beta.**
