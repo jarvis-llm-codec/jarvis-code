@@ -208,6 +208,7 @@ class ProjectRouter:
             self._last_resolved_from = "ambiguous_registry_match"
             return None, warnings, trace
 
+        unregistered_fallback_path: str | None = None
         fallback_path = active_project_path or cwd_hint
         if fallback_path:
             project = self.registry.get_by_path(fallback_path)
@@ -216,12 +217,11 @@ class ProjectRouter:
                 trace.update({"source": "extension_cwd_fallback", "path": project.path, "project_id": project.project_id})
                 self._last_resolved_from = "extension_cwd_fallback"
                 return project, warnings, trace
-            warnings.append(f"active project path not registered: {fallback_path}")
-            trace.update({"source": "fallback", "active_project_path": fallback_path})
-            self._last_resolved_from = "fallback"
-            return None, warnings, trace
+            unregistered_fallback_path = fallback_path
 
         if chat_mode:
+            if unregistered_fallback_path:
+                warnings.append(f"active project path not registered: {unregistered_fallback_path}")
             trace.update({"source": "chat_no_project"})
             self._last_resolved_from = "chat_no_project"
             return None, warnings, trace
@@ -233,13 +233,19 @@ class ProjectRouter:
                 # Sticky is a coding/deepdive fallback only. Chat contexts return
                 # before this branch unless the user explicitly mentioned a project.
                 trace.update({"source": "sticky_active_project", "path": sticky.path, "project_id": sticky.project_id})
+                if unregistered_fallback_path:
+                    trace["unregistered_fallback_path"] = unregistered_fallback_path
                 self._last_resolved_from = "sticky_active_project"
                 return sticky, warnings, trace
             self._active_project_id = None
             self._active_updated_at = None
             self._save_active(None)
 
-        trace.update({"source": "fallback"})
+        if unregistered_fallback_path:
+            warnings.append(f"active project path not registered: {unregistered_fallback_path}")
+            trace.update({"source": "fallback", "active_project_path": unregistered_fallback_path})
+        else:
+            trace.update({"source": "fallback"})
         self._last_resolved_from = "fallback"
         return None, warnings, trace
 
