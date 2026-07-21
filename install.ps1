@@ -505,14 +505,17 @@ function Install-SidecarVenv {
     $nvidiaGpuName = Get-JarvisNvidiaGpuName
     if ($nvidiaGpuName) {
         Write-Step "NVIDIA GPU detected ($nvidiaGpuName) - installing CUDA PyTorch ($PyTorchCudaInstallNote)"
-        & $venvPython -m pip install --disable-pip-version-check --index-url $PyTorchCudaIndexUrl torch
+        & $venvPython -m pip install --disable-pip-version-check --prefer-binary --index-url $PyTorchCudaIndexUrl torch
         if ($LASTEXITCODE -ne 0) {
             throw "CUDA PyTorch install failed with exit code $LASTEXITCODE. Set JARVIS_CODE_CPU_ONLY=1 to force CPU PyTorch."
         }
     } elseif (Test-JarvisCpuOnlyInstall) {
         Write-Step "JARVIS_CODE_CPU_ONLY=1 - using CPU PyTorch packages"
     }
-    & $venvPython -m pip install --disable-pip-version-check -r (Join-Path $sidecarRoot "requirements.txt")
+    # --prefer-binary: prefer prebuilt wheels over source dists so a fresh machine
+    # without a Rust toolchain (tiktoken, pydantic-core via fastapi) does not try to
+    # compile from source and fail. Falls back to source only when no wheel exists.
+    & $venvPython -m pip install --disable-pip-version-check --prefer-binary -r (Join-Path $sidecarRoot "requirements.txt")
     if ($LASTEXITCODE -ne 0) { throw "pip install failed with exit code $LASTEXITCODE" }
 }
 

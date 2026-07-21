@@ -488,14 +488,17 @@ install_sidecar_venv() {
   fi
   if gpu_name=$(detect_nvidia_gpu "$venv_py"); then
     log "NVIDIA GPU detected ($gpu_name) - installing CUDA PyTorch ($PYTORCH_CUDA_INSTALL_NOTE)"
-    if ! run_pip_with_tmp "$venv_py" "$pip_tmp" install --disable-pip-version-check --index-url "$PYTORCH_CUDA_INDEX_URL" torch; then
+    if ! run_pip_with_tmp "$venv_py" "$pip_tmp" install --disable-pip-version-check --prefer-binary --index-url "$PYTORCH_CUDA_INDEX_URL" torch; then
       rm -rf "$pip_tmp"
       exit 1
     fi
   elif cpu_only_requested; then
     log "JARVIS_CODE_CPU_ONLY=1 - using CPU PyTorch packages"
   fi
-  if ! run_pip_with_tmp "$venv_py" "$pip_tmp" install --disable-pip-version-check -r "$sidecar/requirements.txt"; then
+  # --prefer-binary: prefer prebuilt wheels over source dists so a fresh machine
+  # without a Rust toolchain (tiktoken, pydantic-core via fastapi) does not try to
+  # compile from source and fail. Falls back to source only when no wheel exists.
+  if ! run_pip_with_tmp "$venv_py" "$pip_tmp" install --disable-pip-version-check --prefer-binary -r "$sidecar/requirements.txt"; then
     rm -rf "$pip_tmp"
     exit 1
   fi
