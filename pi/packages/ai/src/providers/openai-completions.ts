@@ -81,7 +81,7 @@ function isImageContentBlock(block: { type: string }): block is ImageContent {
 
 export interface OpenAICompletionsOptions extends StreamOptions {
 	toolChoice?: "auto" | "none" | "required" | { type: "function"; function: { name: string } };
-	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 }
 
 interface OpenAICompatCacheControl {
@@ -113,14 +113,14 @@ function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention 
 	return "short";
 }
 
-const OPENROUTER_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+const OPENROUTER_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 
 function normalizeOpenRouterReasoningEffort(value: string | null | undefined): string | undefined {
 	if (value === null || value === undefined) return undefined;
 	const normalized = value.trim().toLowerCase();
 	if (!normalized) return undefined;
 	if (normalized === "off") return "none";
-	if (normalized === "max" || normalized === "maximum") return "xhigh";
+	if (normalized === "maximum") return "max";
 	return OPENROUTER_REASONING_EFFORTS.has(normalized) ? normalized : undefined;
 }
 

@@ -1,8 +1,8 @@
 JARVIS Code release manifest
-Generated: 2026-07-10T13:10:06Z
+Generated: 2026-07-21T12:13:05Z
 Source root: (development checkout)
-Source root commit: 5e50b7da53dfec274d49dfb33375f233267dd173
-Pi engine commit: 50b4fdf4212e5c2d4627e17caa81b048893284c0
+Source root commit: bb6298e9be7b7fb769875a2ff46b19aceb6e7225
+Pi engine commit: 19ce387fba94520f8c4e43012faa3e9b0e904639
 GitHub repo: jarvis-llm-codec/jarvis-code
 Branch: main
 

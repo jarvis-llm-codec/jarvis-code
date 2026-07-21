@@ -91,21 +91,29 @@ _TOKEN_HINT = (
     "will still fail with authentication_failed. Refusing silent fallback."
 )
 
-# Valid ClaudeAgentOptions.effort values (claude-agent-sdk Literal). The route
-# judge maps an intent to one of these via turn_context.route_to_effort; we
-# only forward a value the SDK recognizes and otherwise leave effort=None (the
-# SDK default), so an unknown/absent route never overrides behavior. Claude
-# accepts the full JLC vocabulary up to "xhigh"/"max" — no clamp needed here
-# (unlike the OpenAI Responses path, which tops out at "high"). (2026-06-16)
-_SDK_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+# Valid ClaudeAgentOptions.effort values (claude-agent-sdk Literal). We only
+# forward a user-selected value the SDK recognizes and otherwise leave
+# effort=None (the SDK default), so an unknown/absent value never overrides
+# behavior. The SDK accepts the full ladder (incl ultra) for every model it
+# serves, so we expose it for all Agent SDK (Claude) models. (Jun, 2026-07-21)
+_SDK_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "ultra", "max"})
 
 
-def _coerce_sdk_effort(value: Any) -> str | None:
+def _sdk_efforts_for_model(model: str | None) -> frozenset[str]:
+    # This proxy only ever serves Agent SDK (Claude) models, and the SDK accepts
+    # ultra as valid vocabulary for all of them — no model-specific gating.
+    _ = model
+    return _SDK_EFFORTS
+
+
+def _coerce_sdk_effort(value: Any, model: str | None = None) -> str | None:
     """Return a valid SDK effort string, or None to leave the SDK default."""
     if not value:
         return None
     eff = str(value).strip().lower()
-    return eff if eff in _SDK_EFFORTS else None
+    if eff == "minimal":
+        eff = "low"
+    return eff if eff in _sdk_efforts_for_model(model) else None
 
 
 # Native Agent SDK tools we expose for a daily coding/chat driver, plus the
@@ -677,12 +685,18 @@ class AnthropicAgentSDKAdapter:
         cwd = ctx.get("project_root") or os.getcwd()
         conv_id = ctx.get("conv_id") or "conversation"
         retriever = ctx.get("retriever")
-        # Route-derived reasoning effort for this turn (chat=low ... heavy=xhigh).
-        # None leaves the SDK default ("high") so an untagged turn is unchanged.
-        effort = _coerce_sdk_effort(
+        # User-selected reasoning effort for this turn. None leaves the SDK
+        # default ("high") so a turn without an override is unchanged.
+        requested_effort = (
             ctx.get("reasoning_effort")
             or kwargs.get("reasoning_effort")
             or kwargs.get("reasoning")
+        )
+        effort = _coerce_sdk_effort(requested_effort, self.model)
+        thinking = (
+            {"type": "disabled"}
+            if str(requested_effort or "").strip().lower() in {"off", "none"}
+            else None
         )
         stream_answer_text = bool(
             ctx.get("stream_text_deltas") or kwargs.get("stream_text_deltas")
@@ -738,9 +752,11 @@ class AnthropicAgentSDKAdapter:
             # Optional safety cap on internal agentic iterations (providers.yaml
             # `max_turns`). None = let Claude run to natural completion.
             max_turns=int(max_turns) if max_turns else None,
-            # effort=None is the SDK default; only override when the route gave us
-            # a recognized level.
+            # effort=None is the SDK default; only override for a recognized level.
             effort=effort,
+            # Pi's user-facing "off" is canonicalized to "none" by Subagent.
+            # Agent SDK has no off effort literal, so disable thinking explicitly.
+            thinking=thinking,
             # True token-level streaming (2026-06-25). Verified against the
             # installed claude_agent_sdk 0.2.101: this bool (types.py:1831) appends
             # the CLI flag --include-partial-messages (subprocess_cli.py:334-335),

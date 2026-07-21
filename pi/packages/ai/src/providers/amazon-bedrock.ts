@@ -888,10 +888,15 @@ function buildAdditionalModelRequestFields(
 						medium: 8192,
 						high: 16384,
 						xhigh: 16384, // Claude doesn't support xhigh, clamp to high
+						max: 16384, // Claude doesn't support max, clamp to high
+						ultra: 16384, // Claude doesn't support ultra, clamp to high
 					};
 
-					// Custom budgets override defaults (xhigh not in ThinkingBudgets, use high)
-					const level = options.reasoning === "xhigh" ? "high" : options.reasoning;
+					// Custom budgets override defaults (xhigh/max/ultra are not in ThinkingBudgets, use high)
+					const level =
+						options.reasoning === "xhigh" || options.reasoning === "max" || options.reasoning === "ultra"
+							? "high"
+							: options.reasoning;
 					const budget = options.thinkingBudgets?.[level] ?? defaultBudgets[options.reasoning];
 
 					return {

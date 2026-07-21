@@ -4,7 +4,6 @@ import html as html_lib
 import json
 import os
 import queue
-import re
 import sys
 import threading
 import traceback
@@ -592,6 +591,9 @@ class DelegateSubagentRequest(BaseModel):
     sub_id: str | None = None
     project_root: str | None = None
     bench_conv_id: str | None = None
+    reasoning_effort: Literal[
+        "off", "minimal", "low", "medium", "high", "xhigh", "ultra"
+    ] | None = None
 
 
 class OrchestrateRequest(BaseModel):
@@ -659,15 +661,6 @@ class SwitchRequest(BaseModel):
 
 class ResolvePathRequest(BaseModel):
     path: str
-
-
-class RouteTurnRequest(BaseModel):
-    user_message: str = ""
-    cwd_hint: str | None = None
-    active_project_path: str | None = None
-    recent_messages: list[dict[str, str]] = Field(default_factory=list)
-    pending_project: dict[str, Any] | None = None
-    bench_conv_id: str | None = None
 
 
 class SetupRequest(BaseModel):
@@ -858,12 +851,9 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _auto_recall_top_k_for_mode(mode: str | None) -> int:
+def _auto_recall_top_k() -> int:
     global_top_k = _env_int("JARVIS_AUTO_RECALL_TOP_K", 10)
-    normalized_mode = str(mode or "").strip().lower()
-    if normalized_mode in {"deepdive", "heavy_deepdive"}:
-        return _env_int("JARVIS_AUTO_RECALL_TOP_K_DEEPDIVE", global_top_k)
-    return global_top_k
+    return _env_int("JARVIS_AUTO_RECALL_TOP_K_DEEPDIVE", global_top_k)
 
 
 def _agent_jhb_rebuild_in_progress(agent: Any, session_id: str) -> bool:
@@ -2000,7 +1990,7 @@ def context(req: ContextRequest) -> dict[str, Any]:
     # fallback. Keeping /context and recall_turns on the same retrieval path is
     # important for personal facts that live in the conversation store rather
     # than the repo-local raw-store.
-    _recall_top_k = _auto_recall_top_k_for_mode(req.mode)
+    _recall_top_k = _auto_recall_top_k()
     auto_recall_enabled = _recall_top_k > 0 and bool(req.user_message.strip())
     if auto_recall_enabled:
         try:
@@ -2160,87 +2150,6 @@ def list_projects() -> dict[str, Any]:
             }
         )
     return {"ok": True, "projects": projects, **registry_status}
-
-
-@app.post("/route_turn")
-async def route_turn(req: RouteTurnRequest) -> dict[str, Any]:
-    """Use the configured chat role as the first-pass JARVIS route judge."""
-    user_message = (req.user_message or "").strip()
-    if not user_message:
-        return _route_turn_fallback("chat", "empty user message")
-    projects = _route_project_summaries()
-    system = _route_turn_system_prompt()
-    user = _route_turn_user_prompt(req, projects)
-    try:
-        # Route classification runs on the lightweight `router` role before the main
-        # provider call. The router role mirrors the encoder model (the user's fast
-        # model), so routing always rides whatever fast model they run — never `chat`
-        # (gpt-5.5), whose ~6s TTFT floor would tax every turn (chat + build), and
-        # never a model pinned by name they may lack credentials for. The classifier
-        # emits a tiny JSON object, so a fast model is quality-equivalent here.
-        # (2026-06-24: route-specific fast model.)
-        import time as _time
-
-        llm = get_llm("router")
-        _route_t0 = _time.monotonic()
-        raw = await llm.chat(
-            system=system,
-            user=user,
-            max_tokens=900,
-            reasoning_effort="none",
-        )
-        # Token counts prove the routing call is cheap and reasoning stays off:
-        # think>0 would mean reasoning leaked despite "none". in/out/cache also show
-        # whether latency variance tracks payload size or codex backend jitter.
-        _route_meta = getattr(llm, "llm_meta", None) or {}
-        _route_think = int(_route_meta.get("reasoning_tokens") or 0)
-        _route_in = int(_route_meta.get("tokens_in") or 0)
-        _route_out = int(_route_meta.get("tokens_out") or 0)
-        _route_cr = int(_route_meta.get("cache_read_tokens") or 0)
-        _route_cw = int(_route_meta.get("cache_write_tokens") or 0)
-        # retries>0 on a slow call means latency came from a provider fallback/retry
-        # (e.g. a codex 503/empty-stream re-attempt), not pure backend TTFT jitter.
-        _route_retries = int(_route_meta.get("fallback_attempts") or 0)
-        print(
-            f"[jarvis-sidecar] /route_turn llm={_time.monotonic() - _route_t0:.1f}s "
-            f"(role=router reasoning=none think={_route_think} "
-            f"in={_route_in} out={_route_out} cache={_route_cr}/{_route_cw} "
-            f"retries={_route_retries})",
-            file=sys.stderr,
-            flush=True,
-        )
-        parsed = _extract_json_object(raw)
-        if not parsed:
-            return {
-                **_route_turn_fallback("chat", "chat route LLM returned invalid JSON"),
-                "ok": False,
-                "error": "invalid route JSON",
-                "router_role_used": "router",
-                "raw_text": raw[:2000],
-            }
-        decision = _normalize_route_decision(parsed, raw=raw)
-        decision["ok"] = True
-        decision["router_role_used"] = "router"
-        # Surface the structured decision so we can see whether the classifier set the
-        # language-agnostic create/register flags even when it picks an odd route
-        # (e.g. a new-project build that landed on chat_control). These flags, not the
-        # user's words, are the only language-neutral signal a deterministic backstop
-        # may trust. (2026-06-24 debug)
-        print(
-            f"[jarvis-sidecar] /route_turn decision route={decision.get('route')} "
-            f"create={decision.get('create_project')} register={decision.get('register_project')} "
-            f"expected={decision.get('expected_action')} conf={decision.get('confidence')}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return decision
-    except Exception as exc:  # noqa: BLE001
-        return {
-            **_route_turn_fallback("chat", f"chat route LLM unavailable: {exc}"),
-            "ok": False,
-            "error": str(exc),
-            "router_role_used": "router",
-        }
 
 
 @app.post("/turn")
@@ -2572,6 +2481,7 @@ def _run_delegate_subagent_request(
             storage_root=str(agent.jhb_root),
             project_root=req.project_root,
             retriever=agent.retriever,
+            reasoning_effort=req.reasoning_effort,
         )
         return handler(
             name=name,
@@ -4038,204 +3948,6 @@ def _build_context_block(
     if project_memory.strip():
         parts.extend(["", "## Memory Project Files", project_memory.strip()])
     return "\n".join(parts).strip()
-
-
-_ROUTE_VALUES = {"chat", "chat_control", "unregistered_coding", "deepdive", "heavy_deepdive"}
-
-
-def _route_project_summaries() -> list[dict[str, str]]:
-    projects: list[dict[str, str]] = []
-    try:
-        for project in router.registry.all():
-            projects.append(
-                {
-                    "project_id": project.project_id,
-                    "name": project.name,
-                    "slug": project.slug,
-                    "path": project.path,
-                    "code_path": project.code_path or "",
-                }
-            )
-    except Exception:  # noqa: BLE001
-        return []
-    return projects
-
-
-def _route_turn_system_prompt() -> str:
-    return (
-        "You are the JARVIS Code routing model doing a route-only preflight before "
-        "the main turn is built. Decide the user's intent before the main coding "
-        "agent runs. Return only one JSON object, with no markdown.\n\n"
-        "Routes:\n"
-        "- chat: ordinary conversation, memory recall, questions, confirmations, or discussion that does not need file/tool work.\n"
-        "- chat_control: chat-mode control/tool work such as asking the user, worker/window actions, model settings, web lookup, or managing EXISTING project registrations (list/switch/unregister). It must not mutate files, write project memory, or run shell/code tools, and it is NEVER used to create or build a NEW project (that is deepdive).\n"
-        "- unregistered_coding: code/file analysis or edits for an explicit external/unregistered path or material, without JARVIS project memory.\n"
-        "- deepdive: registered workspace project work, focused coding/debugging, or clear creation/registration of a new project.\n"
-        "- heavy_deepdive: registered workspace project work needing root-cause analysis, broad structure review, multi-file refactor, regression/performance work, or explicit full tests.\n\n"
-        "Project rules:\n"
-        "- You understand natural language in any language. Do not require exact slash commands or full paths.\n"
-        "- If the user clearly names a registered project by name, slug, nickname, translation, or prior context, set target_project_hint.\n"
-        "- If multiple registered projects could match, set needs_clarification=true and route=chat.\n"
-        "- SUPREME RULE (outranks every action overlay below): if the user asks to create/start/build/register a NEW project in any language, this is ALWAYS route=deepdive (or heavy_deepdive) with create_project=true, register_project=true, and an ASCII project_slug -- even when you also plan to ask clarifying questions first. Creating or building a new project is NEVER chat_control.\n"
-        "- For non-English project targets, produce a concise filesystem-safe ASCII slug by transliterating or translating the intent. Do not hardcode user-specific aliases.\n"
-        "- If the user asks to edit an external absolute path without registering it, choose unregistered_coding.\n"
-        "- If the user explicitly says not to register, never set register_project.\n\n"
-        "Action overlays:\n"
-        "- If the user requests an independent review/critic/second-agent review workflow, set critic_mode=true. Set critic_heavy=true only for broad/heavy/project-wide critic work.\n"
-        "- If pending_project is present and the user confirms creating/selecting it, set pending_project_decision=confirm. If the user declines, set pending_project_decision=decline. If unclear, set pending_project_decision=unclear.\n"
-        "- expected_action is none for ordinary chat, ask_user when the next chat action should ask the user, spawn_window when the user asks to open a new worker/agent window, project_work for coding/project work, and tool for other tool-backed chat/control actions.\n"
-        "- If expected_action is ask_user, spawn_window, or tool and no project/file mutation is requested AND the turn is not creating/building a new project, prefer route=chat_control over route=chat. (A new project always follows the SUPREME RULE above: deepdive, never chat_control.)\n"
-        "- If the user asks to message, greet, check, label, configure, or continue an already-open worker/window (for example a named worker/window label), set route=chat_control and expected_action=tool, not spawn_window.\n"
-        "- If the user asks for current/external web facts but not file/project work, set route=chat_control and expected_action=tool.\n\n"
-        "JSON schema:\n"
-        "{"
-        "\"route\":\"chat|chat_control|unregistered_coding|deepdive|heavy_deepdive\","
-        "\"confidence\":\"high|medium|low\","
-        "\"target_project_hint\":string|null,"
-        "\"project_slug\":string|null,"
-        "\"code_path_hint\":string|null,"
-        "\"create_project\":boolean,"
-        "\"register_project\":boolean,"
-        "\"critic_mode\":boolean,"
-        "\"critic_heavy\":boolean,"
-        "\"expected_action\":\"none|ask_user|spawn_window|project_work|tool\","
-        "\"pending_project_decision\":\"none|confirm|decline|unclear\","
-        "\"needs_clarification\":boolean,"
-        "\"clarification\":string|null,"
-        "\"reason\":string"
-        "}"
-    )
-
-
-def _route_turn_user_prompt(req: RouteTurnRequest, projects: list[dict[str, str]]) -> str:
-    payload = {
-        "user_message": req.user_message,
-        "cwd_hint": req.cwd_hint,
-        "active_project_path": req.active_project_path,
-        "registered_projects": projects[:80],
-        "pending_project": req.pending_project,
-        "recent_messages": req.recent_messages[-8:],
-        "default_project_root": get_effective_project_root(),
-        "protected_roots": get_protected_roots(),
-    }
-    return json.dumps(payload, ensure_ascii=False, indent=2)
-
-
-def _route_turn_fallback(route: str, reason: str) -> dict[str, Any]:
-    return {
-        "ok": True,
-        "route": route if route in _ROUTE_VALUES else "chat",
-        "confidence": "low",
-        "target_project_hint": None,
-        "project_slug": None,
-        "code_path_hint": None,
-        "create_project": False,
-        "register_project": False,
-        "critic_mode": False,
-        "critic_heavy": False,
-        "expected_action": "none",
-        "pending_project_decision": "none",
-        "needs_clarification": False,
-        "clarification": None,
-        "reason": reason,
-    }
-
-
-def _extract_json_object(text: str) -> dict[str, Any]:
-    raw = (text or "").strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw).strip()
-    try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {}
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{[\s\S]*\}", raw)
-    if not match:
-        return {}
-    try:
-        parsed = json.loads(match.group(0))
-        return parsed if isinstance(parsed, dict) else {}
-    except json.JSONDecodeError:
-        return {}
-
-
-def _route_str(value: Any, *, max_len: int = 240) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    return text[:max_len]
-
-
-def _route_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"true", "yes", "y", "1"}
-    return bool(value)
-
-
-def _normalize_route_decision(data: dict[str, Any], *, raw: str) -> dict[str, Any]:
-    route = _route_str(data.get("route")) or "chat"
-    if route not in _ROUTE_VALUES:
-        route = "chat"
-    confidence = (_route_str(data.get("confidence"), max_len=20) or "medium").lower()
-    if confidence not in {"high", "medium", "low"}:
-        confidence = "medium"
-    needs_clarification = _route_bool(data.get("needs_clarification"))
-    if needs_clarification:
-        route = "chat"
-    critic_mode = _route_bool(data.get("critic_mode"))
-    critic_heavy = critic_mode and _route_bool(data.get("critic_heavy"))
-    expected_action = (_route_str(data.get("expected_action"), max_len=40) or "none").lower()
-    if expected_action not in {"none", "ask_user", "spawn_window", "project_work", "tool"}:
-        expected_action = "none"
-    pending_project_decision = (_route_str(data.get("pending_project_decision"), max_len=40) or "none").lower()
-    if pending_project_decision not in {"none", "confirm", "decline", "unclear"}:
-        pending_project_decision = "none"
-    register_project = _route_bool(data.get("register_project"))
-    create_project = _route_bool(data.get("create_project"))
-    target_project_hint = _route_str(data.get("target_project_hint"))
-    project_slug = _route_str(data.get("project_slug"), max_len=120)
-    # D3 reconcile: a classifier that says route=chat/chat_control but
-    # expected_action=project_work is internally contradictory — downstream (pi)
-    # leaves it unpromoted AND strips tools to ask_user, so real coding work
-    # silently loses its file tools. Promote to the least-privileged coding route
-    # that restores file tools (unregistered_coding), escalating to deepdive only
-    # when a registered/new-project signal is present and heavy_deepdive only on an
-    # explicit heavy-critic signal. needs_clarification -> chat already ran above
-    # and is intentionally NOT overridden (clarification wins). (2026-06-22 fix.)
-    if (
-        not needs_clarification
-        and expected_action == "project_work"
-        and route in {"chat", "chat_control"}
-    ):
-        if critic_heavy:
-            route = "heavy_deepdive"
-        elif register_project or create_project or project_slug or target_project_hint:
-            route = "deepdive"
-        else:
-            route = "unregistered_coding"
-    return {
-        "route": route,
-        "confidence": confidence,
-        "target_project_hint": target_project_hint,
-        "project_slug": project_slug,
-        "code_path_hint": _route_str(data.get("code_path_hint"), max_len=500),
-        "create_project": create_project,
-        "register_project": register_project,
-        "critic_mode": critic_mode,
-        "critic_heavy": critic_heavy,
-        "expected_action": expected_action,
-        "pending_project_decision": pending_project_decision,
-        "needs_clarification": needs_clarification,
-        "clarification": _route_str(data.get("clarification"), max_len=500),
-        "reason": _route_str(data.get("reason"), max_len=500) or "router classifier decision",
-        "raw_text": raw[:2000],
-    }
 
 
 def _format_recent_turns(

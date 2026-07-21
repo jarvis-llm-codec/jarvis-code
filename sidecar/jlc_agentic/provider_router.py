@@ -30,21 +30,31 @@ _FALLBACK_RESET = "\033[0m"
 _LITELLM: Any | None = None
 _DEFAULT_CODEX_STREAM_TIMEOUT_SEC = 120.0
 
-# OpenAI Responses reasoning.effort tops out at "high"; the JLC route vocabulary
-# goes up to "xhigh"/"max" (which the Claude Agent SDK accepts natively). Clamp
-# the high end so a heavy_deepdive route does not send the Responses API an
-# effort it rejects. "none" is JLC's non-reasoning sentinel (handled specially by
-# the callers) and passes through unchanged.
-_OPENAI_EFFORT_CLAMP = {"xhigh": "high", "max": "high"}
+# OpenAI Responses reasoning.effort support is model-specific. Older models
+# top out at "high" while GPT-5.6 accepts xhigh/max/ultra. "none" is the encoder's
+# non-reasoning sentinel and passes through unchanged.
+_OPENAI_EFFORT_CLAMP = {"xhigh": "high", "ultra": "high", "max": "high"}
 
 
-def _codex_reasoning_effort(kwargs: dict[str, Any]) -> str:
+def _is_gpt56_family(model_id: str | None) -> bool:
+    mid = str(model_id or "").strip().lower().split("/", 1)[-1]
+    return mid == "gpt-5.6" or mid.startswith("gpt-5.6-")
+
+
+def _openai_model_supports_ultra(model: str | None) -> bool:
+    return _is_gpt56_family(model)
+
+
+def _codex_reasoning_effort(
+    kwargs: dict[str, Any], model: str | None = None
+) -> str:
     """Effective reasoning effort for a Codex (OpenAI Responses) call.
 
-    Precedence: explicit ``reasoning_effort`` kwarg > the per-turn route effort
+    Precedence: explicit ``reasoning_effort`` kwarg > the user-selected effort
     parked on ``turn_context`` (set by ChatTurn.run, read on this same worker
     thread) > "high" (the historical default). Clamped to the Responses enum's
-    ceiling so heavier JLC efforts degrade gracefully.
+    ceiling so heavier JLC efforts degrade gracefully. GPT-5.6 keeps its
+    explicit xhigh/ultra values instead of taking the legacy clamp.
     """
     raw = kwargs.get("reasoning_effort")
     if not raw:
@@ -52,6 +62,10 @@ def _codex_reasoning_effort(kwargs: dict[str, Any]) -> str:
 
         raw = turn_context.get().get("reasoning_effort")
     eff = str(raw or "high").strip().lower()
+    if eff == "off":
+        eff = "none"
+    if _openai_model_supports_ultra(model) and eff in {"xhigh", "max", "ultra"}:
+        return eff
     return _OPENAI_EFFORT_CLAMP.get(eff, eff)
 
 
@@ -153,7 +167,7 @@ class ProviderRouter:
                     bare_model = resolved.litellm_id.split("/", 1)[-1]
                     instructions, non_system = split_instructions_and_input(messages)
                     response_tools = chat_tools_to_responses_tools(kwargs.get("tools"))
-                    reasoning_effort = _codex_reasoning_effort(kwargs)
+                    reasoning_effort = _codex_reasoning_effort(kwargs, bare_model)
                     response_body = {
                         "input": chat_messages_to_responses_input(non_system),
                         "instructions": instructions,
@@ -357,7 +371,7 @@ class ProviderRouter:
             bare_model = resolved.litellm_id.split("/", 1)[-1]
             instructions, non_system = split_instructions_and_input(messages)
             response_tools = chat_tools_to_responses_tools(kwargs.get("tools"))
-            reasoning_effort = _codex_reasoning_effort(kwargs)
+            reasoning_effort = _codex_reasoning_effort(kwargs, bare_model)
             response_body = {
                 "input": chat_messages_to_responses_input(non_system),
                 "instructions": instructions,

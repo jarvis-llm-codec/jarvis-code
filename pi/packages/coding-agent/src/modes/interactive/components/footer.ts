@@ -1,5 +1,3 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentSession } from "../../../core/agent-session.js";
 import { estimateTokens } from "../../../core/compaction/compaction.js";
@@ -9,6 +7,8 @@ import { theme } from "../theme/theme.js";
 const JLC_METER_ENTRY_TYPE = "jarvis-jlc-meter";
 const JLC_METER_RESET_ENTRY_TYPE = "jarvis-jlc-meter-reset";
 const JLC_CHAT_THINKING_STATUS_KEY = "jlc-chat-thinking";
+const JLC_SUBAGENT_THINKING_STATUS_KEY = "jlc-subagent-thinking";
+const JLC_SUBAGENT_MODEL_STATUS_KEY = "jlc-subagent-model";
 
 type JlcMeterEntry = {
 	chat_in?: number;
@@ -56,38 +56,19 @@ function getJlcMeterData(entry: unknown): JlcMeterEntry | undefined {
 	return data && typeof data === "object" ? (data as JlcMeterEntry) : undefined;
 }
 
-function getThinkingLevelStatus(value: string): "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | undefined {
+function getThinkingLevelStatus(
+	value: string,
+): "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | undefined {
 	return value === "off" ||
 		value === "minimal" ||
 		value === "low" ||
 		value === "medium" ||
 		value === "high" ||
-		value === "xhigh"
+		value === "xhigh" ||
+		value === "max" ||
+		value === "ultra"
 		? value
 		: undefined;
-}
-
-function jarvisUiStatePath(): string {
-	return process.env.JARVIS_UI_STATE_PATH ?? path.resolve(process.cwd(), "..", "data", "jarvis-ui-state.json");
-}
-
-function loadSavedDeepdiveThinkingLevel(): "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | undefined {
-	try {
-		const statePath = jarvisUiStatePath();
-		if (!fs.existsSync(statePath)) return undefined;
-		const parsed = JSON.parse(fs.readFileSync(statePath, "utf-8")) as { deepdiveThinkingLevel?: unknown };
-		return getThinkingLevelStatus(
-			String(parsed.deepdiveThinkingLevel ?? "")
-				.trim()
-				.toLowerCase(),
-		);
-	} catch {
-		return undefined;
-	}
-}
-
-function isJlcDeepdiveStatus(value: string): boolean {
-	return /\bJLC:(?:heavy deepdive|deepdive)\b/.test(value);
 }
 
 /**
@@ -95,10 +76,10 @@ function isJlcDeepdiveStatus(value: string): boolean {
  * effort tier (cost), not by which source reported the level:
  *   minimal/low -> green (success), medium -> deep green (thinkingMedium),
  *   high -> yellow (warning),
- *   xhigh -> red (error). off/undefined stays uncolored (dim).
+ *   xhigh/max/ultra -> red (error). off/undefined stays uncolored (dim).
  */
 function thinkingLevelColor(
-	level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | undefined,
+	level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | undefined,
 ): ((text: string) => string) | undefined {
 	switch (level) {
 		case "minimal":
@@ -109,6 +90,8 @@ function thinkingLevelColor(
 		case "high":
 			return (text: string) => theme.fg("warning", text);
 		case "xhigh":
+		case "max":
+		case "ultra":
 			return (text: string) => theme.fg("error", text);
 		default:
 			return undefined;
@@ -229,18 +212,17 @@ export class FooterComponent implements Component {
 		// provider registry entirely.
 		const jlcChatModel = sanitizeStatusText(extensionStatuses.get("jlc-chat-model") ?? "");
 		const modelName = jlcChatModel || state.model?.id || "no-model";
-		const jarvisStatus = sanitizeStatusText(extensionStatuses.get("jarvis") ?? "");
-		const savedDeepdiveThinkingLevel = isJlcDeepdiveStatus(jarvisStatus)
-			? loadSavedDeepdiveThinkingLevel()
-			: undefined;
 		const jlcThinkingLevel = getThinkingLevelStatus(
 			sanitizeStatusText(extensionStatuses.get(JLC_CHAT_THINKING_STATUS_KEY) ?? ""),
 		);
-		const thinkingLevel =
-			jlcThinkingLevel ??
-			savedDeepdiveThinkingLevel ??
-			(state.model?.reasoning && state.thinkingLevel !== "off" ? state.thinkingLevel : undefined);
-		const rightSideBody = thinkingLevel ? `${modelName} ${thinkingLevel}` : modelName;
+		const thinkingLevel = jlcThinkingLevel ?? state.thinkingLevel;
+		const subagentModel = sanitizeStatusText(extensionStatuses.get(JLC_SUBAGENT_MODEL_STATUS_KEY) ?? "");
+		const subagentThinkingLevel = getThinkingLevelStatus(
+			sanitizeStatusText(extensionStatuses.get(JLC_SUBAGENT_THINKING_STATUS_KEY) ?? ""),
+		);
+		// Subagent model/effort renders on its own right-aligned line below the chat
+		// model line (see subLine near the return), not inline after the chat model.
+		const rightSideBody = `${modelName} ${thinkingLevel}`;
 		// Color by the resolved effort level, not by which source set it.
 		// Medium uses a deeper green than generic success so it does not read yellow.
 		const rightSideColor = thinkingLevelColor(thinkingLevel);
@@ -314,7 +296,9 @@ export class FooterComponent implements Component {
 								key !== "jlc-enc" &&
 								key !== "jlc-enc-model" &&
 								key !== "jlc-chat-model" &&
-								key !== JLC_CHAT_THINKING_STATUS_KEY,
+								key !== JLC_CHAT_THINKING_STATUS_KEY &&
+								key !== JLC_SUBAGENT_THINKING_STATUS_KEY &&
+								key !== JLC_SUBAGENT_MODEL_STATUS_KEY,
 						)
 						.sort(([a], [b]) => a.localeCompare(b))
 						.map(([, text]) => sanitizeStatusText(text))
@@ -339,6 +323,24 @@ export class FooterComponent implements Component {
 					})()
 				: undefined;
 
-		return [dimStatsLeft + dimPadding + styledRightSide, fixedStatusLine, ...(thirdLine ? [thirdLine] : [])];
+		// Subagent model + effort on its own right-aligned line, directly under the
+		// chat model line. Colored by the subagent effort so Alt+2 cycling is visible.
+		const subLine =
+			subagentModel && subagentThinkingLevel
+				? (() => {
+						const text = `sub:${subagentModel} ${subagentThinkingLevel}`;
+						const truncated = truncateToWidth(text, width, "");
+						const pad = " ".repeat(Math.max(0, width - visibleWidth(truncated)));
+						const color = thinkingLevelColor(subagentThinkingLevel);
+						return pad + (color ? color(truncated) : theme.fg("dim", truncated));
+					})()
+				: undefined;
+
+		return [
+			dimStatsLeft + dimPadding + styledRightSide,
+			...(subLine ? [subLine] : []),
+			fixedStatusLine,
+			...(thirdLine ? [thirdLine] : []),
+		];
 	}
 }

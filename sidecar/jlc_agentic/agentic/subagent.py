@@ -130,8 +130,11 @@ class Subagent:
         self.retriever = retriever
         self.allowed_tools = set(allowed_tools) if allowed_tools is not None else None
         self.should_cancel = should_cancel
+        normalized_effort = (
+            str(reasoning_effort).strip().lower() if reasoning_effort else ""
+        )
         self.reasoning_effort = (
-            str(reasoning_effort).strip() if reasoning_effort else None
+            "none" if normalized_effort == "off" else normalized_effort
         ) or "medium"
         self.timeout_sec = timeout_sec
         self.silence_threshold_sec = silence_threshold_sec
@@ -425,7 +428,7 @@ def make_handler(
     storage_root: str | None = None,
     project_root: str | None = None,
     retriever: Any | None = None,
-    reasoning_effort: str | None = "medium",
+    reasoning_effort: str | None = None,
 ) -> Callable[..., dict]:
     """Build a delegate_subagent handler bound to a specific LLM client.
 

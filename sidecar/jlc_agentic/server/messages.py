@@ -30,10 +30,6 @@ class Inbound(TypedDict, total=False):
     turn_id: str
     key: str
     enabled: bool
-    # JARVIS route for this turn (chat | unregistered_coding | deepdive |
-    # heavy_deepdive), as decided by the /route_turn judge. Carries through to
-    # the chat provider's reasoning effort. Absent/empty = no override.
-    route: str
 
 
 class Outbound(TypedDict, total=False):

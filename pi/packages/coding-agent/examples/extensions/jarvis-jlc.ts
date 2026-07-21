@@ -4,7 +4,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import {
+	type Api,
+	type AssistantMessage,
+	getModels,
+	getSupportedThinkingLevels,
+	type KnownProvider,
+	type Model,
+} from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
@@ -495,7 +502,7 @@ type ToolEventSummary = {
 	}>;
 };
 
-type SupportedThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type SupportedThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 type AutoPromptState = {
 	promptsFile: string;
@@ -627,6 +634,8 @@ const DEFAULT_SIDECAR_URL = "http://127.0.0.1:8765";
 const FOOTER_METER_ENTRY_TYPE = "jarvis-jlc-meter";
 const FOOTER_METER_RESET_ENTRY_TYPE = "jarvis-jlc-meter-reset";
 const FOOTER_CHAT_THINKING_STATUS_KEY = "jlc-chat-thinking";
+const FOOTER_SUBAGENT_THINKING_STATUS_KEY = "jlc-subagent-thinking";
+const FOOTER_SUBAGENT_MODEL_STATUS_KEY = "jlc-subagent-model";
 const AUTO_PROMPT_DELAY_MS = Number.parseInt(process.env.JARVIS_AUTO_PROMPT_DELAY_MS ?? "0", 10);
 const AUTO_PROMPT_STALL_TIMEOUT_MS = Number.parseInt(process.env.JARVIS_AUTO_PROMPT_STALL_TIMEOUT_MS ?? "180000", 10);
 const AUTO_PROMPT_ENCODING_WAIT_MS = Number.parseInt(process.env.JARVIS_AUTO_PROMPT_ENCODING_WAIT_MS ?? "180000", 10);
@@ -744,9 +753,6 @@ function getSubturnPayloadMessageLimit(): number {
 	if (parsed <= 0) return Number.POSITIVE_INFINITY;
 	return Math.max(2, Math.floor(parsed));
 }
-const MODE_MARKER_RE = /^\s*\[MODE:[^\]]+\][ \t]*(?:\r?\n)*/i;
-const WORKER_TOOLS_NEEDED_MARKER = "[JLC:NEED_WORKER_TOOLS]";
-const WORKER_TOOLS_RETRY_MARKER = "[JLC WORKER-TOOLS RETRY]";
 const VERIFY_INCOMPLETE_FOLLOWUP_MARKER = "[JLC VERIFICATION-FLOOR FOLLOW-UP]";
 const MAX_VERIFY_CONTINUATIONS = 2;
 const VERIFICATION_COMMAND_PATTERNS: RegExp[] = [
@@ -815,36 +821,14 @@ function jarvisOriginWindow(): string | undefined {
 	return pairId ? pairId.slice(0, 8) : undefined;
 }
 
-const MODE_MARKER_ANY_RE = /\[MODE:[^\]]+\]/gi;
-const MODE_MARKER_PREFIXES = ["[MODE:CHAT]", "[MODE:UNREGISTERED_CODING]", "[MODE:DEEPDIVE]", "[MODE:HEAVY_DEEPDIVE]"];
-
-type EffectiveTurnRoute = "chat" | "chat_control" | "unregistered_coding" | "deepdive" | "heavy_deepdive";
+type EffectiveTurnRoute = "chat" | "chat_control" | "unregistered_coding" | "deepdive";
 type SidecarContextMode = "chat" | "deepdive";
 type JarvisTurnTerminalReason = "stop" | "tool_calls" | "empty" | "no_action" | "error" | "aborted";
-type SidecarRouteTurnResponse = {
-	ok?: boolean;
-	error?: string;
-	route?: EffectiveTurnRoute | string;
-	confidence?: "high" | "medium" | "low" | string;
-	target_project_hint?: string | null;
-	project_slug?: string | null;
-	code_path_hint?: string | null;
-	create_project?: boolean;
-	register_project?: boolean;
-	critic_mode?: boolean;
-	critic_heavy?: boolean;
-	expected_action?: "none" | "ask_user" | "spawn_window" | "project_work" | "tool" | string;
-	pending_project_decision?: "none" | "confirm" | "decline" | "unclear" | string;
-	needs_clarification?: boolean;
-	clarification?: string | null;
-	reason?: string;
-};
-type PostTurnRecoveryKind = "none" | "worker_tools_followup" | "verify_incomplete";
+type PostTurnRecoveryKind = "none" | "verify_incomplete";
 type PostTurnRecoveryDecision = {
 	kind: PostTurnRecoveryKind;
 };
 type PostTurnRecoveryInput = {
-	workerToolsRetryEligible: boolean;
 	modifiedFilePaths?: readonly string[];
 	verificationRanThisTurn?: boolean;
 	route?: EffectiveTurnRoute;
@@ -1192,81 +1176,6 @@ async function runAskUserDialog(
 	return { ok: true, answers: resolved };
 }
 
-const PLAN_DIALOGUE_PROMPT = `
-PLAN DIALOGUE: when this turn kicks off a NEW user-facing artifact, ALWAYS
-call ask_user once before build/recon (and before delegation on heavy turns).
-This is the plan step; run it even when the request seems clear, and pre-fill
-recommended answers from what the user already specified rather than skipping.
-Ask up to 6 self-composed questions (one per genuine fork, no filler): basics (scope/platform/storage/stack) plus
-design direction. For any visual artifact ALWAYS include one design question
-whose recommended option says you study current web design/UX trends for it
-(alternatives: user's own reference, or a minimal default) so the user sees and
-consents to the web-learning step. Skip ONLY on decide/just-make-it,
-same-project follow-up, bug fix, or non-user-facing work. Incoming
-directive/job/gan dispatch turns NEVER re-ask — the plan already happened in
-the dispatcher's window; if a critical decision is genuinely missing, ask the
-dispatcher via job_send/report handback instead. If ok:false, use recommended
-defaults and continue. The design answer seeds the recon queries below; carry
-answers into plan and NOW.
-`.trim();
-
-// Universal clarify-before-act directive. Appended to EVERY route's mode prompt
-// (chat..heavy) by modePromptForRoute, so the model surfaces the choices it is
-// about to make on the user's behalf instead of guessing silently. The artifact-
-// build specialization (PLAN_DIALOGUE_PROMPT) still rides the coding routes on
-// top of this. Calibrated by an information-value gate so it does not become a
-// robot that asks about everything (Jun, 2026-06-23).
-const CLARIFY_DIRECTIVE_PROMPT = `
-[CLARIFY BEFORE YOU ACT]
-Users routinely under-specify. On any non-trivial request you are silently about
-to make choices for the user (scope, style, stack, blast radius, edge cases).
-Surface those instead of guessing. Ask yourself: "What am I about to decide FOR
-the user where I am genuinely uncertain AND they would plausibly have a
-preference?" Those are the forks.
-
-- A NEW user-facing artifact (app, game, page, UI, dashboard, tool) ALWAYS has
-  real forks -- visual style, scope, features, stack. A FAMILIAR concept
-  ("tetris", "todo app", "calculator") is NOT "clear": its design is still
-  unchosen. Call ask_user FIRST with up to ~10 concrete options BEFORE the first
-  file or design recon. Do NOT pick the style/scope/features yourself and
-  proceed -- choosing for the user and saving a Design Brief without asking is
-  the exact failure to avoid. (The plan-dialogue rules below detail the questions.)
-- DESTRUCTIVE actions that are BULK or IRREVERSIBLE (delete/unregister/clear many
-  items, "delete all", drop data, deploy, overwrite, spend) ALWAYS require an
-  ask_user confirmation BEFORE executing -- EVEN when the user already named the
-  scope (e.g. "delete ALL", "지워줘", "모두 지워"). Naming a scope is NOT the same
-  as confirming the destruction. First inspect what exists, then ask with the
-  exact blast radius and count ("This will unregister ALL 3 projects: tetris,
-  todo, foo"), and present EACH distinct scope as its OWN selectable option --
-  never a yes/no, which hides the middle scope and reads as ambiguous. For a
-  registry deletion that means three options: (1) remove the registry entry
-  only, keep the files; (2) remove the entry AND delete the workspace
-  folder/files; (3) cancel. Act only after an explicit choice. Never delete
-  first and report after.
-- For other EXPENSIVE or IRREVERSIBLE guesses (broad refactor, risky change):
-  call ask_user FIRST with the real forks -- include good options the user may
-  not have thought of; that surfacing is the point.
-- If the request is clear and low-risk AND is NOT a fresh artifact build (a
-  bounded edit, a question, a small known change): DO it, then add a one-line
-  assumption receipt of any forks you chose ("edited with vanilla JS -- say if
-  you want different").
-- If there is no real fork: just act.
-
-Information-value gate: only raise a fork whose answer would CHANGE what you do.
-If you would act the same way regardless of the answer, do not ask. Never
-manufacture questions to seem thorough. Never re-ask on an incoming
-directive/job/handback turn -- the plan already happened upstream.
-`.trim();
-
-// Regime-B work-route narration (2026-07-02, Jun): the SDK loop chains tools
-// silently, so the user sees edit/read cards without the "why". Claude Code
-// solves this with a system-prompt mandate; mirror it only for regime-B work.
-const NARRATION_DIRECTIVE_PROMPT = [
-	"Narrate as you work: before each tool call or batch, write ONE short sentence",
-	'in the user\'s language saying what you are about to do and why (e.g. "충돌 로직을 고치기 전에 현재 패들 판정을 확인할게").',
-	"After significant findings or edits, add a one-line progress note. Never work through multiple tools in silence.",
-].join(" ");
-
 // Mandatory ask_user gate for a NEW user-facing artifact turn (Jun, 2026-06-24).
 // The anthropic-agent-sdk regime is an autonomous-completion loop that barrels to
 // "finish the task" and skips the general CLARIFY directive; codex pauses only
@@ -1284,469 +1193,153 @@ specified, but still ask. Do NOT call write/edit/bash or create any file before
 ask_user returns. Building before asking is a turn failure.
 `.trim();
 
-// Chat is the entry mode for every normal turn. Keep this prompt small: the
-// chat model decides whether to answer directly or escalate into project work.
-const CHAT_MODE_PROMPT = `
-[CHAT ENTRY MODE]
+// One shared operating contract for chat, project work, external work, and
+// every provider path. Routes remain internal memory/tool signals only.
+const JARVIS_SYSTEM_PROMPT = `
+[JARVIS OPERATING CONTRACT]
 
-First line must be exactly one marker:
+You are JARVIS Code, a direct and capable coding partner. Answer in the user's
+language. Keep ordinary conversation human and brief (usually one or
+two plain sentences), but take concrete action when the user asks for work.
+Do not sound like a logger, restate the request, or narrate policy. Before a
+tool batch, one short sentence about what you are checking or changing is
+enough; after a meaningful result, one short progress note is enough.
 
-  [MODE:CHAT]
-  [MODE:UNREGISTERED_CODING]
-  [MODE:DEEPDIVE]
-  [MODE:HEAVY_DEEPDIVE]
+CONTEXT, RECALL, AND PATHS
+- Treat injected JARVIS context, recent_window, and JHB as working memory.
+  Continue the pending thread instead of treating a short confirmation as a
+  new greeting. Do not quote or dump memory unless the user asks.
+- Use recall_turns only when the user asks about older work or the injected
+  context lacks a needed detail. Distill the result; do not replay transcripts.
+- When active_code_project_path is present, create and edit user code there.
+  active_memory_project_path is only the JARVIS.md memory location.
+- For explicit external or unregistered paths, inspect/edit/run the requested
+  work without project memory. Do not register them or write JARVIS.md unless
+  the user explicitly asks for registration or confirms a registration prompt.
+- Project selection may use a clear registered name, alias, or path. If more
+  than one project matches, ask which one. Never invent a project target.
+- Memory is already injected. Do not announce a memory preload or read
+  JARVIS.md as a ritual.
+- Treat the current user request and explicit corrections as authoritative.
+  Use memory to continue intent, never to override a newer instruction. If
+  memory and the repository disagree, inspect the live source and report the
+  discrepancy instead of guessing.
 
-Use [MODE:CHAT] for casual talk, recall, acknowledgments, and off-project
-questions; answer in <=2 short sentences. For a bounded action you may use your
-available tools directly (pi basics read/write/edit/bash/grep/find/ls, plus
-registry management, recall, docs, web, and managed_process).
+CLARIFY AND PLAN
+- Raise only choices whose answers would change the implementation. If there
+  is no real fork, act. For a bounded low-risk edit, make the smallest sound
+  assumption and mention it briefly at the end.
+- A new user-facing artifact (app, game, page, UI, dashboard, or interactive
+  tool) always has design/scope/feature/stack forks. Call ask_user once before
+  design research, delegation, or the first file write, even for familiar
+  concepts. Ask at most six useful questions, pre-fill recommended choices
+  from the request, and include one visual-direction choice that can authorize
+  current design/UX trend research. If ask_user is unavailable, use the
+  recommended defaults and continue.
+- Skip that artifact dialogue only when the user explicitly says decide or
+  just make it, or for a same-project follow-up, bug fix, refactor, or
+  non-user-facing task. Incoming directive/job/GAN turns never re-ask; send a
+  genuinely missing decision back to the dispatcher.
+- Do not ask for facts that a quick repository inspection can answer. When a
+  question is necessary, explain the decision it controls and offer concrete,
+  mutually exclusive choices with a recommended default.
+- Before bulk or irreversible destruction, inspect the exact blast radius and
+  call ask_user. Present distinct choices separately (for registry cleanup:
+  unregister only and keep files; unregister and delete files; cancel). Do not
+  treat the user's named scope as confirmation and never delete first.
 
-Worker tools: new worker = spawn_window; existing worker = list_windows then
-job_send; do not duplicate. If needed worker tools are absent, emit exactly:
-[MODE:CHAT]
-${WORKER_TOOLS_NEEDED_MARKER}
-No other text.
+DESIGN RESEARCH
+- After artifact choices are settled, research only when the user selected or
+  allowed it. You may read the first 2 KB of ~/.jarvis-code/design-taste.md,
+  then use up to four searches and two fetches. Distill a Design Brief of at
+  most twelve lines covering palette, typography, layout, motion, UX
+  conventions, avoid-list, and two or three source domains.
+- For an active registered project, save that brief once with update_jarvis_md
+  before artifact writes. For external work, keep it turn-local. Never dump
+  source pages or fabricate trends.
 
-Route notes: Use [MODE:UNREGISTERED_CODING] for explicit external/unregistered
-file/code work. Use [MODE:DEEPDIVE] for focused registered project work,
-localized bug symptoms, setup, files, commands, or implementation. Use
-[MODE:HEAVY_DEEPDIVE] only for broad/high-risk project-wide work. Default to
-[MODE:CHAT] when ambiguous.
+EXECUTION AND TURN ECONOMY
+- Think before tools: form a hypothesis, identify the likely dependency graph,
+  invariants, UX/API contracts, and the smallest decisive verification set.
+- For non-trivial code work, make the first inspection broad enough: one
+  search and a batch/parallel read of the likely files or ranges (typically
+  four to ten). Do not read one file, think, then read one more; do not reread
+  unchanged ranges. Add another read only when the first batch cannot reveal
+  the cause or edit surface.
+- Use the todo tool for multi-step work and keep exactly one item in progress.
+  Prefer one coherent plan, one bundled patch, and one focused verification
+  pass over repeated micro-edits and speculative test runs.
+- Read before editing existing files. Preserve existing behavior and
+  repository conventions unless the request changes them. Inspect git
+  diff/status before freezing work and commit only intended files when asked.
+- Diagnose from evidence before patching. Trace the relevant call path and
+  existing tests, fix the root cause, and keep the edit surface proportional
+  to the request. Do not hide a failure by weakening validation, deleting a
+  meaningful assertion, or adding a broad fallback that changes unrelated
+  behavior.
+- Keep public interfaces, persisted data, and provider/tool contracts backward
+  compatible unless the user requested a break. Validate untrusted input at
+  its boundary, preserve useful error detail, and avoid logging secrets.
+- If a tool or command fails, read the actual error before trying another
+  approach. Do not repeat an unchanged failing action. After two equivalent
+  failures, change the hypothesis or report the concrete blocker.
+- Use project registry, model, web, process, and worker tools directly when
+  the request needs them. Registry cleanup is executable work, not a reason
+  to claim the capability is unavailable.
+- Delegate only when the user explicitly asks. Follow the worker/GAN tool
+  contracts for source-text handoff, cohesion, verification, and handback;
+  never spawn a duplicate for an existing named worker.
+
+COMPLETION AND VERIFICATION
+- A code-changing turn is not complete until a relevant check has run after
+  the final patch. Run the narrowest decisive syntax/type/test/build/smoke
+  check first, then the broader project check when proportionate. If a check
+  fails, inspect the cause in a batch, patch the cause, and rerun that check.
+- If no safe or practical check exists, say exactly why and state the
+  residual risk. Never finish after edits with only a promise or explanation.
+- Verify the user-visible outcome, not merely that a command exited zero. For
+  bug fixes, exercise the failing case and one nearby boundary when practical;
+  for refactors, confirm the old behavior and public surface remain intact.
+- For UI, interactive, or game work, do not start a local dev server, launch
+  a browser, take screenshots, or kill processes as verification. Verify with
+  file existence plus syntax/build/type checks. On Windows, open files with
+  Start-Process -LiteralPath; never use an unquoted 'start C:\\path'.
+- Re-read the final diff for accidental churn, debug artifacts, stale names,
+  and incomplete call-site migration. Do not claim a test, build, launch,
+  commit, or external action happened unless its result was observed.
+- The final response should lead with the outcome, name the important files
+  or behavior changed, and report the exact checks and pass/fail result.
+
+PROJECT MEMORY
+- After project work, update JARVIS.md only for concrete new durable facts.
+  Use update_jarvis_md only, batch multiple changed sections in one call, and
+  never edit the whole file directly. The tool schema owns the canonical
+  section and OMM formats. Keep memory writes quiet; the user-facing answer is
+  about the work, not the bookkeeping.
 `.trim();
 
-const CHAT_CONTROL_MODE_PROMPT = `
-[CHAT CONTROL MODE]
-
-First line must be exactly [MODE:CHAT].
-
-This is still chat mode for memory/context, but the user asked for a bounded
-control or action. Use the tools needed for the request, then answer briefly.
-
-Available: ask_user, worker/window messaging or spawn, model/window settings,
-web_search/web_fetch, project registry (register/switch/unregister_project),
-update_jarvis_md, recall_turns/retrieve_output, docs_search/package_info,
-managed_process, and pi's basic tools (read/write/edit/bash/grep/find/ls) for a
-bounded file or command action the user asked for.
-
-Keep it bounded: you MAY manage the project registry (register_project,
-switch_project, unregister_project) and update JARVIS.md when the user asks for a
-bounded change. Do not start a substantial REGISTERED project build or set up
-maps/delegation here.
-
-Registry cleanup and workspace deletion are bounded actions you perform HERE,
-never a reason to bail or escalate. To remove registrations -- including a bulk
-"delete everything / reset all" -- call unregister_project (once per entry, or
-for every registration). To delete the workspace folder(s) the user confirmed
-removing, use bash (rm the confirmed path). You HAVE unregister_project and bash
-in this turn: never reply that the tool is "not exposed", that you "cannot delete
-in chat_control mode", or that deletion needs a different/"delete-capable" mode.
-Just call the tools and report what was actually removed.
-`.trim();
-
-const UNREGISTERED_CODING_MODE_PROMPT = `
-[UNREGISTERED CODING MODE]
-
-EVERY reply MUST start with exactly [MODE:UNREGISTERED_CODING] on the first
-line before any text or tool call.
-
-This turn is standalone work on explicit external/unregistered material: a
-path, pasted code, one-off script, command, or file/folder outside a registered
-JARVIS project. Read, analyze, edit, and run focused checks when the user asks.
-
-Do not copy project-memory persistence rules into unregistered_coding.
-Unregistered may do plan/design/recon as turn-local working context, but must
-not call switch_project, register_project, unregister_project, or
-update_jarvis_md. Do not persist the turn with project_path and do not register
-external folders unless the user explicitly asks for JARVIS project
-registration or confirms your registration question.
-
-${PLAN_DIALOGUE_PROMPT}
-
-UNREGISTERED DESIGN RECON: when this turn kicks off a new user-facing artifact
-(app, game, landing page, dashboard, UI component) built in unregistered
-material, recon before the first artifact file write unless the user says to
-skip, the task is a bug fix/refactor/non-user-facing utility, or the user chose
-their own reference over web research. You may read the first 2KB of
-~/.jarvis-code/design-taste.md because it is global user taste, not project
-memory. If web_search/web_fetch are available, use up to 4 searches and up to 2
-fetches. Distill a <=12-line turn-local Design Brief and use it for this turn
-only. Never save it to JARVIS.md.
-
-Verification: after editing external files, run the cheapest relevant syntax,
-type, test, build, smoke, or direct executable probe you can run safely. If no
-check is practical, say exactly why and what risk remains.
-`.trim();
-
-// Full project-work rules. Inject only when the current turn is already
-// classified as project work/deepdive. Both the pre-answer workflow and
-// post-answer memory update rules live here so coding turns remain rigorous
-// without charging casual chat for the same policy body.
-const DEEPDIVE_MODE_PROMPT = `
-[MODE — MANDATORY FIRST-LINE TOKEN]
-
-EVERY reply MUST start with EXACTLY one of these tokens, alone on the
-very first line, BEFORE any text, thinking summary, or tool call. The
-marker is REQUIRED — the JARVIS sidecar gates memory I/O on it and
-project state will corrupt if you omit it. This is not cosmetic; it is
-load-bearing routing.
-
-  [MODE:CHAT]
-  [MODE:UNREGISTERED_CODING]
-  [MODE:DEEPDIVE]
-  [MODE:HEAVY_DEEPDIVE]
-
-If you skip the marker the sidecar will misroute your reply and the
-project memory will not update. Always include it, even for one-word
-acknowledgments and even when you start with a tool call.
-
-Choose by:
-  [MODE:CHAT]     — casual talk, recall, acks, reflection, off-project.
-                    Skip reading project files.
-                    Do not quote or restate prior probes, recent_window,
-                    or earlier assistant text unless the user explicitly
-                    asks for a quote.
-                    Keep ordinary chat replies to at most 2 plain
-                    sentences; target roughly 20–60 tokens.
-                    Do not interpret, analyze, poeticize, or structure
-                    random fragments unless the user explicitly asks.
-                    Short confirmations, denials, or acknowledgements are
-                    contextual answers to the previous assistant question.
-                    Read recent_window/JHB first and continue that pending
-                    action; do not treat them as a fresh casual greeting.
-                    If the user is clearly just sharing a small update,
-                    you may end with ONE short, low-pressure follow-up
-                    question to keep the thread moving, but do not do it
-                    every turn.
-                    Do not sound like a logging bot. Avoid replies such
-                    as "Logged.", "Got it.", "Noted.", or similarly dry
-                    status-only acknowledgments. Be brief but human.
-                    Plain text only; no markdown quotes, bullets, or
-                    headings.
-  [MODE:UNREGISTERED_CODING] — standalone file/code/command work for explicit
-                    external material or an unregistered path/folder. Do not
-                    switch projects, register projects, update JARVIS.md, or
-                    persist the turn with project_path.
-  [MODE:DEEPDIVE] — code/architecture/debugging/project-file work.
-                    Use this for localized bug symptoms and focused fixes, even
-                    when the user asks for cause analysis.
-                    When the memory block includes
-                    active_code_project_path, create/edit user code there.
-                    active_memory_project_path is for JARVIS.md memory file only.
-                    INTERNAL TOOL TURN ECONOMY:
-                    Use strong reasoning freely, but spend it BEFORE tool
-                    calls: infer the likely dependency graph, choose enough
-                    candidate files up front, and create a batch inspection
-                    plan. Do not spend tool turns discovering the codebase one
-                    file at a time.
-
-                    Strong reasoning is for:
-                    - choosing likely files before reading
-                    - designing the fix after the batch read
-                    - deciding the smallest coherent verification set
-
-                    File reading rule:
-                    - file reads MUST be batch/parallel reads whenever possible
-                    - prefer one read call with items=[...] for multi-file or
-                      multi-range inspection
-                    - the first read batch should be broad enough, usually 4-10
-                      likely relevant files for non-trivial coding tasks
-                    - do not reread the same unchanged file range; if read
-                      reports an already-read notice, use the prior context
-                      instead of asking for the same range again
-                    - do not read 1 file, think, then read 1 more file, then
-                      think again
-                    - additional file reads are allowed only when the first
-                      batch cannot identify the cause or edit surface
-
-                    After the first batch read, work inside the context you
-                    have. Do not keep adding single-file reads unless the task
-                    is genuinely blocked.
-
-                    Todo tracking:
-                    - For multi-step coding work, use the todo tool to keep
-                      your task checklist current. The tool replaces the full
-                      list each call; keep exactly one item in_progress unless
-                      the work is paused or complete.
-
-                    Prefer:
-                    - one broad search over many narrow searches
-                    - reading all likely relevant files in one batch
-                    - one comprehensive planning step after inspection
-                    - one bundled patch
-                    - one verification pass
-
-                    Avoid:
-                    - read one file, think, read another file
-                    - search one symbol at a time
-                    - patch one tiny change at a time
-                    - asking the user or re-planning after every observation
-                    - running tests repeatedly before a coherent patch exists
-
-                    Workflow:
-                    1. Build a hypothesis of the affected area.
-                    2. Batch inspect all likely relevant files.
-                    3. State the invariants and UX/API contracts that must
-                       remain true before editing.
-                    4. Only then make the implementation plan.
-                    5. Apply the full coherent change, including focused
-                       tests when behavior changes.
-                    6. Run the narrowest relevant verification first.
-                    7. Run the broader project check after the targeted
-                       verification passes.
-                    8. If verification fails, inspect the failure cause in
-                       batch, patch only the cause, and rerun the same checks.
-                    9. Before finishing, inspect git diff/status and commit
-                       only the intended files when the user asked to freeze
-                       the result.
-
-                    HARD COMPLETION RULE:
-                    A coding/deepdive turn is NOT complete until verification
-                    has actually run after the final patch. Never finish after
-                    editing code by only explaining the change. The final
-                    assistant reply must include the concrete verification
-                    command(s) run and whether they passed. If a relevant
-                    check cannot be run, say exactly why and what residual
-                    risk remains. If verification fails, do not present the
-                    work as done; fix the cause and rerun the checks, or state
-                    the remaining blocker plainly.
-
-                    Verification floor:
-                    - For code edits, run at least one focused test, type
-                      check, lint, build, smoke check, or direct executable
-                      probe that exercises the changed behavior.
-                    - For UI/interactive work, never run browser, screenshot,
-                      canvas, or rendered inspection, and never start a local
-                      dev server or kill processes as part of verification.
-                      Verification is file existence plus syntax/build checks
-                      (for example node --check). Prefer the cheapest relevant
-                      build, lint, type, focused test, or direct executable
-                      probe.
-                    - On Windows, NEVER open a local file with an unquoted
-                      command like start C:path\file.html from bash-like
-                      shells. Backslashes can be swallowed and produce broken
-                      paths such as C:pathfile.html. Use a safe opener instead:
-                      powershell.exe -NoProfile -Command "Start-Process -LiteralPath 'C:path\file.html'"
-                      or cmd.exe /c start "" "C:path\file.html".
-                    - For config/docs-only edits, run the cheapest relevant
-                      parser, formatter, link/schema check, or explain why no
-                      executable verification exists.
-                    - After the last code change, rerun the most relevant
-                      verification. Earlier passing checks do not count if code
-                      changed afterward.
-
-  [MODE:HEAVY_DEEPDIVE] — same as DEEPDIVE, but for broad/high-risk project
-                    work: current implementation analysis before planning plus
-                    full redesign/rework, broad structure review, multi-file
-                    refactor, architecture/game-loop/state/input/rendering/
-                    asset/build inspection, project-wide regression or
-                    performance work, or adding systems such as sound effects/
-                    BGM. Do not use HEAVY for localized bug symptoms unless the
-                    user also asks for broad redesign, project-wide analysis,
-                    or cross-system refactoring. Keep the turn rigorous and
-                    batch reads before editing.
-
-                    Project selection and registration:
-                    - A registered project may be selected by clear name,
-                      slug, alias, or path. If multiple registered projects
-                      match, ask which one before switching or editing.
-                    - If the user asks to create/start/set up a new project
-                      and the target name/path is clear, that is consent to
-                      create/select it under the default project root.
-                    - Ordinary external file edits are standalone
-                      unregistered coding. Do not register external folders
-                      unless the user explicitly asks for JARVIS project
-                      registration or confirms your registration question.
-                    Project memory is already injected before the first model
-                    call. Do not announce that you will read JARVIS.md, and
-                    do not read JARVIS.md merely to satisfy a memory preload
-                    ritual. Read it only when the actual task needs the file
-                    contents beyond the injected memory block.
-
-                    ${PLAN_DIALOGUE_PROMPT}
-
-                    PROJECT DESIGN RECON (clarify-driven, NOT a forced rule):
-                    Design recon is OPT-IN and the user's answer is supreme.
-                    NEVER web_search/web_fetch for recon, and skip recon
-                    entirely, when the user opts out, says keep it
-                    simple/minimal/basic ("간단한", "그냥", "no research",
-                    "웹조사 안함", "리서치 없이"), or does not ask for design
-                    polish. Also skip when "## Design Brief" already exists, for
-                    bug fixes/refactors/existing-code edits, or internal
-                    scripts/CLI utilities/non-user-facing work.
-                    For [MODE:DEEPDIVE] and [MODE:HEAVY_DEEPDIVE], when this turn
-                    kicks off a NEW user-facing artifact (new app, game, landing
-                    page, dashboard, or UI component) with no existing Design
-                    Brief, your clarify/ask_user should surface the choice --
-                    "research current design/UX trends for a polished look, or
-                    keep it simple?" -- then FOLLOW the user's answer. Do recon
-                    ONLY when the user opts in or asks for a polished look.
-                    When recon runs, use existing tools only: web_search for 1-2 visual trend
-                    searches like "<artifact type> UI design trends <current
-                    year>" and 1-2 UX convention searches like "<artifact type>
-                    UX patterns best practices"; total search cap 4. Optionally
-                    web_fetch 1-2 discovered references; fetch cap 2. If search
-                    or fetch is unavailable or empty, do not block the build;
-                    save a brief line saying "recon degraded: search unavailable"
-                    and continue. If ~/.jarvis-code/design-taste.md
-                    exists, read only its first 2KB, merge it into the brief,
-                    prefer it over search on conflicts, and never create or edit
-                    that file. Distill, never dump source text. Save exactly one
-                    Design Brief with update_jarvis_md field DESIGN_BRIEF before
-                    writing artifact files. Keep the entire section <= 12 lines:
-                    - Palette: ...
-                    - Typography: ...
-                    - Layout: ...
-                    - Motion: ...
-                    - UX conventions: ...
-                    - Avoid: ...
-                    - Sources: 2-3 domain names only, no full URLs.
-                    If starting a new project, register or switch the project
-                    path first so update_jarvis_md can write active JARVIS.md,
-                    then run recon and save the brief.
-                    Before editing code, scan injected LAW/BAN/OMM entries for
-                    matching Trigger lines. If any match, follow their Rule,
-                    Required action, and Verify steps before finalizing.
-                    Then proceed with the deepdive task.
-
-                    AFTER answering, update JARVIS.md if it gained NEW
-                    info this turn (ruthlessly selective — touch ONLY
-                    sections with new content; skip if nothing new).
-
-                    HOW TO UPDATE — use update_jarvis_md ONLY. Never write/edit
-                    JARVIS.md directly. If multiple sections change, call it
-                    ONCE with updates=[{field,value}, ...]. Use field/value
-                    only for a single section. Update quietly and summarize once.
-
-                    CANONICAL SECTIONS (8, fixed — do not invent others except
-                    the special DESIGN_BRIEF section required by design recon):
-                    Write JARVIS.md as operational memory for future agents,
-                    not as prose, apology, or a long changelog.
-                    NOW=current task status, verification, and MUST end
-                    "Next: <single-line next step>".
-                    MAP=stable files/symbols/entry points/tests/commands only.
-                    LAW=hard invariants using "LAW-###: Trigger -> Rule -> Verify".
-                    BAN=known-dangerous actions using "BAN-###: Never... because... verify...".
-                    HABIT=user/project preferences using "HABIT-###: When..., prefer...".
-                    WHY=decision rationale only: "Decision -> Why -> Tradeoff".
-                    OMM=operational mistake-prevention rules, not apologies.
-                    Each OMM entry MUST use:
-                      "### OMM-###: Short title"
-                      "- Trigger: When this rule must be recalled."
-                      "- Mistake: What failed before, concretely."
-                      "- Rule: What must/never happen next time."
-                      "- Required action: What to inspect/change before proceeding."
-                      "- Verify: Command, test, log, or observable check."
-                    RAW=evidence pointers only: date, request, files changed,
-                    commands run, test result, turn id if known. No transcripts.
-                    Fill only sections with concrete facts; no generic filler.
-                    Memory writes are bookkeeping: never narrate them in your
-                    reply (no "memory updated:" line). The answer is the answer;
-                    the sidecar tracks what changed.
-Default CHAT when truly ambiguous, but NEVER skip the first-line marker.
-Skipping the marker is a worse error than picking the wrong mode — the
-marker is what the sidecar reads; the mode body only refines behavior.
-`.trim();
-
-const CHAT_ROUTE_PROMPT = `
-[ROUTE:CHAT_ENTRY]
-
-Start light. Answer ordinary chat directly. Escalate only when the request
-actually needs unregistered coding, registered project deepdive, or heavy
-project-wide work. Localized bug symptoms are deepdive, not heavy.
-Do not update JARVIS.md unless escalated into registered project deepdive; do
-not register external folders without explicit user registration intent/confirm.
-`.trim();
-
-const CHAT_CONTROL_ROUTE_PROMPT = `
-[ROUTE:CHAT_CONTROL]
-
-This turn is chat-visible control/web work. Keep the required first-line marker
-as [MODE:CHAT]. Use the control/web tool pocket already exposed to this turn.
-Do not perform file/project mutation, shell commands, project registration,
-project switching, map/delegation setup, or project memory writes.
-`.trim();
-
-const UNREGISTERED_CODING_ROUTE_PROMPT = `
-[ROUTE:UNREGISTERED_CODING]
-
-This turn is standalone coding or inspection for external/unregistered material.
-Keep the required first-line marker as [MODE:UNREGISTERED_CODING]. You may read,
-analyze, and edit the referenced external files when the user asks for ordinary
-file work. JARVIS may ask for confirmation before mutating files outside the
-active project/work directory.
-
-Do not update JARVIS.md, do not switch the active project, and do not persist
-the turn with project_path. Do not register the folder as a JARVIS project unless
-the user explicitly asks to register/add it as a JARVIS project.
-`.trim();
-
-const DEEPDIVE_ROUTE_PROMPT = `
-[ROUTE:DEEPDIVE]
-
-This turn is registered workspace project work. Keep the required first-line
-marker as [MODE:DEEPDIVE]. Use the injected project memory and the active code
-project path. Do focused implementation or debugging, then update JARVIS.md
-only when concrete new project facts were learned.
-`.trim();
-
-const HEAVY_DEEPDIVE_ROUTE_PROMPT = `
-[ROUTE:HEAVY_DEEPDIVE]
-
-This turn is registered workspace project work with broad design, multi-file,
-project-wide regression/performance, or high-risk scope. Keep the required
-first-line marker as [MODE:HEAVY_DEEPDIVE]. Build a hypothesis before tool
-calls, batch inspection, preserve invariants, and verify after the final patch.
-`.trim();
-
-const HEAVY_DEEPDIVE_OVERLAY_PROMPT = `
-[HEAVY DEEPDIVE OVERLAY]
-
-Use this overlay only for broad/high-risk registered project work: current
-implementation analysis before planning, full redesign/rework, broad structure
-review, multi-file refactor, architecture/game-loop/state/input/rendering/
-asset/build inspection, project-wide regression/performance work, or adding
-systems such as sound effects/BGM. Do not use HEAVY for localized bug symptoms
-unless the user also asks for broad redesign, project-wide analysis, or
-cross-system refactoring.
-
-Budget rule: every tool call must either gather multiple pieces of necessary
-information, apply a complete coherent change, or verify the completed work.
-Single-purpose exploratory tool calls are discouraged unless the task is
-genuinely ambiguous. Think hard, parallelize observation, patch once, verify
-once.
-
-DELEGATION DISPATCH CONTRACT: delegation/map initiation is HEAVY-only. For
-build delegation via spawn_window/job_send/send_directive, relay source text
-only: quote the user's original request and raw plan Q/A; include completion/
-handback format and project path/registration. Do NOT invent stack,
-architecture, file layout, implementation order, or code sketches; constraints
-from user words are valid goals and stay quoted. For design-led delegation,
-relay raw design answers; the worker runs web_search/web_fetch, distills/saves
-Design Brief, or inherits an existing "## Design Brief". Review/repair
-delegation is opposite: give lenses/checklists; fixes should be
-symptom+diagnosis unless you truly know the patch.
-
-Delegated builds default to WHOLE delegation: dispatch the full build to ONE
-worker that keeps cohesion end to end. The worker self-checks its build runs
-before handing back; tell it so in the ticket. You then verify the handback
-once — confirm it is real, do not re-run the worker's own checks. No double
-verification. Only when a build is too large for one worker context should you
-persist a feature map with map_create and dispatch features in slices. Surface
-the delegation depth in the plan: [A] you write the core/skeleton directly and
-delegate the rest, or [B] delegate the whole build.
-
-Focused deepdive must not initiate delegation/map. Active worker/directive
-turns may still use handback bus tools; do not confuse handback with new
-delegation initiation.
+const UPDATE_JARVIS_MD_TOOL_DESCRIPTION = `
+Patch only the active project's JARVIS.md operational memory. Never replace or
+edit the whole file. Use field/value for one section. Batch 2+ changed sections
+in one updates array. Write only concrete durable facts; no generic
+filler, apologies, prose changelog, or transcript. Canonical sections:
+NOW=current status and verification, ending with "Next: <one next step>";
+MAP=stable files, symbols, entry points, tests, and commands;
+LAW=hard invariants as "LAW-###: Trigger -> Rule -> Verify";
+BAN=dangerous actions as "BAN-###: Never... because... verify...";
+HABIT=user/project preferences as "HABIT-###: When..., prefer...";
+WHY=decision rationale as "Decision -> Why -> Tradeoff";
+OMM=mistake-prevention rules, each with heading "### OMM-###: Short title"
+and bullets "Trigger", "Mistake", "Rule", "Required action", and "Verify";
+RAW=evidence pointers only (date, request, files, commands, test result, turn id).
+DESIGN_BRIEF is the only special section: at most twelve lines for palette,
+typography, layout, motion, UX conventions, avoid-list, and source domains.
+Refresh only sections that gained facts. Keep the memory write quiet.
 `.trim();
 
 // M7.9: checkpoint turns are ticket processing, not exploration — keep this
 // far lighter than DEEPDIVE (R3-3 token diet).
 const MAP_CHECKPOINT_MODE_PROMPT = `
-[MODE — MANDATORY FIRST-LINE TOKEN]
-EVERY reply MUST start with [MODE:DEEPDIVE] alone on the very first line,
-before any text or tool call — the sidecar gates memory I/O on it.
-
 [MAP CHECKPOINT TURN]
 A worker handed back the feature(s) listed under MAP STATUS below. This is
 ticket processing, not exploration, and never implementation.
@@ -1771,10 +1364,6 @@ automatically when a worker hands back.
 `.trim();
 
 const MAP_SYNTHESIS_PROMPT = `
-[MODE — MANDATORY FIRST-LINE TOKEN]
-EVERY reply MUST start with [MODE:DEEPDIVE] alone on the very first line,
-before any text or tool call — the sidecar gates memory I/O on it.
-
 [MAP SYNTHESIS TURN]
 Every feature on the map passed its checkpoint. Run the final cross-feature
 verification yourself now: build, run the tests, launch the artifact's happy
@@ -1795,10 +1384,6 @@ write it for the user, not for a dispatcher.
 // browser / vision) is parked for an ~unlimited-token future; see
 // _internal/PLAYTEST_END_GATE_MECHANISM_COMPARISON_2026_06_13.md.
 const WHOLE_DELEGATION_END_GATE_PROMPT = `
-[MODE — MANDATORY FIRST-LINE TOKEN]
-EVERY reply MUST start with [MODE:DEEPDIVE] alone on the very first line,
-before any text or tool call — the sidecar gates memory I/O on it.
-
 [WHOLE-DELEGATION END GATE]
 A worker handed back a build you delegated whole and already self-checked it
 runs. Do NOT re-run a heavy verification or re-play the artifact — that double
@@ -1816,10 +1401,6 @@ patch it yourself. Your final text IS the user report.
 `.trim();
 
 const SECOND_EYES_MODE_PROMPT = `
-[MODE — MANDATORY FIRST-LINE TOKEN]
-EVERY reply MUST start with [MODE:DEEPDIVE] alone on the very first line,
-before any text or tool call — the sidecar gates memory I/O on it.
-
 [CRITIC MODE]
 You are an independent Critic Mode reviewer, not the implementer. The main
 window owns planning decisions, implementation, fixes, and user reporting. Your
@@ -1878,10 +1459,6 @@ job header. That handback is the only permitted write-like action.
 `.trim();
 
 const SECOND_EYES_MAIN_MODE_PROMPT = `
-[MODE — MANDATORY FIRST-LINE TOKEN]
-EVERY reply MUST start with [MODE:DEEPDIVE] alone on the very first line,
-before any text or tool call — the sidecar gates memory I/O on it.
-
 [CRITIC MODE MAIN]
 You are the main implementer/orchestrator. The Critic Mode worker is review-only:
 it may inspect and run bounded verification, but never edits files, runs
@@ -1912,20 +1489,8 @@ Protocol:
 `.trim();
 
 function secondEyesModePrompt(prompt: string): string {
-	const marker = currentSecondEyesHeavy() ? "[MODE:HEAVY_DEEPDIVE]" : "[MODE:DEEPDIVE]";
-	const withMarker = prompt.replace(
-		"EVERY reply MUST start with [MODE:DEEPDIVE] alone",
-		`EVERY reply MUST start with ${marker} alone`,
-	);
-	return currentSecondEyesHeavy() ? `${withMarker}\n\n${HEAVY_DEEPDIVE_OVERLAY_PROMPT}` : withMarker;
+	return prompt;
 }
-
-const LOCAL_LANGUAGE_PROMPT = `
-[LANGUAGE POLICY]
-
-Default to English, but answer in the user's language when the user uses another
-language. Keep required machine markers such as [MODE:*] unchanged.
-`.trim();
 
 let activeProjectPath: string | undefined;
 let activeCodePath: string | undefined;
@@ -1941,23 +1506,22 @@ let interruptCheckpointSavedThisTurn = false;
 let interruptInputUnsubscribe: (() => void) | undefined;
 let turnCheckpointScope: CheckpointScope | undefined;
 let sidecarHealthy = false;
-let currentMode: "chat" | "deepdive" = "chat";
-let currentRoute: EffectiveTurnRoute = "chat";
+let currentMode: "chat" | "deepdive" = "deepdive";
+let currentRoute: EffectiveTurnRoute = "deepdive";
 // Route to restore when an [ULTRACODE DONE ...] completion directive re-engages
 // this window. The fast-handoff turn ends, the completion directive arrives as a
-// fresh user turn, the per-turn reset forces "chat", and shouldCallRouteClassifier
-// skips directive turns — so a deepdive-launched ultracode relays its result from
-// a chat turn (route demotion). Latched at agent_end when the ended turn invoked a
-// background-handoff tool; consumed one-shot by the completion directive turn.
+// fresh user turn, and the per-turn reset forces the general "deepdive" route.
+// Latched at agent_end when the ended turn invoked a background-handoff tool;
+// consumed one-shot by the completion directive turn so the source route is restored.
 // Same-window handoffs only: worker/cross-window/second-eyes flows never latch.
 let ultracodeHandoffRouteToRestore: EffectiveTurnRoute | undefined;
 let currentTodoList: JarvisTodoItem[] = [];
 let readBeforeEditRegistry = new Map<string, number>();
-let deepdiveThinkingPreference: SupportedThinkingLevel | undefined;
-let deepdiveThinkingPreferenceLoaded = false;
+let subagentThinkingPreference: SupportedThinkingLevel | undefined;
+let subagentThinkingPreferenceLoaded = false;
+let cachedSubagentEffortState: SubagentEffortState | undefined;
 let subagentModelUserSet = false;
 let subagentModelUserSetLoaded = false;
-let suppressNextThinkingPreferenceSave: SupportedThinkingLevel | undefined;
 let coldStartNoticeShown = false;
 let startupContextWarmupFinished = false;
 let startupContextWarmupPromise: Promise<void> | undefined;
@@ -1971,17 +1535,11 @@ let lastProviderCallRoute: EffectiveTurnRoute | undefined;
 let lastProviderToolsBeforeFilter: string[] = [];
 let lastProviderToolsAfterFilter: string[] = [];
 let lastProviderActionIntentMatch = false;
-let lastProviderChatFilterApplied = false;
-let lastProviderRoutePromotedByClassifier = false;
-let lastRouteClassifierDecision: SidecarRouteTurnResponse | undefined;
-let lastRouteClassifierActionIntent = false;
 let expectedToolActivityThisTurn = false;
-let routePromotedByClassifierThisTurn = false;
-// Set on a classifierNewProject route decision; consumed (front-pushed + cleared)
-// in the before-provider system-prompt assembly so the new-artifact ask_user gate
-// is salient. Errs toward asking if it ever leaks (Jun: ask_user aggressively).
+// Set by explicit project creation; consumed (front-pushed + cleared) in the
+// before-provider system-prompt assembly so the new-artifact ask_user gate is
+// salient. Errs toward asking if it ever leaks (Jun: ask_user aggressively).
 let pendingNewArtifactAskUserGate = false;
-let workerToolsRetryInFlight = false;
 let workerWindowContextInjectedThisTurn = false;
 let lastTurnStartedAtMs: number | undefined;
 let lastProviderStartedAtMs: number | undefined;
@@ -2317,7 +1875,7 @@ function maybeSendDeepdiveReasoningStartNotice(pi: ExtensionAPI): void {
 	deepdiveReasoningStartNoticeSentThisTurn = true;
 	sendJarvisChatNotice(
 		pi,
-		`Reasoning started (${currentRoute}) — the model is planning before its first visible output; this can take a few minutes on high reasoning effort. Progress will stream as it works.`,
+		"Reasoning started — the model is planning before its first visible output; this can take a few minutes at higher effort. Progress will stream as it works.",
 	);
 }
 
@@ -3170,29 +2728,12 @@ function secondEyesHeavyContext(item: SidecarDirectiveItem | undefined): boolean
 	return includesCriticHeavyMarker(body);
 }
 
-function routeDecisionCriticMode(decision: SidecarRouteTurnResponse | undefined): boolean {
-	return decision?.critic_mode === true;
-}
-
-function routeDecisionCriticHeavy(decision: SidecarRouteTurnResponse | undefined): boolean {
-	return routeDecisionCriticMode(decision) && decision?.critic_heavy === true;
-}
-
 function enterSecondEyesRoute(): void {
-	if (
-		activeSecondEyesHeavyTurn ||
-		currentRoute === "heavy_deepdive" ||
-		routeDecisionCriticHeavy(lastRouteClassifierDecision)
-	) {
-		enterHeavyProjectWork();
-		activeSecondEyesHeavyTurn = true;
-		return;
-	}
 	enterProjectWork();
 }
 
 function currentSecondEyesHeavy(): boolean {
-	return activeSecondEyesHeavyTurn || currentRoute === "heavy_deepdive";
+	return activeSecondEyesHeavyTurn;
 }
 
 function startsWithAnyMarker(text: string, markers: readonly string[]): boolean {
@@ -4262,33 +3803,27 @@ function jlcLabel(state: "checking" | "down" | "degraded" | "ok", projectName?: 
 	if (state === "checking") return `${ANSI_YELLOW}${prefix}JLC checking${ANSI_RESET}`;
 	if (state === "down") return `${ANSI_RED}${prefix}JLC down${ANSI_RESET}`;
 	if (state === "degraded") return `${ANSI_RED}${prefix}JLC degraded${ANSI_RESET}`;
-	const color = isProjectRoute(currentRoute) ? ANSI_RED : ANSI_YELLOW;
-	const label = `JLC:${routeStatusLabel(currentRoute)}`;
-	const body = isProjectRoute(currentRoute) && projectName ? `${label}:${projectName}` : label;
-	return `${color}${prefix}${body}${ANSI_RESET}`;
+	const body = projectName ? `JLC:${projectName}` : "JLC";
+	return `${ANSI_YELLOW}${prefix}${body}${ANSI_RESET}`;
 }
 
 function isProjectRoute(route: EffectiveTurnRoute): boolean {
-	return route === "deepdive" || route === "heavy_deepdive";
+	return route === "deepdive";
 }
 
 function modeForRoute(route: EffectiveTurnRoute): SidecarContextMode {
 	return isProjectRoute(route) ? "deepdive" : "chat";
 }
 
-function routeStatusLabel(route: EffectiveTurnRoute): string {
-	if (route === "heavy_deepdive") return "heavy deepdive";
-	if (route === "deepdive") return "deepdive";
-	if (route === "unregistered_coding") return "unregistered coding";
-	return "chat mode";
+function workStatusLabel(route: EffectiveTurnRoute): string {
+	if (route === "deepdive") return "project work";
+	if (route === "unregistered_coding") return "external work";
+	return "request";
 }
 
-function setEffectiveRoute(route: EffectiveTurnRoute, reasoningLevel?: SupportedThinkingLevel): void {
+function setEffectiveRoute(route: EffectiveTurnRoute): void {
 	currentRoute = route;
 	currentMode = modeForRoute(route);
-	if (reasoningLevel) {
-		saveDeepdiveThinkingPreference(reasoningLevel);
-	}
 }
 
 function isSupportedThinkingLevel(value: unknown): value is SupportedThinkingLevel {
@@ -4298,17 +3833,19 @@ function isSupportedThinkingLevel(value: unknown): value is SupportedThinkingLev
 		value === "low" ||
 		value === "medium" ||
 		value === "high" ||
-		value === "xhigh"
+		value === "xhigh" ||
+		value === "max" ||
+		value === "ultra"
 	);
 }
 
 function normalizeThinkingLevel(value: string | undefined): SupportedThinkingLevel | undefined {
 	const normalized = value?.trim().toLowerCase();
 	if (!normalized) return undefined;
-	if (normalized === "max" || normalized === "maximum") {
-		return "xhigh";
+	if (normalized === "maximum") {
+		return "max";
 	}
-	return normalized === "medium" || normalized === "high" || normalized === "xhigh" ? normalized : undefined;
+	return isSupportedThinkingLevel(normalized) ? normalized : undefined;
 }
 
 function jarvisUiStatePath(): string {
@@ -4339,22 +3876,22 @@ function writeJarvisUiState(state: Record<string, unknown>): boolean {
 	}
 }
 
-function loadDeepdiveThinkingPreference(): SupportedThinkingLevel | undefined {
-	if (deepdiveThinkingPreferenceLoaded) return deepdiveThinkingPreference;
-	deepdiveThinkingPreferenceLoaded = true;
+function loadSubagentThinkingPreference(): SupportedThinkingLevel | undefined {
+	if (subagentThinkingPreferenceLoaded) return subagentThinkingPreference;
+	subagentThinkingPreferenceLoaded = true;
 	const parsed = readJarvisUiState();
-	const parsedLevel = normalizeThinkingLevel(String(parsed.deepdiveThinkingLevel ?? ""));
+	const parsedLevel = normalizeThinkingLevel(String(parsed.subagentThinkingLevel ?? ""));
 	if (parsedLevel) {
-		deepdiveThinkingPreference = parsedLevel;
+		subagentThinkingPreference = parsedLevel;
 	}
-	return deepdiveThinkingPreference;
+	return subagentThinkingPreference;
 }
 
-function saveDeepdiveThinkingPreference(level: SupportedThinkingLevel): void {
-	deepdiveThinkingPreferenceLoaded = true;
-	deepdiveThinkingPreference = level;
+function saveSubagentThinkingPreference(level: SupportedThinkingLevel): void {
+	subagentThinkingPreferenceLoaded = true;
+	subagentThinkingPreference = level;
 	const state = readJarvisUiState();
-	state.deepdiveThinkingLevel = level;
+	state.subagentThinkingLevel = level;
 	writeJarvisUiState(state);
 }
 
@@ -4374,175 +3911,27 @@ function saveSubagentModelUserSet(value = true): void {
 	writeJarvisUiState(state);
 }
 
-function suppressThinkingPreferenceSaveOnce(level: SupportedThinkingLevel): void {
-	suppressNextThinkingPreferenceSave = level;
-	setTimeout(() => {
-		if (suppressNextThinkingPreferenceSave === level) {
-			suppressNextThinkingPreferenceSave = undefined;
-		}
-	}, 0);
+export function modePromptForRoute(_route: EffectiveTurnRoute, _provider: string | undefined): string {
+	return JARVIS_SYSTEM_PROMPT;
 }
-
-function parseDeepdiveReasoningUtterance(text: string): SupportedThinkingLevel | undefined {
-	const normalized = text.trim().toLowerCase();
-	const hasDeepdiveCue = /\bdeep\s*dive\b|\bdeepdive\b/i.test(normalized);
-	const hasReasoningCue = /\breasoning\b|\bthinking\b/i.test(normalized);
-	const hasLevelCue = /\b(?:xhigh|max|maximum|high|medium|fast|quick|light)\b/i.test(normalized);
-	if (!hasDeepdiveCue && !(hasReasoningCue && hasLevelCue)) {
-		return undefined;
-	}
-	if (/\b(?:xhigh|max|maximum)\b/i.test(normalized)) return "xhigh";
-	if (/\bhigh\b/i.test(normalized)) return "high";
-	if (/\bmedium\b|\bfast\b|\bquick\b|\blight\b/i.test(normalized)) return "medium";
-	return undefined;
-}
-
-function stripTrailingPathPunctuation(value: string): string {
-	return value
-		.replace(/\s+(?:을|를|에|에서|으로|로)\s+.*$/i, "")
-		.replace(/\s+(?:을|를|에|에서|으로|로)\s*$/i, "")
-		.replace(/[.,;:!?]+$/g, "")
-		.replace(/[)\]}]+$/g, "")
-		.trim();
-}
-
-function isAbsolutePathCandidate(value: string): boolean {
-	return /^[A-Za-z]:[\\/]/.test(value) || /^\/[^/\s]+\/.+/.test(value);
-}
-
-function extractAbsolutePathsFromText(text: string): string[] {
-	const paths: string[] = [];
-	const quoted = /["'“‘]([A-Za-z]:[\\/][^"'“”‘’\r\n]+|\/[^"'“”‘’\r\n]+)["'”’]/g;
-	for (const match of text.matchAll(quoted)) {
-		const value = stripTrailingPathPunctuation(match[1] ?? "");
-		if (value && isAbsolutePathCandidate(value)) paths.push(value);
-	}
-	const unquoted = /(?:^|[\s(])([A-Za-z]:[\\/][^\s)\]}>,;]+|\/[^\s)\]}>,;]+)/g;
-	for (const match of text.matchAll(unquoted)) {
-		const value = stripTrailingPathPunctuation(match[1] ?? "");
-		if (value && isAbsolutePathCandidate(value)) paths.push(value);
-	}
-	return [...new Set(paths.map((value) => path.resolve(value)))];
-}
-
-function routePromptForRoute(route: EffectiveTurnRoute): string {
-	if (route === "chat_control") return CHAT_CONTROL_ROUTE_PROMPT;
-	if (route === "unregistered_coding") return UNREGISTERED_CODING_ROUTE_PROMPT;
-	if (route === "heavy_deepdive") return HEAVY_DEEPDIVE_ROUTE_PROMPT;
-	if (route === "deepdive") return DEEPDIVE_ROUTE_PROMPT;
-	return CHAT_ROUTE_PROMPT;
-}
-
-function baseModePromptForRoute(route: EffectiveTurnRoute): string {
-	if (route === "chat_control") return CHAT_CONTROL_MODE_PROMPT;
-	if (route === "unregistered_coding") return UNREGISTERED_CODING_MODE_PROMPT;
-	if (route === "heavy_deepdive") return `${DEEPDIVE_MODE_PROMPT}\n\n${HEAVY_DEEPDIVE_OVERLAY_PROMPT}`;
-	if (route === "deepdive") return DEEPDIVE_MODE_PROMPT;
-	return CHAT_MODE_PROMPT;
-}
-
-// Regime split (2026-06-26, Jun+JARVIS): CLARIFY_DIRECTIVE_PROMPT exists to make the
-// agent-sdk regime (B) ask before barreling ahead — the SDK owns its own loop and
-// ignores soft prose otherwise. The pi-native regime (A / OpenAI-completions) ALREADY
-// owns the loop and follows the directive literally, so stacking it there over-clarified
-// and tripled the subturn count (~13 -> ~34) on builds. Inject it ONLY for the
-// sidecar-chat-proxy regime. Regime A keeps its build-dialogue via DEEPDIVE's
-// PLAN_DIALOGUE_PROMPT. This function is the single chokepoint for the clarify directive:
-// regime-specific prose lives behind the regime gate so an OpenAI-path change can never
-// bleed into the agent-sdk path (and vice versa). Add future regime-B-only nudges here,
-// gated — never ungated on a shared prompt.
-export function modePromptForRoute(route: EffectiveTurnRoute, provider: string | undefined): string {
-	const base = baseModePromptForRoute(route);
-	if (isSidecarChatProxyProvider(provider)) {
-		const narration =
-			isProjectRoute(route) || route === "unregistered_coding" ? `\n\n${NARRATION_DIRECTIVE_PROMPT}` : "";
-		return `${base}\n\n${CLARIFY_DIRECTIVE_PROMPT}${narration}`;
-	}
-	return base;
-}
-
-// The directive-bus toolset (list_windows/send_directive/gan_send/gan_close/
-// job_send/job_close/spawn_window) is deliberately NOT route-gated: workers execute most
-// directives on coding routes and must be able to hand work back on the bus —
-// stripping them there forced models into prose handbacks and hand-rolled
-// shell launchers (2026-06-11 live runs).
-const CHAT_ROUTE_ONLY_TOOL_NAMES = new Set([
-	"docs_search",
-	"package_info",
-	"set_window_label",
-	"set_chat_model",
-	"set_subagent_model",
-	"set_encoder_model",
-]);
-const CHAT_ROUTE_BASE_ALLOWED_TOOL_NAMES = new Set<string>(["ask_user"]);
-// pi's native coding tools. Chat routes already carry pi's full base prompt (which
-// frames the model as a tool-using coder), so stripping these from chat both wasted
-// that framing and dead-ended "do X for me" requests with a false "no tool exposed"
-// (Jun, 2026-06-22: "I said save tokens, not disable the function"). They ride every
-// chat-family route by default; the lean diet (JARVIS_LEAN_CHAT_TOOLS=1) is opt-in
-// for weak local models that mis-fire when handed many tools.
-const PI_BASIC_TOOL_NAMES = new Set<string>(["read", "bash", "edit", "write", "grep", "find", "ls"]);
-// Capability tools every chat-family route exposes by default. These are
-// "absence kills normal work" abilities (project registry, JARVIS.md, recall,
-// docs, web, background process). Only the heavy multi-window orchestration
-// workflow (spawn_window/job_*/send_directive/gan_*/map_create/feature_verdict)
-// stays scoped to deepdive+, since its absence does NOT kill normal coding — it
-// is a workflow mode, not a base ability. Gating these by the fallible route
-// classifier was the single largest source of "model says it has no tool" flow
-// deaths (Jun, 2026-06-23: "90%+ of the breakage is missing tools"). The lean
-// diet (JARVIS_LEAN_CHAT_TOOLS=1) still strips back for weak local models.
-const CHAT_ROUTE_CAPABILITY_TOOL_NAMES = new Set<string>([
-	"register_project",
-	"switch_project",
-	"unregister_project",
-	"update_jarvis_md",
-	"recall_turns",
-	"delegate_subagent",
-	"ultracode",
-	"retrieve_output",
-	"search_within",
-	"docs_search",
-	"package_info",
-	"web_search",
-	"web_fetch",
-	"managed_process",
-	"list_windows",
-]);
-const CHAT_ROUTE_SPAWN_ALLOWED_TOOL_NAMES = new Set<string>(["ask_user", "list_windows", "job_send", "spawn_window"]);
-const CHAT_ROUTE_TOOL_ACTION_ALLOWED_TOOL_NAMES = new Set<string>([
-	"ask_user",
-	"list_windows",
-	"job_send",
-	"spawn_window",
-	"set_window_label",
-	"set_chat_model",
-	"set_subagent_model",
-	"set_encoder_model",
-]);
-const CHAT_CONTROL_ALLOWED_TOOL_NAMES = new Set<string>([
-	"ask_user",
-	"list_windows",
-	"job_send",
-	"spawn_window",
-	"set_window_label",
-	"set_chat_model",
-	"set_subagent_model",
-	"set_encoder_model",
-	"web_search",
-	"web_fetch",
-]);
 const HANDOFF_BUS_TOOL_NAMES = new Set(["send_directive", "gan_send", "gan_close", "job_send", "job_close"]);
 // Turn-ending background handoffs: the model intentionally ends the turn empty
 // because a background job will re-engage this window later (e.g. ultracode).
 // Keep this scoped - gan_send/job_send ride directive handbacks or worker flows.
 const BACKGROUND_HANDOFF_TOOL_NAMES = new Set(["ultracode"]);
-const DELEGATION_INITIATE_TOOL_NAMES = new Set(["map_create", "spawn_window", ...HANDOFF_BUS_TOOL_NAMES]);
+const SECOND_EYES_INITIAL_ALLOWED_TOOL_NAMES = new Set([
+	"ask_user",
+	"list_windows",
+	"job_send",
+	"spawn_window",
+	"delegate_subagent",
+	"ultracode",
+]);
 const SECOND_EYES_ALLOWED_TOOL_NAMES = new Set([
 	"read",
 	"ls",
 	"grep",
 	"find",
-	"search_within",
 	"recall_turns",
 	"delegate_subagent",
 	"ultracode",
@@ -4554,12 +3943,6 @@ const SECOND_EYES_ALLOWED_TOOL_NAMES = new Set([
 	"package_info",
 	"list_windows",
 	...HANDOFF_BUS_TOOL_NAMES,
-]);
-const UNREGISTERED_PROJECT_MEMORY_TOOL_NAMES = new Set([
-	"switch_project",
-	"register_project",
-	"unregister_project",
-	"update_jarvis_md",
 ]);
 
 function assistantToolNames(message: AssistantMessage): string[] {
@@ -4603,372 +3986,21 @@ function isSlashCommand(text: string, command: string): boolean {
 	return normalized === command || normalized.startsWith(`${command} `);
 }
 
-function escapeRegexLiteral(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function isDegenerateProjectToken(value: string): boolean {
-	const token = value.trim().toLowerCase();
-	if (!token) return true;
-	if (token === "app" || token === "web") return true;
-	if (/^\d+$/.test(token)) return true;
-	return token.length < 3;
-}
-
-function isMatchableProjectToken(value: string): boolean {
-	return !isDegenerateProjectToken(value);
-}
-
-function projectTokenMatchesText(token: string, text: string): boolean {
-	const normalized = token.trim().toLowerCase();
-	if (!isMatchableProjectToken(normalized)) return false;
-	const pattern = new RegExp(`(?<![\\w-])${escapeRegexLiteral(normalized)}(?![\\w-])`, "i");
-	return pattern.test(text);
-}
-
-function projectMatchesText(project: CachedProject, text: string): boolean {
-	const normalizedText = text.toLowerCase();
-	if (projectTokenMatchesText(project.project_id, normalizedText)) return true;
-	if (projectTokenMatchesText(project.slug, normalizedText)) return true;
-	if (project.name !== project.slug && projectTokenMatchesText(project.name, normalizedText)) return true;
-	return false;
-}
-
-async function findRegisteredProjectForRouteHint(hint: unknown): Promise<CachedProject | undefined> {
-	const text = String(hint ?? "").trim();
-	if (!text) return undefined;
-	if (!projectCacheLoaded) {
-		try {
-			await refreshProjectCache();
-		} catch {
-			// Route hints are best-effort; /context can still resolve below.
-		}
-	}
-	const pathMatches = projectCache.filter(
-		(project) =>
-			sameProjectPath(text, project.path) ||
-			sameProjectPath(text, project.code_path) ||
-			extractAbsolutePathsFromText(text).some(
-				(candidate) => sameProjectPath(candidate, project.path) || sameProjectPath(candidate, project.code_path),
-			),
-	);
-	if (pathMatches.length === 1) return pathMatches[0];
-	const textMatches = projectCache.filter((project) => projectMatchesText(project, text));
-	return textMatches.length === 1 ? textMatches[0] : undefined;
-}
-
-function normalizeRouteClassifierRoute(route: unknown): EffectiveTurnRoute | undefined {
-	const value = String(route ?? "").trim();
-	if (
-		value === "chat" ||
-		value === "chat_control" ||
-		value === "unregistered_coding" ||
-		value === "deepdive" ||
-		value === "heavy_deepdive"
-	) {
-		return value;
-	}
-	return undefined;
-}
-
-// --- cluster-2 fail-safe: deterministic "clear build request" detector --------
-// The /route_turn classifier is a WEAK chat model (reasoning=none). When it
-// silently returns route=chat for an obvious "build/create/edit this" request
-// (D4), or fails entirely (D2), the turn is tool-stripped to ask_user and ends
-// with no recovery — the "테트리스 만들어줘 makes no files" swamp.
-//
-// This predicate is a CONSERVATIVE backstop, NOT a router. It only fires when a
-// strong build/create/edit VERB co-occurs with a code/file/app TARGET, so plain
-// chat and questions ("안녕?", "이거 왜 이래?") stay chat. It never *promotes*
-// the route on its own for the chat case — it only ARMS the existing no-action
-// recovery (FIX A) and provides a fail-safe coding route when the classifier is
-// unavailable (FIX B). Keep it tight: a false positive here turns chat into a
-// coding turn, so prefer missing edge cases over over-promotion.
-const BUILD_INTENT_VERB_RE =
-	/(만들어|만들자|만들게|만들어줘|만들어주|구현|개발|작성해|코딩|코드\s*짜|짜줘|짜봐|고쳐|수정해|리팩터|리팩토|빌드해|생성해|\b(build|create|make|implement|write|code|add|fix|refactor|generate|scaffold|set\s*up|develop)\b)/i;
-const BUILD_INTENT_TARGET_RE =
-	/(게임|앱|프로그램|스크립트|함수|클래스|모듈|컴포넌트|파일|코드|페이지|사이트|봇|api|서버|기능|테트리스|클론|툴|유틸|\b(game|app|website|web\s*site|component|function|class|module|script|file|code|page|server|bot|api|feature|tool|util|clone|cli|endpoint|test|tests)\b)/i;
-
-export function detectClearBuildIntent(userText: string): boolean {
-	const text = (userText ?? "").trim();
-	if (!text) return false;
-	// Ignore JLC-internal retry/marker turns — those carry their own intent state
-	// and must not be re-promoted by surface text matching.
-	if (isWorkerToolsRetryPrompt(text) || isSlashCommand(text.toLowerCase(), "/chat")) {
-		return false;
-	}
-	return BUILD_INTENT_VERB_RE.test(text) && BUILD_INTENT_TARGET_RE.test(text);
-}
-
-function routeClassifierDecisionIndicatesAction(decision: SidecarRouteTurnResponse | undefined): boolean {
-	const route = normalizeRouteClassifierRoute(decision?.route);
-	if (!route) return false;
-	if (route !== "chat") return true;
-	return (
-		decision?.create_project === true ||
-		decision?.register_project === true ||
-		Boolean(decision?.code_path_hint) ||
-		(!!decision?.expected_action && decision.expected_action !== "none")
-	);
-}
-
-function routeTelemetryUserTextHead(userText: string): string {
-	return String(userText ?? "")
-		.replace(/\s+/g, " ")
-		.trim()
-		.slice(0, 80);
-}
-
-function recordRouteDecisionTelemetry(args: {
-	decision: SidecarRouteTurnResponse;
-	clearBuildIntent: boolean;
-	routeSource: string;
-}): void {
-	const needsClarification = args.decision.needs_clarification === true;
-	const classifierRoute = normalizeRouteClassifierRoute(args.decision.route) ?? String(args.decision.route ?? "");
-	const clarifyOverrodeBuildIntent = needsClarification && args.clearBuildIntent;
-	const data = {
-		classifier_route: classifierRoute,
-		needs_clarification: needsClarification,
-		clear_build_intent: args.clearBuildIntent,
-		effective_route: currentRoute,
-		clarify_overrode_build_intent: clarifyOverrodeBuildIntent,
-		user_text_len: lastUserMessage.length,
-		user_text_head: routeTelemetryUserTextHead(lastUserMessage),
-		route_source: args.routeSource,
-	};
-	recordSubturnDebugEvent("route_decision", data);
-	recordTurnTimelineEvent("route_decision", data);
-	if (clarifyOverrodeBuildIntent) {
-		recordSubturnDebugEvent("route_clarify_override", data);
-		recordTurnTimelineEvent("route_clarify_override", data);
-	}
-}
-
-function enterRouteFromClassifier(route: EffectiveTurnRoute): void {
-	if (route === "chat_control") {
-		setEffectiveRoute("chat_control");
-	} else if (route === "unregistered_coding") {
-		enterUnregisteredCoding();
-	} else if (route === "heavy_deepdive") {
-		enterHeavyProjectWork();
-	} else if (route === "deepdive") {
-		enterProjectWorkPreservingHeavy();
-	}
-}
-
-function recentRouteMessages(messages: AgentMessage[]): Array<{ role: string; text: string }> {
-	return messages
-		.slice(-8)
-		.map((message) => ({
-			role: String((message as { role?: unknown }).role ?? ""),
-			text: stripJarvisMemoryBlock(messageContentToText((message as { content?: unknown }).content)).slice(0, 1600),
-		}))
-		.filter((item) => item.role && item.text.trim());
-}
-
-function mandatoryPreRouteEnabled(): boolean {
-	const value = String(process.env.JARVIS_ROUTE_PREFLIGHT ?? "")
-		.trim()
-		.toLowerCase();
-	if (!value) return true;
-	return !(value === "0" || value === "false" || value === "no" || value === "off");
-}
-
-async function applyRouteDecisionBeforeContext(decision: SidecarRouteTurnResponse | undefined): Promise<boolean> {
-	lastRouteClassifierDecision = decision;
-	const classifierIndicatesAction = routeClassifierDecisionIndicatesAction(decision);
-	// FIX A (cluster-2 D4): a clear build request must never end in a silent
-	// no-action turn. If the weak classifier returns chat with no action intent
-	// for an obvious "build/create/edit X" turn, treat it as action-intent so the
-	// existing no-action recovery (decidePostTurnRecovery / route-skill retry)
-	// arms. This only flips a boolean (it does NOT change the first call's tools),
-	// so the first chat subturn still gets the ask_user diet — but if the model
-	// answers in prose without acting, recovery fires and the NEXT subturn runs
-	// with coding tools.
-	const buildIntent = detectClearBuildIntent(lastUserMessage);
-	lastRouteClassifierActionIntent = classifierIndicatesAction || buildIntent;
-	const route = normalizeRouteClassifierRoute(decision?.route);
-	// FIX B (cluster-2 D2): classifier genuinely UNAVAILABLE — sidecar unreachable
-	// (decision === undefined) or it returned an error (ok === false). A transient
-	// router hiccup must not silently turn a build request into ask_user-only. When
-	// the turn clearly asks to build, fail SAFE onto a coding route so file tools
-	// survive. We deliberately scope this to true transport/error failures: a
-	// SUCCESSFUL classifier response that returns chat (or omits a route) is a
-	// real product decision (natural-language new-project requests start in
-	// chat-entry and let the chat model respond first), so it is left as chat and
-	// only FIX A's armed action-intent guards against a silent no-action ending.
-	const classifierUnavailable = decision === undefined || decision.ok === false;
-	if (classifierUnavailable) {
-		if (buildIntent) {
-			enterUnregisteredCoding();
-			routePromotedByClassifierThisTurn = true;
-			return true;
-		}
-		return false;
-	}
-	if (!route) return false;
-	const classifierNewProject = decision.create_project === true || decision.register_project === true;
-	if (decision.needs_clarification) {
-		setEffectiveRoute("chat");
-		if (decision.clarification) {
-			appendTransientSystemDirective(
-				["[Route clarification]", decision.clarification, "Ask this clarification before using coding tools."].join(
-					"\n",
-				),
-			);
-		}
-		recordRouteDecisionTelemetry({
-			decision,
-			clearBuildIntent: buildIntent,
-			routeSource: "classifier_clarification",
-		});
-		return false;
-	}
-	// Language-agnostic enforcement (2026-06-24): create_project/register_project is the
-	// classifier's SEMANTIC, language-neutral "this is a NEW project" signal (the LLM sets
-	// it for any language, and it distinguishes "등록해줘" from "등록 어떻게?"). A flagged
-	// new project MUST enter the deepdive build route regardless of which route string the
-	// classifier picked -- never a no-build route like chat_control. The weak classifier
-	// sometimes mislabels the route (live: a clear new-project build landed on chat_control)
-	// even while setting the flags correctly, so code guarantees the build route here. The
-	// universal clarify directive still fires inside deepdive ("confirm before building").
-	if (classifierNewProject) {
-		// eafac008 forced the deepdive route here but never created the project, so
-		// activeProjectPath stayed null while DEEPDIVE_ROUTE_PROMPT claims a registered
-		// project with an active code path. That contradiction made the model defer the
-		// build to a "next implementation turn" and ask a second "build now?". Create +
-		// select the project now (mirroring the maybeHandlePendingProjectCreation confirm
-		// path) so the deepdive prompt is truthful and the model builds in THIS turn after
-		// its clarify. Registering the (empty) project folder is not "build", so the
-		// universal clarify still gates file writes. If no slug is resolvable or creation
-		// fails, still force deepdive (never regress to chat_control) and let the
-		// [Project clarification] directive ask the user to register/name it this turn.
-		const newProjectSlug = (decision.project_slug ?? decision.target_project_hint ?? "").trim();
-		if (newProjectSlug) {
-			const response = await postSidecar<SidecarSwitchResponse>("/switch_project", {
-				slug_or_name: newProjectSlug,
-				code_path: decision.code_path_hint ?? undefined,
-				auto_create: true,
-			});
-			if (response?.ok && response.path) {
-				patchProjectCache(response);
-				activeProjectPath = response.path;
-				activeCodePath = response.code_path ?? activeCodePath;
-				activeProjectId = response.project_id ?? activeProjectId;
-			}
-		}
-		enterProjectWorkPreservingHeavy();
-		// Mandatory: front-load the new-artifact ask_user gate so the autonomous
-		// SDK loop asks before building (the sidecar PreToolUse hook also enforces it).
-		pendingNewArtifactAskUserGate = true;
-		routePromotedByClassifierThisTurn = true;
-		return true;
-	}
-	// A clear build-intent the weak classifier returned as chat OR chat_control enters
-	// deepdive directly. chat_control is a misroute blind spot: it carries no file tools
-	// and (without create/register flags) neither rescue path above fires, so a build
-	// request dead-ends in an ask_user loop ("테트리스 만들어줘 makes no files"). Scope
-	// stays tight via the conservative detectClearBuildIntent (build VERB + TARGET);
-	// directive/worker turns are excluded upstream in shouldCallRouteClassifier.
-	if ((route === "chat" || route === "chat_control") && buildIntent) {
-		enterProjectWorkPreservingHeavy();
-		routePromotedByClassifierThisTurn = true;
-		return true;
-	}
-	if (route === "chat") return false;
-	if (isProjectRoute(route) && !classifierNewProject) {
-		const hintedProject = await findRegisteredProjectForRouteHint(
-			decision.target_project_hint ?? decision.code_path_hint,
-		);
-		if (hintedProject) {
-			activeProjectPath = hintedProject.path;
-			activeCodePath = hintedProject.code_path;
-			activeProjectId = hintedProject.project_id;
-		}
-	}
-	enterRouteFromClassifier(route);
-	routePromotedByClassifierThisTurn = true;
-	return true;
-}
-
-export function shouldCallRouteClassifier(userText: string, explicitChat: boolean): boolean {
-	if (!mandatoryPreRouteEnabled()) return false;
-	if (explicitChat) return false;
-	// Route is normally frozen once it leaves "chat" (no per-turn re-classification).
-	// Exception: a clear build command must be able to escape a chat_control turn it
-	// was misrouted into, so re-classify and let the build-intent escalation in
-	// applyRouteDecisionBeforeContext promote it to deepdive. Directive/worker turns
-	// are still excluded by the guards below.
-	if (currentRoute !== "chat" && !(currentRoute === "chat_control" && detectClearBuildIntent(userText))) {
-		return false;
-	}
-	if (activeDirectiveTurn || activeSecondEyesReviewTurn || activeSecondEyesMainTurn || secondEyesRequestedThisTurn) {
-		return false;
-	}
-	if (isWorkerToolsRetryPrompt(userText)) return false;
-	return true;
-}
-
-async function maybeClassifyRouteBeforeContext(
-	userText: string,
-	messages: AgentMessage[],
-	cwdHint: string,
-	pi: ExtensionAPI,
-	explicitChat: boolean,
-): Promise<boolean> {
-	if (!shouldCallRouteClassifier(userText, explicitChat)) return false;
-	const decision = await postSidecar<SidecarRouteTurnResponse>("/route_turn", {
-		user_message: userText,
-		cwd_hint: cwdHint,
-		active_project_path: currentActiveProjectHint(),
-		recent_messages: recentRouteMessages(messages),
-		pending_project: pendingProjectCreate
-			? { slug_or_name: pendingProjectCreate.slugOrName, code_path: pendingProjectCreate.codePath }
-			: undefined,
-		bench_conv_id: benchConvId(pi),
-	});
-	return applyRouteDecisionBeforeContext(decision);
-}
-
-function enterProjectWork(reasoningLevel?: SupportedThinkingLevel): void {
-	setEffectiveRoute("deepdive", reasoningLevel);
-}
-
-function enterProjectWorkPreservingHeavy(reasoningLevel?: SupportedThinkingLevel): void {
-	if (currentRoute === "heavy_deepdive") {
-		if (reasoningLevel) {
-			saveDeepdiveThinkingPreference(reasoningLevel);
-		}
-		return;
-	}
-	enterProjectWork(reasoningLevel);
-}
-
-function enterHeavyProjectWork(reasoningLevel?: SupportedThinkingLevel): void {
-	setEffectiveRoute("heavy_deepdive", reasoningLevel);
+function enterProjectWork(): void {
+	setEffectiveRoute("deepdive");
 }
 
 function enterUnregisteredCoding(): void {
 	setEffectiveRoute("unregistered_coding");
 }
 
-// Chat baseline thinking = "medium" (2026-06-17, Jun): clean 3-step ladder —
-// chat "medium" → deepdive "high" → heavy xhigh, each a deliberate step up.
-// (medium was the verified-good chat level; reverted from the 2026-06-16 "low".)
-function applyChatDefaultThinking(ctx: ExtensionContext, pi: ExtensionAPI): void {
-	if (pi.getThinkingLevel() !== "medium") {
-		suppressThinkingPreferenceSaveOnce("medium");
-		pi.setThinkingLevel("medium");
-	}
-	ctx.ui.setHiddenThinkingLabel(" ");
-}
-
-function resetToChatMode(ctx: ExtensionContext, pi: ExtensionAPI, options: { updateFooter?: boolean } = {}): void {
-	setEffectiveRoute("chat");
+function resetEffectiveMode(
+	route: "chat" | "deepdive",
+	ctx: ExtensionContext,
+	options: { updateFooter?: boolean } = {},
+): void {
+	setEffectiveRoute(route);
 	try {
-		applyChatDefaultThinking(ctx, pi);
-		ctx.ui.setStatus(FOOTER_CHAT_THINKING_STATUS_KEY, undefined);
 		if (options.updateFooter !== false) {
 			ctx.ui.setStatus("jarvis", jlcLabel(sidecarHealthy ? "ok" : "down"));
 		}
@@ -4977,8 +4009,8 @@ function resetToChatMode(ctx: ExtensionContext, pi: ExtensionAPI, options: { upd
 	}
 }
 
-function resetToChatModeAfterEncoding(ctx: ExtensionContext, pi: ExtensionAPI): void {
-	setTimeout(() => resetToChatMode(ctx, pi), 1200);
+function resetToDeepdiveModeAfterEncoding(ctx: ExtensionContext): void {
+	setTimeout(() => resetEffectiveMode("deepdive", ctx), 1200);
 }
 
 function refreshTurnCheckpointScope(): void {
@@ -4994,23 +4026,6 @@ async function clearInterruptCheckpointForScope(scope: CheckpointScope | undefin
 	await postSidecar<SidecarInterruptCheckpointResponse>("/interrupt_checkpoint/clear", {
 		project_path: scope.path,
 	});
-}
-
-function selectDeepdiveThinkingLevel(ctx: ExtensionContext): SupportedThinkingLevel {
-	const preferred = loadDeepdiveThinkingPreference();
-	if (preferred) return preferred;
-	const model = ctx.model;
-	if (!model?.reasoning) return "medium";
-
-	const levelMap = model.thinkingLevelMap;
-	const ordered: SupportedThinkingLevel[] = ["xhigh", "high", "medium"];
-	if (levelMap) {
-		for (const level of ordered) {
-			if (levelMap[level] !== null) return level;
-		}
-	}
-
-	return "xhigh";
 }
 
 export default function jarvisJlc(pi: ExtensionAPI) {
@@ -5034,7 +4049,6 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		recordFooterMeterReset(pi);
 		clearAutoPromptWatchdog();
-		loadDeepdiveThinkingPreference();
 		lastObservedUserTurnKey = "";
 		lastInjectedContextTurnKey = "";
 		pendingProjectSwitchContextRefresh = false;
@@ -5060,13 +4074,16 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		setEffectiveRoute("chat");
 		try {
 			ctx.ui.setStatus("jarvis", jlcLabel("checking"));
+			ctx.ui.setStatus(FOOTER_CHAT_THINKING_STATUS_KEY, normalizeThinkingLevel(pi.getThinkingLevel()) ?? "off");
 		} catch {
 			/* stale */
 		}
 		sidecarHealthy = await checkHealth();
 		try {
 			ctx.ui.setStatus("jarvis", sidecarHealthy ? jlcLabel("ok") : jlcLabel("down"));
-			ctx.ui.setHiddenThinkingLabel(" ");
+			const level = normalizeThinkingLevel(pi.getThinkingLevel()) ?? "off";
+			ctx.ui.setStatus(FOOTER_CHAT_THINKING_STATUS_KEY, level);
+			ctx.ui.setHiddenThinkingLabel(level === "off" ? " " : `Thinking ${level}`);
 		} catch {
 			/* stale */
 		}
@@ -5082,8 +4099,10 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			} else {
 				setChatModelStatus(ctx, chatRole);
 			}
+			await refreshCurrentSubagentEffortState(ctx);
 			try {
 				ctx.ui.setStatus("jarvis", sidecarHealthy ? jlcLabel("ok") : jlcLabel("down"));
+				ctx.ui.setStatus(FOOTER_CHAT_THINKING_STATUS_KEY, normalizeThinkingLevel(pi.getThinkingLevel()) ?? "off");
 			} catch {
 				/* stale */
 			}
@@ -5119,21 +4138,16 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 	});
 
 	pi.on("thinking_level_select", async (event, ctx) => {
-		const level = normalizeThinkingLevel(isSupportedThinkingLevel(event.level) ? event.level : undefined);
-		if (level && suppressNextThinkingPreferenceSave === level) {
-			suppressNextThinkingPreferenceSave = undefined;
-		} else if (level) {
-			saveDeepdiveThinkingPreference(level);
-			if (isProjectRoute(currentRoute)) {
-				try {
-					ctx.ui.setStatus(FOOTER_CHAT_THINKING_STATUS_KEY, level);
-				} catch {
-					/* stale */
-				}
+		const level = isSupportedThinkingLevel(event.level) ? event.level : undefined;
+		if (level) {
+			try {
+				ctx.ui.setStatus(FOOTER_CHAT_THINKING_STATUS_KEY, level);
+			} catch {
+				/* stale */
 			}
 		}
 		try {
-			const label = isProjectRoute(currentRoute) && event.level !== "off" ? `Thinking ${event.level}` : " ";
+			const label = event.level !== "off" ? `Thinking ${event.level}` : " ";
 			ctx.ui.setHiddenThinkingLabel(label);
 		} catch {
 			/* stale */
@@ -5151,7 +4165,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		if (DEBUG_CONTEXT) console.error("[jlc:debug-context-handler] ENTER");
 		const messages = event.messages;
 		const rawUserText = stripJarvisMemoryBlock(latestUserText(messages));
-		const userText = workerToolsRetryOriginalUserRequest(rawUserText) ?? rawUserText;
+		const userText = verifyIncompleteOriginalUserRequest(rawUserText) ?? rawUserText;
 		if (!userText.trim()) return;
 		const isPendingDirectiveUserTurn = pendingDirectiveMatchesText(rawUserText);
 		const userTurnKey = latestUserTurnKey(messages, rawUserText);
@@ -5168,24 +4182,13 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			lastProviderToolsBeforeFilter = [];
 			lastProviderToolsAfterFilter = [];
 			lastProviderActionIntentMatch = false;
-			lastProviderChatFilterApplied = false;
-			lastProviderRoutePromotedByClassifier = false;
-			lastRouteClassifierDecision = undefined;
-			lastRouteClassifierActionIntent = false;
 			expectedToolActivityThisTurn = false;
-			routePromotedByClassifierThisTurn = false;
 			verifyContinuationCount = 0;
-			if (isWorkerToolsRetryPrompt(rawUserText)) {
-				workerToolsRetryInFlight = true;
-				expectedToolActivityThisTurn = true;
-			} else {
-				workerToolsRetryInFlight = false;
-			}
 			workerWindowContextInjectedThisTurn = false;
 			resetProviderCallCeilingState();
 			lastTurnStartedAtMs = Date.now();
 			lastProviderStartedAtMs = undefined;
-			setEffectiveRoute("chat");
+			setEffectiveRoute("deepdive");
 			checkpointToolEvents = [];
 			lastAssistantPartialText = "";
 			interruptCheckpointSavedThisTurn = false;
@@ -5219,8 +4222,8 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			enterSecondEyesRoute();
 		}
 		// The [ULTRACODE DONE ...] completion directive turn resumes the route the
-		// handoff was fired from (the per-turn reset above forced "chat" and
-		// shouldCallRouteClassifier skips directive turns, so it cannot re-promote).
+		// handoff was fired from (the per-turn reset above forced the general
+		// "deepdive" route, which may differ from the special source route).
 		maybeRestoreUltracodeHandoffRoute(rawUserText);
 		if (isNewUserTurn) {
 			try {
@@ -5233,7 +4236,6 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		const normalizedUser = userText.trim().toLowerCase();
 		const explicitChat = isSlashCommand(normalizedUser, "/chat");
 		const explicitDeepdive = isSlashCommand(normalizedUser, "/deepdive");
-		const utteredDeepdiveLevel = explicitDeepdive ? parseDeepdiveReasoningUtterance(userText) : undefined;
 		if (explicitChat && !secondEyesRequestedThisTurn && !activeSecondEyesReviewTurn && !activeSecondEyesMainTurn) {
 			clearActiveProjectState();
 			setEffectiveRoute("chat");
@@ -5253,14 +4255,6 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		} catch {
 			/* ctx stale — skip setup */
 		}
-		if (!explicitChat) {
-			await maybeClassifyRouteBeforeContext(userText, messages, cwdHint, pi, explicitChat);
-		}
-		if (!isPendingDirectiveUserTurn && routeDecisionCriticMode(lastRouteClassifierDecision)) {
-			secondEyesRequestedThisTurn = true;
-			secondEyesReviewSpawnedThisTurn = false;
-			secondEyesReminderInjectedThisTurn = false;
-		}
 		try {
 			if (await maybeHandlePendingProjectCreation(userText, ctx)) {
 				pendingProjectSwitchContextRefresh = true;
@@ -5278,29 +4272,17 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			}
 		}
 		if (!explicitChat && explicitDeepdive) {
-			enterHeavyProjectWork(utteredDeepdiveLevel);
+			enterProjectWork();
 		}
 		if (secondEyesRequestedThisTurn || activeSecondEyesReviewTurn || activeSecondEyesMainTurn) {
 			enterSecondEyesRoute();
 		}
-		const classifierRoute = normalizeRouteClassifierRoute(lastRouteClassifierDecision?.route);
-		const classifierNewProject =
-			lastRouteClassifierDecision?.create_project === true || lastRouteClassifierDecision?.register_project === true;
-		if (
-			isProjectRoute(currentRoute) &&
-			!activeProjectPath &&
-			(explicitDeepdive || (classifierRoute !== undefined && classifierRoute !== "chat"))
-		) {
+		if (isProjectRoute(currentRoute) && !activeProjectPath && explicitDeepdive) {
 			appendTransientSystemDirective(
-				classifierNewProject
-					? [
-							"[New project]",
-							"This is a NEW project and it is not registered yet (auto-create did not yield an active project). Register it THIS turn (call switch_project with a clear project name; the default project root is used when no path is given), then build the files and verify in this same turn. Do not defer to a later turn and do not ask a second 'build now?' — the clarify was the confirmation.",
-						].join("\n")
-					: [
-							"[Project clarification]",
-							"Deepdive needs a registered workspace project for this action. If the target project is clear, call switch_project first; otherwise ask which project to use before editing, launching, or updating JARVIS.md.",
-						].join("\n"),
+				[
+					"[Project clarification]",
+					"Project memory needs a registered workspace project for this action. If the target project is clear, call switch_project first; otherwise ask which project to use before editing, launching, or updating JARVIS.md.",
+				].join("\n"),
 			);
 		}
 		const turnMode: SidecarContextMode = modeForRoute(currentRoute);
@@ -5371,12 +4353,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			}
 		}
 		try {
-			if (isProjectRoute(currentRoute)) {
-				const level = applyRouteThinkingLevel(currentRoute, ctx, pi);
-				ctx.ui.setStatus(FOOTER_CHAT_THINKING_STATUS_KEY, level);
-			} else {
-				ctx.ui.setStatus(FOOTER_CHAT_THINKING_STATUS_KEY, undefined);
-			}
+			ctx.ui.setStatus(FOOTER_CHAT_THINKING_STATUS_KEY, normalizeThinkingLevel(pi.getThinkingLevel()) ?? "off");
 			ctx.ui.setStatus("jarvis", jlcLabel("ok", response.project_name));
 		} catch {
 			/* stale */
@@ -5393,57 +4370,26 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		const messages = (event as { messages?: AgentMessage[] }).messages ?? [];
 		const promptText = (event as { prompt?: string }).prompt ?? "";
 		const rawPromptText = promptText.trim();
-		const userText = rawPromptText ? effectiveUserTextFromInternalRetry(rawPromptText) : lastUserMessage;
+		const userText = rawPromptText ? effectiveUserTextFromInternalFollowUp(rawPromptText) : lastUserMessage;
 		agentTurnActive = true;
 		activeModelProviderThisTurn = String(ctx.model?.provider ?? "").trim() || undefined;
 		markDirectiveTurnIfMatching(userText);
 		markSecondEyesMarkerTurnIfPresent(userText);
-		if (
-			!activeDirectiveTurn &&
-			!secondEyesRequestedThisTurn &&
-			routeDecisionCriticMode(lastRouteClassifierDecision)
-		) {
-			secondEyesRequestedThisTurn = true;
-			secondEyesReviewSpawnedThisTurn = false;
-			secondEyesReminderInjectedThisTurn = false;
-		}
 		const normalizedUser = userText.trim().toLowerCase();
 		const explicitChat = isSlashCommand(normalizedUser, "/chat");
 		const explicitDeepdive = isSlashCommand(normalizedUser, "/deepdive");
-		const utteredDeepdiveLevel = explicitDeepdive ? parseDeepdiveReasoningUtterance(userText) : undefined;
-		const classifierRouteForPrompt = normalizeRouteClassifierRoute(lastRouteClassifierDecision?.route);
 		if (explicitChat && !secondEyesRequestedThisTurn && !activeSecondEyesReviewTurn && !activeSecondEyesMainTurn) {
 			clearActiveProjectState();
 			setEffectiveRoute("chat");
 		} else if (explicitDeepdive) {
-			enterHeavyProjectWork(utteredDeepdiveLevel);
-		} else if (
-			classifierRouteForPrompt &&
-			classifierRouteForPrompt !== "chat" &&
-			lastRouteClassifierDecision?.needs_clarification !== true
-		) {
-			// A classifier-flagged new project keeps the forced deepdive build route even when
-			// the weak classifier mislabeled the route string as a no-build route like
-			// chat_control. applyRouteDecisionBeforeContext already forced deepdive (and
-			// created the project), so re-deriving the raw route here would silently regress
-			// the build to chat_control and dead-end it -- the /context already ran in deepdive.
-			if (
-				lastRouteClassifierDecision?.create_project === true ||
-				lastRouteClassifierDecision?.register_project === true
-			) {
-				enterProjectWorkPreservingHeavy();
-			} else {
-				enterRouteFromClassifier(classifierRouteForPrompt);
-			}
-			routePromotedByClassifierThisTurn = true;
+			enterProjectWork();
 		}
 		if (secondEyesRequestedThisTurn || activeSecondEyesReviewTurn || activeSecondEyesMainTurn) {
 			enterSecondEyesRoute();
 		}
 		expectedToolActivityThisTurn =
 			!explicitChat &&
-			(lastRouteClassifierActionIntent ||
-				activeDirectiveTurn !== undefined ||
+			(activeDirectiveTurn !== undefined ||
 				secondEyesRequestedThisTurn ||
 				activeSecondEyesReviewTurn ||
 				activeSecondEyesMainTurn);
@@ -5459,15 +4405,15 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			secondEyesRequestedThisTurn && !activeDirectiveTurn
 				? [
 						"[CRITIC MODE REQUESTED]",
-						"The user requested Critic Mode. This is project work in deepdive or heavy_deepdive, never chat mode.",
+						"The user requested Critic Mode. This is project work with project memory, never chat mode.",
 						"The main window owns user choice gathering, design/trend recon, architecture decisions, plan draft, implementation, fixes, and final user report.",
 						"If user-facing choices are still unresolved, call ask_user first and stop; do not call any other tool in the same response.",
 						"Once user choices and the main-window plan draft are settled, dispatch exactly one review-only plan critique before implementation.",
 						`If the user named an existing live worker/window, use job_send to that worker. Only call spawn_window(job=true) when no worker target exists. The directive must include ${SECOND_EYES_PLAN_READY_MARKER}, the project path, user choices/Q&A, and the main draft. Do not ask the worker to perform recon, select architecture, invent the plan, implement, or mutate files.`,
 						"Do not create files or modify code before this Critic Mode review dispatch.",
 						currentSecondEyesHeavy()
-							? "This Critic Mode job is heavy deepdive; preserve the heavy marker in the worker directive and use HEAVY_DEEPDIVE."
-							: "This Critic Mode job is deepdive; keep both main and worker at least DEEPDIVE.",
+							? "This Critic Mode job requests a broad critic review; preserve [CRITIC_HEAVY] in the worker directive."
+							: "Keep both main and worker on the project-memory path.",
 						"The worker is review-only: it may inspect and run bounded verification, but it never implements or fixes.",
 						"After the plan handback, ask_user only if a real user choice controls quality; otherwise the main window implements.",
 						"After implementation, send the same worker a review request with job_send. Apply confirmed Must-fix items yourself.",
@@ -5476,8 +4422,8 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 				: "";
 		const overlay = transientSystemDirective.trim();
 		transientSystemDirective = "";
-		// New-artifact ask_user gate (consume-once): set on a classifierNewProject
-		// route decision, front-loaded in `parts` below so the mandate is salient.
+		// New-artifact ask_user gate (consume-once): set by explicit project creation
+		// and front-loaded in `parts` below so the mandate is salient.
 		// Regime split (2026-06-26): this is an agent-sdk-regime nudge — its enforcement
 		// PreToolUse hook only runs in the sidecar/regime-B path, so in regime A it was a
 		// dangling unenforced prompt that only added ask-first pressure (a subturn
@@ -5500,7 +4446,6 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 						: activeEndGateTurn
 							? WHOLE_DELEGATION_END_GATE_PROMPT
 							: modePromptForRoute(currentRoute, activeModelProviderThisTurn);
-		const routePrompt = routePromptForRoute(currentRoute);
 		const mapDigest = activeMapCheckpointTurn || activeMapSynthesisTurn ? buildMapStatusDigest() : "";
 		// CACHE: the system prompt is the head of the cacheable prefix (system →
 		// tools → history). Keep it byte-stable across steady-state turns so the
@@ -5513,10 +4458,8 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		// system+tools+history. Memory is unchanged; only position moves.
 		const parts: string[] = [];
 		if (existingPrompt.trim()) parts.push(existingPrompt);
-		parts.push(LOCAL_LANGUAGE_PROMPT);
 		if (newArtifactGate) parts.push(newArtifactGate);
 		parts.push(modePrompt);
-		parts.push(routePrompt);
 		if (preflight) parts.push(preflight);
 		if (secondEyesInstruction) parts.push(secondEyesInstruction);
 		if (mapDigest) parts.push(mapDigest);
@@ -5556,17 +4499,14 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 
 		try {
 			setAutoPromptStatus(ctx, autoPromptState);
-			const level = isProjectRoute(currentRoute) ? applyRouteThinkingLevel(currentRoute, ctx, pi) : undefined;
-			if (!isProjectRoute(currentRoute)) {
-				applyChatDefaultThinking(ctx, pi);
-			}
+			const level = normalizeThinkingLevel(pi.getThinkingLevel()) ?? "off";
 			ctx.ui.setStatus(FOOTER_CHAT_THINKING_STATUS_KEY, level);
 			ctx.ui.setStatus("jarvis", jlcLabel(sidecarHealthy ? "ok" : "down"));
 			if (isProjectRoute(currentRoute)) {
 				setWorkStatus(ctx, undefined);
 				notifyWork(
 					ctx,
-					`JLC: ${routeStatusLabel(currentRoute)} started. Thinking ${level}; waiting for the model/tool calls.`,
+					`JLC: ${workStatusLabel(currentRoute)} started. Effort ${level}; waiting for the model/tool calls.`,
 				);
 			} else {
 				setWorkStatus(ctx, undefined);
@@ -5613,7 +4553,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			messages,
 			userText,
 			promptContextText: buildPromptContextText(lastContextResponse?.context),
-			modePromptText: `${modePrompt}\n\n${routePrompt}`,
+			modePromptText: modePrompt,
 			overlayText: overlay,
 			existingPromptText: existingPrompt,
 		};
@@ -5630,10 +4570,6 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		if (directiveSpawnBlock) return directiveSpawnBlock;
 		const secondEyesInitialSpawnBlock = maybeBlockSecondEyesInitialSpawnToolCall(toolName, event.input);
 		if (secondEyesInitialSpawnBlock) return secondEyesInitialSpawnBlock;
-		const existingWorkerSpawnBlock = maybeBlockExistingWorkerRequestSpawnToolCall(toolName);
-		if (existingWorkerSpawnBlock) return existingWorkerSpawnBlock;
-		const existingWorkerDirectiveBlock = maybeBlockExistingWorkerRequestPassiveDirectiveToolCall(toolName);
-		if (existingWorkerDirectiveBlock) return existingWorkerDirectiveBlock;
 		const mapCheckpointBlock = maybeBlockMapCheckpointToolCall(toolName);
 		if (mapCheckpointBlock) return mapCheckpointBlock;
 		const secondEyesBlock = maybeBlockSecondEyesToolCall(toolName);
@@ -5680,7 +4616,6 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			if (!isProjectRoute(currentRoute)) {
 				enterUnregisteredCoding();
 				try {
-					ctx.ui.setStatus(FOOTER_CHAT_THINKING_STATUS_KEY, undefined);
 					ctx.ui.setStatus("jarvis", jlcLabel(sidecarHealthy ? "ok" : "down"));
 				} catch {
 					/* stale */
@@ -5702,10 +4637,9 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		activeProjectPath = project.path;
 		activeCodePath = project.code_path;
 		activeProjectId = project.project_id;
-		enterProjectWorkPreservingHeavy();
+		enterProjectWork();
 		initializeSubturnLog(project.path, lastUserMessage, lastObservedUserTurnKey, ctx.cwd, "deepdive");
 		try {
-			applyRouteThinkingLevel(currentRoute, ctx, pi);
 			ctx.ui.setStatus("jarvis", jlcLabel(sidecarHealthy ? "ok" : "down", project.name));
 		} catch {
 			/* stale */
@@ -5755,16 +4689,15 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			applyLockedResourceReportStop(compressionOutcome.payload),
 		);
 		const payloadWithWorkerContext = await applyWorkerWindowContext(reportStopPayload);
-		const payloadBeforeRouteFilters = applyProviderCallCeiling(
+		const payloadBeforeOverlayFilters = applyProviderCallCeiling(
 			applyToolLessonHints(applySecondEyesReminder(payloadWithWorkerContext)),
 			nextProviderCall,
 		);
 		const providerCallRoute = currentRoute;
-		const toolsBeforeFilter = providerPayloadToolNames(payloadBeforeRouteFilters);
-		const actionIntentMatch = lastRouteClassifierActionIntent || expectedToolActivityThisTurn;
-		const chatFilterApplied = chatRouteToolDietWouldApply() && toolsBeforeFilter.length > 0;
+		const toolsBeforeFilter = providerPayloadToolNames(payloadBeforeOverlayFilters);
+		const actionIntentMatch = expectedToolActivityThisTurn;
 		const filteredProviderPayload = filterSecondEyesMainTools(
-			filterSecondEyesTools(filterMapCheckpointTools(filterChatRouteOnlyTools(payloadBeforeRouteFilters))),
+			filterSecondEyesTools(filterMapCheckpointTools(payloadBeforeOverlayFilters)),
 		);
 		const providerPayload = applySecondEyesProviderPhase(filteredProviderPayload);
 		const afterMetrics = extractPayloadTokens(providerPayload);
@@ -5773,8 +4706,6 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		lastProviderToolsBeforeFilter = toolsBeforeFilter;
 		lastProviderToolsAfterFilter = toolsAfterFilter;
 		lastProviderActionIntentMatch = actionIntentMatch;
-		lastProviderChatFilterApplied = chatFilterApplied;
-		lastProviderRoutePromotedByClassifier = routePromotedByClassifierThisTurn;
 		lastToolSchemaTokens = afterMetrics.tool_schema_tokens;
 		const prefixProbe = measureJarvisPrefixProbe(providerPayload);
 		providerCallCountThisTurn = nextProviderCall;
@@ -5806,8 +4737,6 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			tools_before_filter: toolsBeforeFilter,
 			tools_after_filter: toolsAfterFilter,
 			action_intent_match: actionIntentMatch,
-			chat_filter_applied: chatFilterApplied,
-			route_promoted_by_classifier: routePromotedByClassifierThisTurn,
 			second_eyes_phase: currentSecondEyesProviderPhase(),
 			before_message_tokens: beforeMetrics.message_tokens,
 			legacy_message_tokens: legacyMetrics.message_tokens,
@@ -6086,13 +5015,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		// sentinel cannot clobber a captured trailer.
 		const sdkTrailerUpdate = parseJarvisSdkToolTrailerFromText(text);
 		if (sdkTrailerUpdate.length > 0) lastSdkToolTrailerRecords = sdkTrailerUpdate;
-		// The model's [MODE:X] marker no longer mutates the route -- the upfront
-		// /route_turn classifier is authoritative. The marker is still emitted and
-		// stripped from user-facing text below, but it carries no routing effect.
 		lastAssistantPartialText = sanitizeAssistantText(text);
-		if (DEBUG_CONTEXT && /\[MODE:[^\]]+\]/i.test(text)) {
-			console.error(`[jlc:mode-marker] observed update current=${currentMode}`);
-		}
 		sanitizeAssistantMessageInPlace(event.message as AssistantMessage, true);
 		updateTurnMeterFromText(ctx, contentToText((event.message as { content: unknown }).content));
 		if (lastAssistantPartialText.length - lastSubturnAssistantUpdateLength >= SUBTURN_ASSISTANT_SAMPLE_CHARS) {
@@ -6134,11 +5057,6 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		if (sdkTrailer.length > 0) lastSdkToolTrailerRecords = sdkTrailer;
 		const toolNames = assistantToolNames(assistantMessage);
 		const assistantText = sanitizeAssistantText(rawText || lastAssistantPartialText);
-		if (DEBUG_CONTEXT) {
-			const hasMarker = /\[MODE:[^\]]+\]/i.test(rawText);
-			const head = rawText.slice(0, 80).replace(/\r?\n/g, "\\n");
-			console.error(`[jlc:mode-marker] observed=${hasMarker ? "yes" : "no"} current=${currentMode} head="${head}"`);
-		}
 		if (assistantText.trim()) {
 			upsertSubturnCarry("assistant:last", `assistant: ${oneLineForSummary(assistantText, 260)}`);
 			appendSubturnCommit("assistant", oneLineForSummary(assistantText, 180));
@@ -6169,7 +5087,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			resetProviderCallCeilingState();
 			turnCheckpointScope = undefined;
 			resetJarvisTurnChoreographyState();
-			resetToChatMode(ctx, pi);
+			resetEffectiveMode("chat", ctx);
 			agentTurnActive = false;
 			return;
 		}
@@ -6179,7 +5097,6 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		finishTurnMeter(ctx, assistantMessage);
 		const assistantTextRaw = assistantMessage ? contentToText(assistantMessage.content) : "";
 		const assistantText = sanitizeAssistantText(assistantTextRaw);
-		const agentEndRawUserText = stripJarvisMemoryBlock(latestUserText(event.messages));
 		if (isRetryableAssistantError(assistantMessage)) {
 			const errorText = assistantMessage?.errorMessage || assistantText || "retryable provider error";
 			appendSubturnEvent("provider_retryable_error", {
@@ -6189,7 +5106,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			try {
 				ctx.ui.setStatus("jarvis", jlcLabel(sidecarHealthy ? "ok" : "down", lastContextResponse?.project_name));
 				if (isProjectRoute(currentRoute)) {
-					setWorkStatus(ctx, `JLC: ${routeStatusLabel(currentRoute)} kept after provider retryable error.`);
+					setWorkStatus(ctx, `JLC: ${workStatusLabel(currentRoute)} kept after provider retryable error.`);
 				}
 			} catch {
 				/* ctx may be stale */
@@ -6240,8 +5157,6 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 				tools_before_filter: lastProviderToolsBeforeFilter,
 				tools_after_filter: lastProviderToolsAfterFilter,
 				action_intent_match: lastProviderActionIntentMatch,
-				chat_filter_applied: lastProviderChatFilterApplied,
-				route_promoted_by_classifier: lastProviderRoutePromotedByClassifier,
 				expected_tool_activity: expectedToolActivityThisTurn,
 				trim_before_tokens: trimBeforeTokensSum,
 				trim_after_tokens: trimAfterTokensSum,
@@ -6266,7 +5181,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			toolEvents = [];
 			turnCheckpointScope = undefined;
 			resetJarvisTurnChoreographyState();
-			resetToChatMode(ctx, pi);
+			resetEffectiveMode("chat", ctx);
 			agentTurnActive = false;
 			activeDirectiveTurn = undefined;
 			activeMapCheckpointTurn = undefined;
@@ -6335,9 +5250,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 				content: assistantTextForTurn,
 			});
 		}
-		const workerToolsRetryEligible = shouldQueueWorkerToolsRetry(event.messages, assistantTextForTurn);
 		const recoveryDecision = decidePostTurnRecovery({
-			workerToolsRetryEligible,
 			modifiedFilePaths: turnSuccessfulFileMutations.map((mutation) => mutation.path),
 			verificationRanThisTurn,
 			route: currentRoute,
@@ -6348,7 +5261,6 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			decision: recoveryDecision.kind,
 			terminal_reason: terminalReason,
 			provider_calls: providerCallCountThisTurn,
-			worker_tools_retry_eligible: workerToolsRetryEligible,
 			modified_file_count: turnSuccessfulFileMutations.length,
 			verification_ran: verificationRanThisTurn,
 			verify_continuation_count: verifyContinuationCount,
@@ -6360,32 +5272,13 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			decision: recoveryDecision.kind,
 			terminal_reason: terminalReason,
 			tools_after_filter: lastProviderToolsAfterFilter,
-			worker_tools_retry_eligible: workerToolsRetryEligible,
 			modified_file_count: turnSuccessfulFileMutations.length,
 			verification_ran: verificationRanThisTurn,
 			verify_continuation_count: verifyContinuationCount,
 			harness_second_eyes_spawned: harnessSecondEyesSpawned,
 		});
-		let workerToolsRetryQueuedThisAgentEnd = false;
 		let verificationFollowUpQueuedThisAgentEnd = false;
-		if (recoveryDecision.kind === "worker_tools_followup") {
-			workerToolsRetryInFlight = true;
-			const retryPrompt = buildWorkerToolsRetryPrompt(lastUserMessage, assistantTextForTurn);
-			recordSubturnDebugEvent("worker_tools_retry_queued", {
-				user_message: oneLineForSummary(lastUserMessage, 400),
-				assistant_text: oneLineForSummary(assistantTextForTurn, 300),
-				tools_after_filter: lastProviderToolsAfterFilter,
-				provider_calls: providerCallCountThisTurn,
-			});
-			try {
-				pi.sendUserMessage(retryPrompt, { deliverAs: "followUp" });
-				workerToolsRetryQueuedThisAgentEnd = true;
-				setWorkStatus(ctx, "JLC: worker tools enabled; queued follow-up.");
-			} catch {
-				workerToolsRetryInFlight = false;
-				sendJarvisChatNotice(pi, "Worker-tool retry could not be queued; preserved the signal in turn history.");
-			}
-		} else if (recoveryDecision.kind === "verify_incomplete") {
+		if (recoveryDecision.kind === "verify_incomplete") {
 			const verifyPrompt = buildVerificationIncompletePrompt(lastUserMessage, turnSuccessfulFileMutations);
 			recordSubturnDebugEvent("verification_floor_followup_queued", {
 				files: verificationGateMutationPaths(turnSuccessfulFileMutations),
@@ -6404,21 +5297,16 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 				);
 			}
 		}
-		if (workerToolsRetryInFlight && isWorkerToolsRetryPrompt(agentEndRawUserText)) {
-			workerToolsRetryInFlight = false;
-		}
 		recordSubturnDebugEvent("turn_terminal", {
 			terminal_reason: terminalReason,
 			stop_reason: assistantMessage?.stopReason ?? "",
 			provider_calls: providerCallCountThisTurn,
-			worker_tools_retry_in_flight: workerToolsRetryInFlight,
 			verification_followup_queued: verificationFollowUpQueuedThisAgentEnd,
 		});
 		recordTurnTimelineEvent("turn_terminal", {
 			terminal_reason: terminalReason,
 			stop_reason: assistantMessage?.stopReason ?? "",
-			worker_tools_retry_in_flight: workerToolsRetryInFlight,
-			queued_follow_up: workerToolsRetryQueuedThisAgentEnd || verificationFollowUpQueuedThisAgentEnd,
+			queued_follow_up: verificationFollowUpQueuedThisAgentEnd,
 			verification_followup_queued: verificationFollowUpQueuedThisAgentEnd,
 		});
 
@@ -6591,7 +5479,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 				// footer badge + chat notify fire after deferred encode completes.
 				footerResetDeferred = true;
 				void pollEncodingStatus(ctx, pi, benchConvId(pi) ?? "", response.scheduled_turn).finally(() =>
-					resetToChatModeAfterEncoding(ctx, pi),
+					resetToDeepdiveModeAfterEncoding(ctx),
 				);
 			}
 		}
@@ -6620,10 +5508,10 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			resetJarvisTurnChoreographyState();
 		}
 
-		// Project work is a one-turn transaction. The next user turn starts as
-		// chat unless it explicitly enters deepdive or resolves to a project.
+		// Keep the general route pinned after a completed turn. Explicit chat and
+		// exceptional cleanup paths still select chat at their dedicated call sites.
 		if (!verificationFollowUpQueuedThisAgentEnd) {
-			resetToChatMode(ctx, pi, { updateFooter: !footerResetDeferred });
+			resetEffectiveMode("deepdive", ctx, { updateFooter: !footerResetDeferred });
 		}
 
 		if (autoPromptState) {
@@ -6938,7 +5826,10 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		description:
 			"Open a visible new JARVIS Code terminal window with a fresh pair address; optionally send it an initial directive. " +
 			"TRIGGER — spawn ONLY when the user explicitly asks for the work to run in a new, separate, additional, or parallel window, or to use a worker/delegate, in any language. " +
-			"If the user did not ask to delegate, do the build directly in THIS window — broad or heavy scope is not a reason to spawn on your own. " +
+			"If the user did not ask to delegate, do the build directly in THIS window — broad scope is not a reason to spawn on your own. " +
+			"Delegated builds default to WHOLE delegation to one worker for end-to-end cohesion; use a feature map only when the build is too large for one worker context. " +
+			"Relay source text only: quote the user's request and raw plan answers, plus constraints, project path, completion criteria, and handback format. Do not invent stack, architecture, file layout, implementation order, or code sketches for the worker. " +
+			"Tell the worker to self-check the build before handback; then verify the handback once without repeating the worker's full check. " +
 			"This tool is the ONLY supported way to open a JARVIS window: never launch jarvis.ps1 via bash/PowerShell or a launcher script yourself — " +
 			"manual launches mangle the initial prompt and skip the directive-bus wiring. Long or quoted task text is safe here; pass it as initial_directive. " +
 			"If the user refers to an existing window (by label, role, or as already open), call list_windows first and address that window " +
@@ -7319,6 +6210,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			"When replying inside an existing GAN (the turn header shows a gan_id), you MUST pass that gan_id; the server rejects a second open GAN between the same two windows. " +
 			"Protocol: round 1 hands the work to the destroyer, round 2 is the destroyer's verdict (sets the issue baseline), round 3 is the rebuttal or acceptance; " +
 			"maximum 3 send rounds; enumerate open issues and pass issues_open. From round 3 onward issues_open must strictly decrease. " +
+			"Relay source facts, user constraints, evidence, and review lenses; do not invent a replacement architecture or patch unless the evidence establishes it. " +
 			"Tie-breakers: P0 correctness/security/data-loss issues are won by the destroyer; " +
 			"style/preferences are the worker's call; unresolved issues must be closed with gan_close status escalated. This tool does not spawn windows; use spawn_window separately. " +
 			"The counterpart's round arrives automatically as a new turn once this window is idle — after sending, end your turn; do not poll while waiting.",
@@ -7883,6 +6775,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			await ensureSubagentModelSelectedForDelegate(pi, ctx);
+			const subagentEffort = await currentSubagentEffortState(ctx);
 			const body = {
 				name: params.name,
 				task: params.task,
@@ -7891,6 +6784,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 				sub_id: params.sub_id,
 				project_root: activeCodePath ?? activeProjectPath ?? ctx?.cwd,
 				bench_conv_id: benchConvId(pi),
+				reasoning_effort: subagentEffort.level,
 			};
 			let data: SidecarSubagentDelegateResponse | undefined;
 			if (onUpdate) {
@@ -8183,8 +7077,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "update_jarvis_md",
 		label: "Update JARVIS.md sections",
-		description:
-			"Patch active JARVIS.md sections; batch 2+ updates; DESIGN_BRIEF stores design recon; refresh NOW/MAP/RAW after code; never edit whole file.",
+		description: UPDATE_JARVIS_MD_TOOL_DESCRIPTION,
 		parameters: Type.Object({
 			field: Type.Optional(Type.String({ description: "NOW|MAP|LAW|BAN|HABIT|WHY|OMM|RAW|DESIGN_BRIEF" })),
 			value: Type.Optional(Type.String()),
@@ -8216,7 +7109,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 				const text = JSON.stringify(
 					{
 						ok: false,
-						error: "update_jarvis_md requires a registered project route (deepdive or heavy_deepdive). Chat/unregistered coding turns must not mutate JARVIS.md.",
+						error: "update_jarvis_md requires an active registered project. Chat/unregistered coding turns must not mutate JARVIS.md.",
 						current_mode: currentMode,
 						current_route: currentRoute,
 					},
@@ -8303,14 +7196,7 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 			name: Type.Optional(Type.String()),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const routeAllowsRegistration =
-				lastRouteClassifierDecision?.create_project === true ||
-				lastRouteClassifierDecision?.register_project === true ||
-				lastRouteClassifierDecision?.pending_project_decision === "confirm";
-			const allowRegistration =
-				isProjectRoute(currentRoute) ||
-				routeAllowsRegistration ||
-				(pendingProjectCreate !== undefined && lastRouteClassifierDecision?.pending_project_decision === "confirm");
+			const allowRegistration = currentRoute !== "unregistered_coding" || pendingProjectCreate !== undefined;
 			if (!allowRegistration) {
 				const text = JSON.stringify(
 					{
@@ -8335,10 +7221,9 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 				activeCodePath = data.code_path ?? activeCodePath;
 				activeProjectId = data.project_id ?? activeProjectId;
 				pendingProjectSwitchContextRefresh = needsContextRefresh;
-				enterProjectWorkPreservingHeavy();
+				enterProjectWork();
 				try {
 					ctx.ui.setStatus("jarvis", jlcLabel(sidecarHealthy ? "ok" : "down", data.name));
-					applyRouteThinkingLevel(currentRoute, ctx, pi);
 				} catch {
 					/* pi stale */
 				}
@@ -8484,9 +7369,8 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 				activeCodePath = data.code_path ?? activeCodePath;
 				activeProjectId = data.project_id ?? activeProjectId;
 				pendingProjectSwitchContextRefresh = needsContextRefresh;
-				enterProjectWorkPreservingHeavy();
+				enterProjectWork();
 				try {
-					applyRouteThinkingLevel(currentRoute, ctx, pi);
 					ctx.ui.setStatus("jarvis", jlcLabel("ok", data.name));
 				} catch {
 					/* stale */
@@ -8606,18 +7490,16 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 	});
 
 	// =========================================================================
-	// Deferred Tools — context diet (flag-gated, default OFF)
+	// Deferred Tools — context diet (default ON, explicit opt-out)
 	// =========================================================================
-	// When JARVIS_DEFERRED_TOOLS=1, narrow the active tool set to a core working
-	// set and let the model discover/load the rest via tool_search + load_tool.
-	// Flag OFF = byte-identical to today (no setActiveTools call, no extra tools).
+	// Narrow the active tool set to a core working set and let the model
+	// discover/load the rest via tool_search + load_tool. Operators can set
+	// JARVIS_DEFERRED_TOOLS=0 to restore the fully eager registry temporarily.
 
-	// All deferred-tools logic is gated on the flag. When OFF, zero code paths
-	// execute and zero pi methods are called → byte-identical to today.
-	// NOTE: only registration (registerTool) happens here at load time. The
-	// active-set narrowing runs at runtime via applyDeferredToolsDiet, invoked
-	// from the session_start handler — getAllTools/setActiveTools are action
-	// methods that throw during extension loading.
+	// Only registration (registerTool) happens here at load time. The active-set
+	// narrowing runs at runtime via applyDeferredToolsDiet, invoked from the
+	// session_start handler — getAllTools/setActiveTools are action methods that
+	// throw during extension loading.
 	if (deferredToolsEnabled()) {
 		pi.registerTool({
 			name: "tool_search",
@@ -8761,28 +7643,10 @@ export default function jarvisJlc(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("deepdive-reasoning", {
-		description: "Set the saved JARVIS deepdive reasoning level: medium, high, xhigh.",
-		handler: async (args, ctx) => {
-			const level = normalizeThinkingLevel(args);
-			if (!level) {
-				ctx.ui.notify("Usage: /deepdive-reasoning medium|high|xhigh", "warning");
-				return;
-			}
-			saveDeepdiveThinkingPreference(level);
-			if (currentRoute === "heavy_deepdive") {
-				try {
-					suppressThinkingPreferenceSaveOnce(level);
-					pi.setThinkingLevel(level);
-					ctx.ui.setStatus(FOOTER_CHAT_THINKING_STATUS_KEY, level);
-				} catch {
-					/* pi may be stale */
-				}
-			}
-			ctx.ui.notify(
-				`JARVIS heavy deepdive reasoning set to ${level}${currentRoute !== "heavy_deepdive" ? " (will apply in heavy deepdive)" : ""}`,
-				"info",
-			);
+	pi.registerCommand("cycle-subagent-effort", {
+		description: "Cycle subagent effort through the active subagent model's supported levels.",
+		handler: async (_args, ctx) => {
+			await cycleSubagentEffort(ctx);
 		},
 	});
 
@@ -9185,6 +8049,167 @@ async function fetchLLMSettingCatalog(forceRefresh = false): Promise<SidecarLLMS
 	return postSidecar<SidecarLLMSettingCatalogResponse>(catalogPath, undefined, "GET");
 }
 
+const SUBAGENT_PI_PROVIDER_ALIASES: Partial<Record<string, KnownProvider>> = {
+	"anthropic-agent-sdk": "anthropic",
+};
+
+// Providers whose subagent turn is proxied through the sidecar (Agent SDK regime,
+// e.g. anthropic-agent-sdk/claude-*). At runtime these route exactly like the chat
+// turn and clamp unsupported effort internally; their pi catalog entries carry no
+// thinkingLevelMap, so resolving one here yields a stale, high-capped default that
+// silently drops xhigh/ultra. The alias-map keys are precisely this set.
+const SUBAGENT_SIDECAR_ROUTED_PROVIDERS = new Set<string>(Object.keys(SUBAGENT_PI_PROVIDER_ALIASES));
+
+type SubagentEffortState = {
+	spec?: string;
+	modelLabel?: string;
+	levels: SupportedThinkingLevel[];
+	level: SupportedThinkingLevel;
+};
+
+// Structural view of Pi's live model registry (ctx.modelRegistry). Resolving through it —
+// instead of the static built-in getModels() — is what lets user-configured models
+// (models.json: ollama-cloud/glm-*, dashscope, openrouter, ...) report their real per-model
+// thinking levels. This is the same registry chat uses, so subagent effort mirrors chat.
+type SubagentModelRegistry = { find?(provider: string, modelId: string): Model<Api> | undefined };
+
+function resolveSubagentPiModel(
+	spec: string | null | undefined,
+	modelRegistry?: SubagentModelRegistry,
+): Model<Api> | undefined {
+	const split = splitModelSpec(spec ?? undefined);
+	if (!split) return undefined;
+	const aliased = SUBAGENT_PI_PROVIDER_ALIASES[split.provider] ?? (split.provider as KnownProvider);
+	// Prefer the live, config-aware registry (raw provider first, then the proxy alias).
+	const fromRegistry =
+		modelRegistry?.find?.(split.provider, split.model) ??
+		(aliased !== split.provider ? modelRegistry?.find?.(aliased, split.model) : undefined);
+	if (fromRegistry) return fromRegistry;
+	// Fallback: static built-in catalog (e.g. when no registry handle is available).
+	const models = getModels(aliased) as Model<Api>[];
+	return models.find((model) => model.id === split.model);
+}
+
+// Last-resort fallback for a subagent model that resolves in NEITHER the live registry NOR
+// the static catalog (i.e. a spec Pi has no definition for anywhere). Expose the full ladder
+// rather than a single level, mirroring AgentSession.getAvailableThinkingLevels()
+// (`if (!this.model) return THINKING_LEVELS`); the sidecar/provider clamps unsupported levels
+// internally. Configured models (ollama-cloud/glm-*, dashscope, ...) never reach this — they
+// resolve through ctx.modelRegistry and report their real per-model levels. Without this the
+// ladder collapsed to ["medium"], so `(idx + 1) % 1 === 0` made Alt+2 cycling a silent no-op.
+const SUBAGENT_THINKING_LEVEL_LADDER: SupportedThinkingLevel[] = [
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+	"ultra",
+];
+
+function supportedSubagentThinkingLevels(
+	spec: string | null | undefined,
+	modelRegistry?: SubagentModelRegistry,
+): SupportedThinkingLevel[] {
+	// Sidecar-proxied (Agent SDK) subagents mirror the chat null-branch exactly
+	// (AgentSession.getAvailableThinkingLevels -> THINKING_LEVELS): expose the full
+	// ladder — "max" included — rather than the stale high-capped default their
+	// map-less catalog entry would yield. Anthropic exposes "max" on chat, so keeping
+	// it here holds chat and subagent in lockstep; the sidecar/provider clamps any
+	// level the concrete model doesn't support.
+	const providerId = splitModelSpec(spec ?? undefined)?.provider;
+	if (providerId && SUBAGENT_SIDECAR_ROUTED_PROVIDERS.has(providerId)) {
+		return SUBAGENT_THINKING_LEVEL_LADDER;
+	}
+	const model = resolveSubagentPiModel(spec, modelRegistry);
+	if (!model) return SUBAGENT_THINKING_LEVEL_LADDER;
+	const levels = getSupportedThinkingLevels(model).filter(isSupportedThinkingLevel);
+	return levels.length > 0 ? levels : SUBAGENT_THINKING_LEVEL_LADDER;
+}
+
+function reconcileSubagentEffort(
+	spec: string | null | undefined,
+	modelRegistry?: SubagentModelRegistry,
+): SubagentEffortState {
+	const levels = supportedSubagentThinkingLevels(spec, modelRegistry);
+	const saved = loadSubagentThinkingPreference();
+	const fallbackOrder: SupportedThinkingLevel[] = ["medium", "high", "low", "minimal", "off", "xhigh", "max", "ultra"];
+	const level =
+		(saved && levels.includes(saved) ? saved : undefined) ??
+		fallbackOrder.find((candidate) => levels.includes(candidate)) ??
+		levels[0] ??
+		"medium";
+	if (saved !== level) saveSubagentThinkingPreference(level);
+	const split = splitModelSpec(spec ?? undefined);
+	return {
+		spec: spec ?? undefined,
+		modelLabel: split?.model,
+		levels,
+		level,
+	};
+}
+
+function setSubagentEffortStatus(ctx: ExtensionContext, state: SubagentEffortState): void {
+	cachedSubagentEffortState = state;
+	try {
+		ctx.ui.setStatus(FOOTER_SUBAGENT_MODEL_STATUS_KEY, state.modelLabel);
+		ctx.ui.setStatus(FOOTER_SUBAGENT_THINKING_STATUS_KEY, state.level);
+	} catch {
+		/* footer stale on reload */
+	}
+}
+
+async function currentSubagentEffortState(ctx?: ExtensionContext): Promise<SubagentEffortState> {
+	if (cachedSubagentEffortState) {
+		if (ctx) setSubagentEffortStatus(ctx, cachedSubagentEffortState);
+		return cachedSubagentEffortState;
+	}
+	const level = loadSubagentThinkingPreference() ?? "medium";
+	const state: SubagentEffortState = { levels: [level], level };
+	if (ctx) setSubagentEffortStatus(ctx, state);
+	return state;
+}
+
+async function refreshCurrentSubagentEffortState(ctx?: ExtensionContext): Promise<SubagentEffortState> {
+	const catalog = await fetchLLMSettingCatalog(false);
+	const spec = catalog?.ok ? catalog.current?.subagent : undefined;
+	if (!spec) {
+		const level = loadSubagentThinkingPreference() ?? "medium";
+		const state: SubagentEffortState = { levels: [level], level };
+		if (ctx) setSubagentEffortStatus(ctx, state);
+		else cachedSubagentEffortState = state;
+		return state;
+	}
+	const state = reconcileSubagentEffort(spec, ctx?.modelRegistry);
+	if (ctx) setSubagentEffortStatus(ctx, state);
+	else cachedSubagentEffortState = state;
+	return state;
+}
+
+async function cycleSubagentEffort(ctx: ExtensionContext): Promise<void> {
+	// Cycle in-process from the cached state (mirrors Alt+1 chat effort). The sidecar
+	// catalog is queried only when the cache is cold/degraded (no resolved spec), so
+	// repeated Alt+2 presses don't each pay a ~HTTP round-trip. The cache is warmed at
+	// boot (refreshCurrentSubagentEffortState) and refreshed on every /model-setting apply.
+	let state = cachedSubagentEffortState;
+	if (!state || !state.spec) {
+		state = await refreshCurrentSubagentEffortState(ctx);
+	}
+	if (!state.spec) {
+		ctx.ui.notify("Subagent effort unavailable: sidecar model catalog has no active subagent model.", "warning");
+		return;
+	}
+	const levels =
+		state.levels.length > 0 ? state.levels : supportedSubagentThinkingLevels(state.spec, ctx.modelRegistry);
+	const currentIndex = levels.indexOf(state.level);
+	const nextLevel = levels[(currentIndex + 1) % levels.length] ?? state.level;
+	saveSubagentThinkingPreference(nextLevel);
+	const nextState: SubagentEffortState = { ...state, levels, level: nextLevel };
+	setSubagentEffortStatus(ctx, nextState);
+	ctx.ui.notify(`Subagent effort: ${nextLevel}`, "info");
+}
+
 type LLMSettingRole = "chat" | "subagent" | "encoder";
 type LLMSettingPick = { provider: string; model: string };
 
@@ -9386,6 +8411,10 @@ function registerSidecarChatProxyProvider(
 						medium: "medium",
 						high: "high",
 						xhigh: "xhigh",
+						// This proxy only serves sidecar-routed Agent SDK (Claude) models, which
+						// accept the full effort ladder incl max/ultra — always expose it.
+						max: "max",
+						ultra: "ultra",
 					},
 					input: ["text"],
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -9428,7 +8457,7 @@ async function ensureSidecarChatProxyLive(
 	const next = ctx.modelRegistry.find?.(target.provider, target.model);
 	if (!next) {
 		ctx.ui.notify(
-			`JARVIS sidecar proxy registered, but ${target.provider}/${target.model} was not in the Pi model registry; restart Pi.`,
+			`JARVIS-Code saved ${target.provider}/${target.model}, but it isn't in the live model list yet - restart JARVIS-Code to switch to it.`,
 			"warning",
 		);
 		return false;
@@ -9436,7 +8465,7 @@ async function ensureSidecarChatProxyLive(
 	const swapped = await pi.setModel(next);
 	if (!swapped) {
 		ctx.ui.notify(
-			`JARVIS sidecar proxy was registered, but Pi refused ${target.provider}/${target.model}.`,
+			`JARVIS-Code saved ${target.provider}/${target.model}, but couldn't switch to it right now - restart JARVIS-Code to switch to it.`,
 			"warning",
 		);
 		return false;
@@ -9468,6 +8497,9 @@ async function applyLLMSetting(
 		// encode summary, so push the newly saved spec immediately.
 		setEncModelStatus(ctx, result.encoder);
 	}
+	if (body.subagent && result.subagent) {
+		setSubagentEffortStatus(ctx, reconcileSubagentEffort(result.subagent, ctx.modelRegistry));
+	}
 	// Fuzzy validation may have corrected the requested spec; swap to what was
 	// actually saved, not what the caller typed.
 	const swapTarget = liveChat ? (splitModelSpec(result.chat) ?? liveChat) : undefined;
@@ -9486,7 +8518,7 @@ async function applyLLMSetting(
 	const next = ctx.modelRegistry.find(swapTarget.provider, swapTarget.model);
 	if (!next) {
 		ctx.ui.notify(
-			`JARVIS models saved (chat=${result.chat}, encoder=${result.encoder}), but ${swapTarget.provider}/${swapTarget.model} was not in the Pi model registry after refresh; saved but not swapped; restart Pi.`,
+			`JARVIS-Code models saved (chat=${result.chat}, encoder=${result.encoder}), but ${swapTarget.provider}/${swapTarget.model} isn't in the live model list yet - saved, not switched. Restart JARVIS-Code to switch to it.`,
 			"warning",
 		);
 		return { result, liveSwapped: false };
@@ -9494,7 +8526,7 @@ async function applyLLMSetting(
 	const swapped = await pi.setModel(next);
 	if (!swapped) {
 		ctx.ui.notify(
-			`JARVIS models saved, but Pi refused ${swapTarget.provider}/${swapTarget.model}; saved but not swapped; restart Pi.`,
+			`JARVIS-Code models saved, but couldn't switch to ${swapTarget.provider}/${swapTarget.model} right now - saved, not switched. Restart JARVIS-Code to switch to it.`,
 			"warning",
 		);
 		return { result, liveSwapped: false };
@@ -10750,10 +9782,9 @@ async function registerWorkspaceFolderFromObservedWrite(ctx: ExtensionContext, p
 		activeProjectPath = selected.path ?? activeProjectPath;
 		activeCodePath = selected.code_path ?? activeCodePath;
 		activeProjectId = selected.project_id ?? activeProjectId;
-		enterProjectWorkPreservingHeavy();
+		enterProjectWork();
 		try {
 			ctx.ui.setStatus("jarvis", jlcLabel(sidecarHealthy ? "ok" : "down", selected.name));
-			applyRouteThinkingLevel(currentRoute, ctx, pi);
 		} catch {
 			/* stale */
 		}
@@ -11194,8 +10225,9 @@ async function maybeSwitchProjectFromUserMessage(userText: string, ctx: Extensio
 		activeCodePath = response.code_path ?? activeCodePath;
 		activeProjectId = response.project_id ?? activeProjectId;
 		pendingProjectCreate = undefined;
-		enterProjectWorkPreservingHeavy();
+		enterProjectWork();
 		if (request.autoCreate) {
+			pendingNewArtifactAskUserGate = true;
 			transientSystemDirective = [
 				"[Project creation complete]",
 				`The project ${request.slugOrName} has been created and selected.`,
@@ -11220,10 +10252,28 @@ async function maybeSwitchProjectFromUserMessage(userText: string, ctx: Extensio
 	return false;
 }
 
+type PendingProjectDecision = "confirm" | "decline" | "unclear";
+
+function pendingProjectDecisionFromUserText(userText: string): PendingProjectDecision {
+	const normalized = userText.trim().toLowerCase();
+	if (!normalized) return "unclear";
+	if (
+		/^(?:y(?:es)?|yeah|yep|ok(?:ay)?|sure|confirm|please|응|어|네|예|그래|좋아|만들어(?:줘)?|생성해(?:줘)?|등록해(?:줘)?)[\s.!?~]*$/iu.test(
+			normalized,
+		)
+	) {
+		return "confirm";
+	}
+	if (/^(?:n(?:o)?|nope|cancel|stop|아니|아니요|취소|됐어|하지\s*마)[\s.!?~]*$/iu.test(normalized)) {
+		return "decline";
+	}
+	return "unclear";
+}
+
 async function maybeHandlePendingProjectCreation(userText: string, ctx: ExtensionContext): Promise<boolean> {
 	if (!pendingProjectCreate) return false;
 	if (parseProjectSwitchCommand(userText)) return false;
-	const decision = lastRouteClassifierDecision?.pending_project_decision;
+	const decision = pendingProjectDecisionFromUserText(userText);
 	if (decision === "confirm") {
 		const pending = pendingProjectCreate;
 		const response = await postSidecar<SidecarSwitchResponse>("/switch_project", {
@@ -11237,7 +10287,8 @@ async function maybeHandlePendingProjectCreation(userText: string, ctx: Extensio
 			activeProjectPath = response.path;
 			activeCodePath = response.code_path ?? activeCodePath;
 			activeProjectId = response.project_id ?? activeProjectId;
-			enterProjectWorkPreservingHeavy();
+			enterProjectWork();
+			pendingNewArtifactAskUserGate = true;
 			transientSystemDirective = [
 				"[Project creation complete]",
 				`The project ${pending.slugOrName} has been created and selected.`,
@@ -12208,7 +11259,6 @@ const REPEATED_FAILURE_NON_REPAIR_TOOLS = new Set([
 	"ls",
 	"list",
 	"recall_turns",
-	"search_within",
 	"ask_user",
 ]);
 function repeatedFailureCommandKey(toolName: unknown, command: unknown): string | undefined {
@@ -12406,7 +11456,7 @@ export function latchUltracodeHandoffRouteIfInvoked(messages: AgentMessage[]): s
 	if (!handoffTool) return undefined;
 	// Second-eyes turns are per-turn review modes, not resumable work routes.
 	if (activeSecondEyesReviewTurn || activeSecondEyesMainTurn) return handoffTool;
-	// The per-turn reset target IS "chat"; nothing to restore.
+	// Explicit chat handoffs are not resumable work routes.
 	if (currentRoute === "chat") return handoffTool;
 	ultracodeHandoffRouteToRestore = currentRoute;
 	appendSubturnEvent("ultracode_handoff_route_saved", { route: currentRoute, tool: handoffTool });
@@ -12459,19 +11509,11 @@ function buildDirectiveHandbackCompletionMarker(summary: string): string {
 	);
 }
 
-function isWorkerToolsRetryPrompt(text: string): boolean {
-	return text.trim().startsWith(WORKER_TOOLS_RETRY_MARKER);
-}
-
 function isVerifyIncompletePrompt(text: string): boolean {
 	return text.trim().startsWith(VERIFY_INCOMPLETE_FOLLOWUP_MARKER);
 }
 
-function assistantSignaledWorkerToolsNeeded(text: string): boolean {
-	return text.split(/\r?\n/).some((line) => line.trim() === WORKER_TOOLS_NEEDED_MARKER);
-}
-
-function originalUserRequestLineFromRetryPrompt(text: string): string | undefined {
+function originalUserRequestLineFromInternalPrompt(text: string): string | undefined {
 	for (const line of text.split(/\r?\n/)) {
 		const trimmed = line.trim();
 		const prefix = "Original user request:";
@@ -12483,18 +11525,13 @@ function originalUserRequestLineFromRetryPrompt(text: string): string | undefine
 	return undefined;
 }
 
-function workerToolsRetryOriginalUserRequest(text: string): string | undefined {
-	if (!isWorkerToolsRetryPrompt(text)) return undefined;
-	return originalUserRequestLineFromRetryPrompt(text);
-}
-
 function verifyIncompleteOriginalUserRequest(text: string): string | undefined {
 	if (!isVerifyIncompletePrompt(text)) return undefined;
-	return originalUserRequestLineFromRetryPrompt(text);
+	return originalUserRequestLineFromInternalPrompt(text);
 }
 
-function effectiveUserTextFromInternalRetry(text: string): string {
-	return workerToolsRetryOriginalUserRequest(text) ?? verifyIncompleteOriginalUserRequest(text) ?? text;
+function effectiveUserTextFromInternalFollowUp(text: string): string {
+	return verifyIncompleteOriginalUserRequest(text) ?? text;
 }
 
 // ask_user is a clarification dialog, not an external action: a turn whose only
@@ -12561,7 +11598,6 @@ function assistantMessageHasAgentSdkToolActivity(message: AgentMessage): boolean
 }
 
 export function decidePostTurnRecovery(input: PostTurnRecoveryInput): PostTurnRecoveryDecision {
-	if (input.workerToolsRetryEligible) return { kind: "worker_tools_followup" };
 	const modifiedFileCount = input.modifiedFilePaths?.length ?? 0;
 	if (modifiedFileCount === 0) return { kind: "none" };
 	if (input.verificationRanThisTurn === true) return { kind: "none" };
@@ -12570,7 +11606,11 @@ export function decidePostTurnRecovery(input: PostTurnRecoveryInput): PostTurnRe
 	const maxContinuations = Math.max(0, input.maxVerifyContinuations ?? MAX_VERIFY_CONTINUATIONS);
 	const continuationCount = Math.max(0, input.verifyContinuationCount ?? 0);
 	if (continuationCount >= maxContinuations) return { kind: "none" };
-	return { kind: "verify_incomplete" };
+	// Verification-floor follow-up removed (Jun 2026-07-20): it mis-fired on explicit
+	// run/execute requests ("실행시켜줘") and was unwanted friction. This decision is
+	// now always a no-op so the follow-up at agent_end never queues. The marker/prompt/
+	// fire branch remain as inert dead code for a later physical cleanup pass.
+	return { kind: "none" };
 }
 
 function inferAssistantTerminalReason(
@@ -12584,39 +11624,6 @@ function inferAssistantTerminalReason(
 	if (assistantMessage && assistantToolNames(assistantMessage).length > 0) return "tool_calls";
 	if (!assistantText.trim()) return "empty";
 	return "stop";
-}
-
-function workerToolsWereAvailableInLastProviderCall(): boolean {
-	const tools = new Set(lastProviderToolsAfterFilter);
-	// Only the ACTION tools count: spawn_window (new worker) or job_send (existing
-	// worker). list_windows is read-only/informational and now rides every chat
-	// route as a capability tool, so it must NOT mark worker tools as "available" —
-	// doing so would suppress the worker-tools retry on plain chat routes.
-	return tools.has("spawn_window") || tools.has("job_send");
-}
-
-function shouldQueueWorkerToolsRetry(messages: AgentMessage[], assistantText: string): boolean {
-	if (!lastUserMessage.trim()) return false;
-	if (providerCallCountThisTurn <= 0) return false;
-	if (workerToolsRetryInFlight || isWorkerToolsRetryPrompt(lastUserMessage)) return false;
-	if (!assistantSignaledWorkerToolsNeeded(assistantText)) return false;
-	if (turnHasToolActivity(messages)) return false;
-	if (workerToolsWereAvailableInLastProviderCall()) return false;
-	return true;
-}
-
-function buildWorkerToolsRetryPrompt(userText: string, assistantText: string): string {
-	void assistantText;
-	return [
-		WORKER_TOOLS_RETRY_MARKER,
-		`The previous assistant signaled ${WORKER_TOOLS_NEEDED_MARKER}.`,
-		"Worker/window tools are now enabled for this follow-up.",
-		"Start with [MODE:CHAT], then call the appropriate tool now:",
-		"- new worker/agent window: call spawn_window",
-		"- existing worker/window: call list_windows if needed, then job_send",
-		"Do not repeat the signal. Do not answer with another promise.",
-		`Original user request: ${oneLineForSummary(userText, 400)}`,
-	].join("\n");
 }
 
 export function looksLikeVerification(command: string): boolean {
@@ -12725,33 +11732,6 @@ function maybeBlockSecondEyesInitialSpawnToolCall(toolName: string, input: unkno
 		return { block: true, reason: secondEyesPlanReadyError() };
 	}
 	return undefined;
-}
-
-function maybeBlockExistingWorkerRequestSpawnToolCall(toolName: string): ToolBlockResult | undefined {
-	if (toolName !== "spawn_window") return undefined;
-	if (secondEyesReviewSpawnRequired()) return undefined;
-	const action = String(lastRouteClassifierDecision?.expected_action ?? "")
-		.trim()
-		.toLowerCase();
-	if (currentRoute !== "chat_control" || action !== "tool") return undefined;
-	return {
-		block: true,
-		reason:
-			"Existing worker/window request: call list_windows, then job_send to the named existing worker/window. Do not spawn a duplicate. If the target is ambiguous, call ask_user.",
-	};
-}
-
-function maybeBlockExistingWorkerRequestPassiveDirectiveToolCall(toolName: string): ToolBlockResult | undefined {
-	if (toolName !== "send_directive") return undefined;
-	const action = String(lastRouteClassifierDecision?.expected_action ?? "")
-		.trim()
-		.toLowerCase();
-	if (currentRoute !== "chat_control" || action !== "tool") return undefined;
-	return {
-		block: true,
-		reason:
-			"Existing worker/window request: use job_send so the target can hand back and wake this window. send_directive is passive/legacy only.",
-	};
 }
 
 // M7.9 checkpoint turns: verify + dispatch only. Implementation tools are
@@ -13100,15 +12080,6 @@ function appendDeveloperInstruction(payload: unknown, text: string): unknown {
 	return { ...record, messages: [message] };
 }
 
-function workerWindowContextWanted(): boolean {
-	if (workerToolsRetryInFlight) return true;
-	if (currentRoute === "chat_control") return true;
-	const action = String(lastRouteClassifierDecision?.expected_action ?? "")
-		.trim()
-		.toLowerCase();
-	return action === "spawn_window" || action === "tool";
-}
-
 function workerWindowContextLine(window: SidecarDirectiveWindow): string {
 	const name = displayWindowName(window.pair8, window.label);
 	const live = window.alive === false ? "stale" : "alive";
@@ -13152,7 +12123,7 @@ function buildWorkerWindowContextText(windows: SidecarDirectiveWindow[]): string
 }
 
 async function applyWorkerWindowContext(payload: unknown): Promise<unknown> {
-	if (workerWindowContextInjectedThisTurn || !workerWindowContextWanted()) return payload;
+	if (workerWindowContextInjectedThisTurn || currentRoute !== "chat_control") return payload;
 	workerWindowContextInjectedThisTurn = true;
 	try {
 		const data = await postSidecar<SidecarDirectiveWindowsResponse>("/directives/windows", undefined, "GET", 3000);
@@ -13288,55 +12259,52 @@ function providerPayloadToolNames(payload: unknown): string[] {
 	return tools.map((tool) => providerToolSchemaName(tool)).filter((name): name is string => !!name);
 }
 
-function chatRouteToolDietWouldApply(): boolean {
-	return (
-		(currentRoute === "chat" || currentRoute === "chat_control") &&
-		!activeMapCheckpointTurn &&
-		!activeMapSynthesisTurn &&
-		!activeEndGateTurn &&
-		!activeSecondEyesReviewTurn &&
-		!activeSecondEyesMainTurn
-	);
-}
-
-function leanChatToolsEnabled(): boolean {
-	const value = String(process.env.JARVIS_LEAN_CHAT_TOOLS ?? "")
-		.trim()
-		.toLowerCase();
-	return value === "1" || value === "true" || value === "yes" || value === "on";
-}
-
 export function deferredToolsEnabled(): boolean {
 	const value = String(process.env.JARVIS_DEFERRED_TOOLS ?? "")
 		.trim()
 		.toLowerCase();
-	return value === "1" || value === "true" || value === "yes" || value === "on";
+	return !new Set(["0", "false", "no", "off"]).has(value);
 }
 
 /**
- * JLC tools that must always be active (never deferred). These are either
- * high-frequency coding tools (pi builtins) or structurally required for
- * the interactive flow (ask_user modal, todo tracking, subagent orchestration).
- * tool_search and load_tool are added dynamically when deferred mode is ON.
+ * Tools that must always be active (never deferred). Everything registered
+ * outside this set remains reachable through tool_search + load_tool.
  */
 export const DEFERRED_TOOLS_ALWAYS_ACTIVE = new Set<string>([
-	// pi builtins — every coding turn
+	// pi builtins
 	"read",
-	"bash",
 	"edit",
 	"write",
+	"bash",
 	"grep",
 	"find",
 	"ls",
-	// jlc core — structurally required
-	"todo",
+	// core
 	"ask_user",
-	"delegate_subagent",
-	"ultracode",
+	"todo",
 	"recall_turns",
-	// diet tools themselves (added when deferred mode ON)
+	"update_jarvis_md",
 	"tool_search",
 	"load_tool",
+	// project management
+	"register_project",
+	"switch_project",
+	"unregister_project",
+	// information and network
+	"web_search",
+	"web_fetch",
+	"docs_search",
+	"package_info",
+	// model settings
+	"set_chat_model",
+	"set_subagent_model",
+	"set_encoder_model",
+	// delegation and completion/operations
+	"delegate_subagent",
+	"managed_process",
+	"feature_verdict",
+	// Registered by the lineage companion when that extension is present.
+	"submit_lineage",
 ]);
 
 /**
@@ -13348,91 +12316,14 @@ export const DEFERRED_TOOLS_ALWAYS_ACTIVE = new Set<string>([
  * called during extension loading.").
  */
 export function applyDeferredToolsDiet(pi: ExtensionAPI): void {
+	// Partial/legacy runtimes (and stale extension test doubles) may not expose
+	// active-tool action methods. Default-on dieting must never abort startup.
+	if (typeof pi.getAllTools !== "function" || typeof pi.setActiveTools !== "function") return;
 	const narrowed = pi
 		.getAllTools()
 		.map((t) => t.name)
 		.filter((name) => DEFERRED_TOOLS_ALWAYS_ACTIVE.has(name));
 	pi.setActiveTools(narrowed);
-}
-
-// The control/clarification pocket each chat-family route exposes for its JLC
-// orchestration tools (ask_user, worker/window, model settings, web). pi's basic
-// coding tools are layered on top of this by chatRouteAllowedToolNames.
-function chatRouteControlAllowedToolNames(): ReadonlySet<string> {
-	if (currentRoute === "chat_control") return CHAT_CONTROL_ALLOWED_TOOL_NAMES;
-	if (workerToolsRetryInFlight) return CHAT_ROUTE_TOOL_ACTION_ALLOWED_TOOL_NAMES;
-	const action = String(lastRouteClassifierDecision?.expected_action ?? "none")
-		.trim()
-		.toLowerCase();
-	if (action === "spawn_window") return CHAT_ROUTE_SPAWN_ALLOWED_TOOL_NAMES;
-	if (action === "tool") return CHAT_ROUTE_TOOL_ACTION_ALLOWED_TOOL_NAMES;
-	return CHAT_ROUTE_BASE_ALLOWED_TOOL_NAMES;
-}
-
-function chatRouteAllowedToolNames(): ReadonlySet<string> {
-	const control = chatRouteControlAllowedToolNames();
-	// Default: pi's native coding tools AND the base capability set stay available
-	// in chat so the model can actually act on "do X for me" — including registry
-	// management, recall, docs, web, and bounded process work. Only the opt-in lean
-	// diet (JARVIS_LEAN_CHAT_TOOLS=1) strips back to the control/clarification
-	// pocket for weak local models. Heavy multi-window orchestration is NOT here;
-	// it stays scoped to deepdive+ via the normal-route blocklist.
-	if (leanChatToolsEnabled()) return control;
-	return new Set<string>([...control, ...PI_BASIC_TOOL_NAMES, ...CHAT_ROUTE_CAPABILITY_TOOL_NAMES]);
-}
-
-function filterChatRouteOnlyTools(payload: unknown): unknown {
-	if (!payload || typeof payload !== "object") return payload;
-	const record = payload as Record<string, unknown>;
-	const tools = Array.isArray(record.tools) ? record.tools : undefined;
-	if (!tools?.length) return payload;
-	if (secondEyesReviewSpawnRequired()) {
-		const filtered = tools.filter((tool) => {
-			const name = providerToolSchemaName(tool);
-			return (
-				name === "ask_user" ||
-				name === "list_windows" ||
-				name === "job_send" ||
-				name === "spawn_window" ||
-				name === "delegate_subagent" ||
-				name === "ultracode"
-			);
-		});
-		return filtered.length === tools.length ? payload : { ...record, tools: filtered };
-	}
-	if (chatRouteToolDietWouldApply()) {
-		const allowedToolNames = chatRouteAllowedToolNames();
-		const filtered = tools.filter((tool) => {
-			const name = providerToolSchemaName(tool);
-			return !!name && allowedToolNames.has(name);
-		});
-		return filtered.length === tools.length ? payload : { ...record, tools: filtered };
-	}
-	const normalRouteToolDiet =
-		!activeMapCheckpointTurn &&
-		!activeMapSynthesisTurn &&
-		!activeEndGateTurn &&
-		!activeSecondEyesReviewTurn &&
-		!activeSecondEyesMainTurn;
-	const filtered = tools.filter((tool) => {
-		const name = providerToolSchemaName(tool);
-		if (!name) return true;
-		if (CHAT_ROUTE_ONLY_TOOL_NAMES.has(name)) return false;
-		if (normalRouteToolDiet && currentRoute === "unregistered_coding") {
-			if (UNREGISTERED_PROJECT_MEMORY_TOOL_NAMES.has(name)) return false;
-			if (!activeDirectiveTurn && DELEGATION_INITIATE_TOOL_NAMES.has(name)) return false;
-		}
-		if (
-			normalRouteToolDiet &&
-			currentRoute === "deepdive" &&
-			!activeDirectiveTurn &&
-			DELEGATION_INITIATE_TOOL_NAMES.has(name)
-		) {
-			return false;
-		}
-		return true;
-	});
-	return filtered.length === tools.length ? payload : { ...record, tools: filtered };
 }
 
 // M7.9 checkpoint tool allowlist: evidence gathering + verdict + dispatch.
@@ -13476,13 +12367,15 @@ function filterMapCheckpointTools(payload: unknown): unknown {
 }
 
 function filterSecondEyesTools(payload: unknown): unknown {
-	if (!activeSecondEyesReviewTurn) return payload;
+	const initialReviewSpawn = secondEyesReviewSpawnRequired();
+	if (!initialReviewSpawn && !activeSecondEyesReviewTurn) return payload;
 	if (!payload || typeof payload !== "object") return payload;
 	const record = payload as Record<string, unknown>;
 	const tools = Array.isArray(record.tools) ? record.tools : undefined;
 	if (!tools?.length) return payload;
 	const filtered = tools.filter((tool) => {
 		const name = providerToolSchemaName(tool);
+		if (initialReviewSpawn) return !!name && SECOND_EYES_INITIAL_ALLOWED_TOOL_NAMES.has(name);
 		return !name || SECOND_EYES_ALLOWED_TOOL_NAMES.has(name);
 	});
 	return filtered.length === tools.length ? payload : { ...record, tools: filtered };
@@ -15299,6 +14192,8 @@ export function __setProjectRouteStateForTests(state: {
 	activeCodePath?: string;
 	lastUserMessage?: string;
 	defaultProjectRoot?: string;
+	secondEyesRequested?: boolean;
+	secondEyesHeavy?: boolean;
 }): void {
 	if (state.route !== undefined) setEffectiveRoute(state.route);
 	if (state.activeProjectPath !== undefined) activeProjectPath = state.activeProjectPath;
@@ -15309,6 +14204,13 @@ export function __setProjectRouteStateForTests(state: {
 			...(lastContextResponse ?? {}),
 			default_project_root: state.defaultProjectRoot,
 		} as typeof lastContextResponse;
+	}
+	if (state.secondEyesHeavy !== undefined) activeSecondEyesHeavyTurn = state.secondEyesHeavy;
+	if (state.secondEyesRequested !== undefined) {
+		secondEyesRequestedThisTurn = state.secondEyesRequested;
+		secondEyesReviewSpawnedThisTurn = false;
+		secondEyesReminderInjectedThisTurn = false;
+		if (secondEyesRequestedThisTurn) enterSecondEyesRoute();
 	}
 }
 
@@ -15350,8 +14252,9 @@ export function __resetJarvisJlcForTests(): void {
 	ultracodeHandoffRouteToRestore = undefined;
 	currentTodoList = [];
 	clearReadBeforeEditRegistry();
-	deepdiveThinkingPreference = undefined;
-	deepdiveThinkingPreferenceLoaded = false;
+	subagentThinkingPreference = undefined;
+	subagentThinkingPreferenceLoaded = false;
+	cachedSubagentEffortState = undefined;
 	subagentModelUserSet = false;
 	subagentModelUserSetLoaded = false;
 	coldStartNoticeShown = false;
@@ -15364,13 +14267,7 @@ export function __resetJarvisJlcForTests(): void {
 	lastProviderToolsBeforeFilter = [];
 	lastProviderToolsAfterFilter = [];
 	lastProviderActionIntentMatch = false;
-	lastProviderChatFilterApplied = false;
-	lastProviderRoutePromotedByClassifier = false;
-	lastRouteClassifierDecision = undefined;
-	lastRouteClassifierActionIntent = false;
 	expectedToolActivityThisTurn = false;
-	routePromotedByClassifierThisTurn = false;
-	workerToolsRetryInFlight = false;
 	verifyContinuationCount = 0;
 	workerWindowContextInjectedThisTurn = false;
 	providerCallCountThisTurn = 0;
@@ -15487,47 +14384,13 @@ export function latestAssistantMessage(messages: AgentMessage[]): AssistantMessa
 	return undefined;
 }
 
-export function stripLeadingModeMarkerText(text: string, allowPartial = false): string {
-	const withoutCompleteMarker = text.replace(MODE_MARKER_RE, "");
-	if (withoutCompleteMarker !== text || !allowPartial) return withoutCompleteMarker;
-
-	const leadingWhitespace = text.match(/^\s*/)?.[0] ?? "";
-	const body = text.slice(leadingWhitespace.length);
-	const lowerBody = body.toLowerCase();
-	const isPartialMarker = MODE_MARKER_PREFIXES.some((marker) => marker.toLowerCase().startsWith(lowerBody));
-	return isPartialMarker ? "" : text;
-}
-
-function sanitizeAssistantText(text: string, allowPartial = false, isFirstTextPart = true): string {
-	let sanitized = stripLeadingModeMarkerText(text, allowPartial);
-
-	// The model is mandated to lead with a [MODE:*] marker, so the real answer
-	// begins at the first marker. Anything before it is leaked internal preamble
-	// (e.g. a "reasoning:" line the model added on its own). Drop it by POSITION
-	// — not by matching words — so this works in every chat language, not just
-	// the ones we happened to enumerate in a regex.
-	if (isFirstTextPart) {
-		const firstMarker = sanitized.match(MODE_MARKER_ANY_RE)?.[0];
-		if (firstMarker) {
-			const markerIndex = sanitized.indexOf(firstMarker);
-			if (markerIndex > 0) sanitized = sanitized.slice(markerIndex);
-		}
-	}
-
-	// The marker(s) are routing signals the sidecar reads, never user content.
-	sanitized = sanitized.replace(MODE_MARKER_ANY_RE, "");
-
-	// The agent-sdk tool-activity trailer (regime-B memory sensor) rides a sentinel
-	// line in the assistant text; the consumer parses it off the RAW message, so by
-	// the time text is sanitized for display/persistence it must be stripped.
-	sanitized = stripJarvisSdkToolTrailer(sanitized);
-
+function sanitizeAssistantText(text: string, _allowPartial = false, _isFirstTextPart = true): string {
+	const sanitized = stripJarvisSdkToolTrailer(text);
 	return sanitized
 		.replace(/[ \t]+\n/g, "\n")
 		.replace(/\n{3,}/g, "\n\n")
 		.trim();
 }
-
 function sanitizeAssistantMessage(message: AssistantMessage, allowPartial: boolean): AssistantMessage {
 	if (!Array.isArray(message.content)) return message;
 	let changed = false;
@@ -16750,39 +15613,6 @@ function findLatestUserIndex(messages: AgentMessage[]): number {
 		if (messages[i].role === "user") return i;
 	}
 	return -1;
-}
-
-// Reserved for future thinking-level promotion. Currently not invoked
-// after the deepdive-force rewrite; kept here intentionally.
-function _selectThinkingLevel(
-	userText: string,
-	assistantText: string,
-	ctx?: ExtensionContext,
-): SupportedThinkingLevel | undefined {
-	const user = userText.trim().toLowerCase();
-	if (isSlashCommand(user, "/deepdive")) return ctx ? selectDeepdiveThinkingLevel(ctx) : "xhigh";
-	if (isSlashCommand(user, "/chat")) return "medium";
-	if (assistantText.includes("[MODE:HEAVY_DEEPDIVE]")) return ctx ? selectDeepdiveThinkingLevel(ctx) : "xhigh";
-	if (assistantText.includes("[MODE:DEEPDIVE]")) return ctx ? selectDeepdiveThinkingLevel(ctx) : "xhigh";
-	if (assistantText.includes("[MODE:UNREGISTERED_CODING]")) return "medium";
-	if (assistantText.includes("[MODE:CHAT]")) return "medium";
-	return undefined;
-}
-
-function applyRouteThinkingLevel(
-	route: EffectiveTurnRoute,
-	ctx: ExtensionContext,
-	pi: ExtensionAPI,
-): SupportedThinkingLevel {
-	const level = route === "heavy_deepdive" ? selectDeepdiveThinkingLevel(ctx) : "high";
-	try {
-		suppressThinkingPreferenceSaveOnce(level);
-		pi.setThinkingLevel(level);
-		ctx.ui.setHiddenThinkingLabel(level === "off" ? "" : `Thinking ${level}`);
-	} catch {
-		/* pi may be stale */
-	}
-	return level;
 }
 
 function parseProjectSwitchCommand(text: string): string | undefined {

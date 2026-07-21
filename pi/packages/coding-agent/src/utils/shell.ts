@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { delimiter } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { spawn, spawnSync } from "child_process";
 import { getBinDir } from "../config.js";
 
@@ -17,9 +17,18 @@ function findBashOnPath(): string | null {
 		try {
 			const result = spawnSync("where", ["bash.exe"], { encoding: "utf-8", timeout: 5000 });
 			if (result.status === 0 && result.stdout) {
-				const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
-				if (firstMatch && existsSync(firstMatch)) {
-					return firstMatch;
+				const matches = result.stdout
+					.trim()
+					.split(/\r?\n/)
+					.map((line) => line.trim())
+					.filter(Boolean);
+				for (const match of matches) {
+					// Skip the WSL launcher / Store-alias stubs (System32\bash.exe,
+					// SysWOW64\bash.exe, WindowsApps\bash.exe): they route into WSL,
+					// which fails with "no distribution installed" on a WSL-less box.
+					// Prefer a real bash (Git for Windows, MSYS2, Cygwin).
+					if (/\\(System32|SysWOW64|WindowsApps)\\bash\.exe$/i.test(match)) continue;
+					if (existsSync(match)) return match;
 				}
 			}
 		} catch {
@@ -44,10 +53,35 @@ function findBashOnPath(): string | null {
 }
 
 /**
+ * Windows: derive Git Bash from the git.exe on PATH. Git for Windows and
+ * PortableGit both ship bash at <gitRoot>\bin\bash.exe, while git.exe lives at
+ * <gitRoot>\cmd\git.exe (or <gitRoot>\bin\git.exe). This finds bash even when
+ * Git is installed outside %ProgramFiles% (PortableGit, winget, scoop, user dir).
+ */
+function findGitBashFromGitExe(): string | null {
+	if (process.platform !== "win32") return null;
+	try {
+		const result = spawnSync("where", ["git.exe"], { encoding: "utf-8", timeout: 5000 });
+		if (result.status !== 0 || !result.stdout) return null;
+		for (const raw of result.stdout.trim().split(/\r?\n/)) {
+			const gitExe = raw.trim();
+			if (!gitExe || !existsSync(gitExe)) continue;
+			const gitRoot = dirname(dirname(gitExe));
+			const bash = join(gitRoot, "bin", "bash.exe");
+			if (existsSync(bash)) return bash;
+		}
+	} catch {
+		// Ignore errors
+	}
+	return null;
+}
+
+/**
  * Resolve shell configuration based on platform and an optional explicit shell path.
  * Resolution order:
  * 1. User-specified shellPath
- * 2. On Windows: Git Bash in known locations, then bash on PATH
+ * 2. On Windows: Git Bash in known locations, then Git Bash derived from git.exe
+ *    on PATH, then a real (non-WSL-stub) bash on PATH
  * 3. On Unix: /bin/bash, then bash on PATH, then fallback to sh
  */
 export function getShellConfig(customShellPath?: string): ShellConfig {
@@ -77,7 +111,13 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 			}
 		}
 
-		// 3. Fallback: search bash.exe on PATH (Cygwin, MSYS2, WSL, etc.)
+		// 3. Git Bash derived from git.exe on PATH (PortableGit, winget, scoop, user dir)
+		const gitBash = findGitBashFromGitExe();
+		if (gitBash) {
+			return { shell: gitBash, args: ["-c"] };
+		}
+
+		// 4. Fallback: a real bash.exe on PATH (Cygwin, MSYS2; WSL stubs skipped)
 		const bashOnPath = findBashOnPath();
 		if (bashOnPath) {
 			return { shell: bashOnPath, args: ["-c"] };

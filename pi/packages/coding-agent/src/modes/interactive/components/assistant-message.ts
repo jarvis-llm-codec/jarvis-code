@@ -15,7 +15,10 @@ function getFoldedThinkingLabel(thinking: string): string {
 }
 
 function isThinkingPlaceholder(line: string): boolean {
-	return /^\[?thinking(?:\.\.\.)?\]?$/i.test(line) || /^thinking\s+(off|minimal|low|medium|high|xhigh)$/i.test(line);
+	return (
+		/^\[?thinking(?:\.\.\.)?\]?$/i.test(line) ||
+		/^thinking\s+(off|minimal|low|medium|high|xhigh|max|ultra)$/i.test(line)
+	);
 }
 
 const AGENT_SDK_TOOL_ACTIVITY_LINE_RE =

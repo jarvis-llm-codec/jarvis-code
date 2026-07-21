@@ -16,6 +16,8 @@ export interface AppKeybindings {
 	"app.exit": true;
 	"app.suspend": true;
 	"app.thinking.cycle": true;
+	"app.effort.cycleChat": true;
+	"app.effort.cycleSubagent": true;
 	"app.model.cycleForward": true;
 	"app.model.cycleBackward": true;
 	"app.model.select": true;
@@ -73,6 +75,14 @@ export const KEYBINDINGS = {
 	"app.thinking.cycle": {
 		defaultKeys: "shift+tab",
 		description: "Cycle thinking level",
+	},
+	"app.effort.cycleChat": {
+		defaultKeys: "alt+1",
+		description: "Cycle chat effort",
+	},
+	"app.effort.cycleSubagent": {
+		defaultKeys: "alt+2",
+		description: "Cycle subagent effort",
 	},
 	"app.model.cycleForward": {
 		defaultKeys: "ctrl+p",

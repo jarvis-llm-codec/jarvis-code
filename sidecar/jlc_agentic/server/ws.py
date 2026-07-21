@@ -16,7 +16,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from jlc_agentic import JarvisAgentic, get_slim
 from jlc_agentic.agentic.chat_turn import ChatTurn
 from jlc_agentic.agentic.schema import get_dispatcher
-from jlc_agentic.providers import get_llm, turn_context
+from jlc_agentic.providers import get_llm
 
 from .messages import Inbound, Outbound
 from .state import parse_jhb_blocks, refresh_mixer_tokens, save_mixer, ui_state
@@ -488,7 +488,6 @@ def _validate_inbound(data: Any) -> Inbound:
             "type": "user_input",
             "text": str(data.get("text") or ""),
             "turn_id": str(data.get("turn_id") or uuid.uuid4().hex),
-            "route": str(data.get("route") or ""),
         }
     if msg_type == "mixer_toggle":
         return {
@@ -589,7 +588,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         def _rebuild_chat_turn() -> ChatTurn:
             return _build_chat_turn(slim, emit_from_thread, conv_id, project_path, content_filter, think_parser, should_cancel=cancel_event.is_set)
 
-        async def _execute_turn(text: str, turn_id: str, route: str = "") -> None:
+        async def _execute_turn(text: str, turn_id: str) -> None:
             nonlocal chat_turn, chat_turn_llm
             try:
                 # Pick up a mid-session /llmsetting/apply chat switch before the
@@ -601,10 +600,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 refresh_mixer_tokens(ui_state.mixer, message_text=text, jhb_token=jhb_token)
                 await emit({"type": "user_echo", "text": text, "turn_id": turn_id})
 
-                # Route-derived reasoning effort for this turn. None when the
-                # client did not tag a route, leaving the provider default intact.
-                reasoning_effort = turn_context.route_to_effort(route)
-
                 def run_turn() -> dict[str, Any]:
                     prior_history = [{"role": "system", "content": UI_TOOL_SYSTEM_MESSAGE}]
                     mixer_note = _mixer_system_message()
@@ -615,7 +610,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         conv_id=conv_id,
                         project_path=project_path,
                         prior_history=prior_history,
-                        reasoning_effort=reasoning_effort,
                     )
 
                 result = await asyncio.to_thread(run_turn)
@@ -678,9 +672,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await emit({"type": "error_log", "level": "warn", "text": "Previous turn still running"})
                     continue
                 turn_id = str(data.get("turn_id") or uuid.uuid4().hex)
-                route = str(data.get("route") or "")
                 cancel_event.clear()
-                turn_task = asyncio.create_task(_execute_turn(text, turn_id, route))
+                turn_task = asyncio.create_task(_execute_turn(text, turn_id))
             except WebSocketDisconnect:
                 raise
             except Exception as exc:

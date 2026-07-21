@@ -7,7 +7,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	getProviders,
@@ -242,8 +242,6 @@ type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
 };
-
-const HEAVY_DEEPDIVE_THINKING_LEVELS: ThinkingLevel[] = ["medium", "high", "xhigh"];
 
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 
@@ -756,7 +754,8 @@ export class InteractiveMode {
 				hint("app.exit", "to exit (empty)"),
 				hint("app.suspend", "to suspend"),
 				keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
-				hint("app.thinking.cycle", "to set heavy deepdive thinking"),
+				hint("app.effort.cycleChat", "to cycle chat effort"),
+				hint("app.effort.cycleSubagent", "to cycle subagent effort"),
 				rawKeyHint(`${keyText("app.model.cycleForward")}/${keyText("app.model.cycleBackward")}`, "to cycle models"),
 				hint("app.model.select", "to select model"),
 				hint("app.tools.expand", "to expand tools"),
@@ -2550,6 +2549,10 @@ export class InteractiveMode {
 		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
 		this.defaultEditor.onAction("app.suspend", () => this.handleCtrlZ());
 		this.defaultEditor.onAction("app.thinking.cycle", () => this.cycleThinkingLevel());
+		this.defaultEditor.onAction("app.effort.cycleChat", () => this.cycleThinkingLevel());
+		this.defaultEditor.onAction("app.effort.cycleSubagent", () => {
+			void this.cycleSubagentThinkingLevel();
+		});
 		this.defaultEditor.onAction("app.model.cycleForward", () => this.cycleModel("forward"));
 		this.defaultEditor.onAction("app.model.cycleBackward", () => this.cycleModel("backward"));
 
@@ -3960,28 +3963,28 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private cycleHeavyDeepdiveThinkingLevel(): ThinkingLevel | undefined {
-		if (!this.session.supportsThinking()) return undefined;
-
-		const availableLevels = this.session
-			.getAvailableThinkingLevels()
-			.filter((level) => HEAVY_DEEPDIVE_THINKING_LEVELS.includes(level));
-		if (availableLevels.length === 0) return undefined;
-
-		const currentIndex = availableLevels.indexOf(this.session.thinkingLevel);
-		const nextLevel = availableLevels[(currentIndex + 1) % availableLevels.length];
-		this.session.setThinkingLevel(nextLevel);
-		return this.session.thinkingLevel;
-	}
-
 	private cycleThinkingLevel(): void {
-		const newLevel = this.cycleHeavyDeepdiveThinkingLevel();
+		const newLevel = this.session.cycleThinkingLevel();
 		if (newLevel === undefined) {
-			this.showStatus("Current model does not support heavy deepdive thinking");
+			this.showStatus("Current model does not support configurable effort");
 		} else {
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
-			this.showStatus(`Heavy Deepdive Thinking level: ${newLevel}`);
+			this.showStatus(`Chat effort: ${newLevel}`);
+		}
+	}
+
+	private async cycleSubagentThinkingLevel(): Promise<void> {
+		const commandName = "cycle-subagent-effort";
+		if (!this.session.extensionRunner.getCommand(commandName)) {
+			this.showStatus("Subagent effort control is unavailable");
+			return;
+		}
+		try {
+			await this.session.prompt(`/${commandName}`);
+			this.footer.invalidate();
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
 		}
 	}
 
@@ -5765,6 +5768,8 @@ export class InteractiveMode {
 		const exit = this.getAppKeyDisplay("app.exit");
 		const suspend = this.getAppKeyDisplay("app.suspend");
 		const cycleThinkingLevel = this.getAppKeyDisplay("app.thinking.cycle");
+		const cycleChatEffort = this.getAppKeyDisplay("app.effort.cycleChat");
+		const cycleSubagentEffort = this.getAppKeyDisplay("app.effort.cycleSubagent");
 		const cycleModelForward = this.getAppKeyDisplay("app.model.cycleForward");
 		const selectModel = this.getAppKeyDisplay("app.model.select");
 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
@@ -5808,7 +5813,9 @@ export class InteractiveMode {
 | \`${clear}\` | Clear editor (first) / exit (second) |
 | \`${exit}\` | Exit (when editor is empty) |
 | \`${suspend}\` | Suspend to background |
-| \`${cycleThinkingLevel}\` | Cycle heavy deepdive thinking level |
+| \`${cycleChatEffort}\` | Cycle chat effort |
+| \`${cycleSubagentEffort}\` | Cycle subagent effort |
+| \`${cycleThinkingLevel}\` | Cycle chat effort (legacy shortcut) |
 | \`${cycleModelForward}\` / \`${cycleModelBackward}\` | Cycle models |
 | \`${selectModel}\` | Open model selector |
 | \`${expandTools}\` | Toggle tool output expansion |

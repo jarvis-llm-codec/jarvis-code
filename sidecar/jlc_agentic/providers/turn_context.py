@@ -20,32 +20,6 @@ from typing import Any
 
 _tls = threading.local()
 
-# Canonical JARVIS route -> reasoning-effort map. The route judge
-# (jarvis_sidecar.app._ROUTE_VALUES) classifies a turn before the chat agent
-# runs; this turns that intent into the reasoning effort the chat provider
-# should spend. Plain chat stays cheap; deepdive/heavy escalate. Providers
-# clamp to their own enum (Claude Agent SDK accepts up to "xhigh"/"max";
-# OpenAI Responses tops out at "high"). An unknown/absent route maps to None
-# so callers leave the provider/SDK default untouched (non-regressive).
-_ROUTE_EFFORT = {
-    "chat": "low",
-    "unregistered_coding": "medium",
-    "deepdive": "medium",
-    "heavy_deepdive": "xhigh",
-}
-
-
-def route_to_effort(route: str | None) -> str | None:
-    """Map a JARVIS route to its canonical reasoning effort.
-
-    Returns None for an empty/unknown route so the caller can pass it straight
-    through to ``ChatTurn.run(reasoning_effort=...)`` without overriding the
-    provider default.
-    """
-    if not route:
-        return None
-    return _ROUTE_EFFORT.get(str(route).strip().lower())
-
 
 def set(  # noqa: A001 - module-level verb mirrors threading.local idiom
     *,

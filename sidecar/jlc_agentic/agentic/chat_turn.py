@@ -134,9 +134,9 @@ class ChatTurn:
         """Run one chat turn.
 
         prior_history contains prior assistant/tool/system history from older turns.
-        reasoning_effort is the route-derived effort (see turn_context.route_to_effort);
-        it is carried on turn_context so the chat provider can spend the right amount
-        of thinking for this turn. None leaves the provider/SDK default untouched.
+        reasoning_effort is the user-selected chat effort. It is carried on
+        turn_context so the provider can spend the requested amount of thinking for
+        this turn. None leaves the provider/SDK default untouched.
         jhb prepend is applied once at the chat-turn boundary before loop execution.
         Encoder is invoked at chat-turn end ONLY when the turn completed cleanly
         (halt_reason in {final, max_iter}). timeout/swap/cancelled skips encoder
