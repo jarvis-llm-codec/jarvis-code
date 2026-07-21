@@ -133,7 +133,7 @@ Windows installs under `%LOCALAPPDATA%\JARVIS-Code`; macOS/Linux installs under 
 
 ## ▶️ First run
 
-First launch may take several minutes if dependencies were not preinstalled, especially after a manual/source install. The first three launches automatically show the sidecar window so you can see setup progress. For troubleshooting or reinstall verification, you can always run:
+First launch may take several minutes if dependencies were not preinstalled, especially after a manual/source install. For troubleshooting or reinstall verification, you can always open the sidecar window deliberately:
 
 ```bash
 jarvis --sidecar-window

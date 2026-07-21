@@ -282,14 +282,12 @@ function Set-JarvisFirstRunCount {
 }
 
 function Enable-FirstRunSidecarWindow {
-    if ($SkipSidecar) { return }
-    $previousCount = Get-JarvisFirstRunCount
-    Set-JarvisFirstRunCount -Count ($previousCount + 1)
-    if ($previousCount -lt $AutoSidecarWindowRuns) {
-        $script:ShowSidecarWindow = $true
-        $env:JARVIS_SHOW_SIDECAR_WINDOW = "1"
-        Write-Host "[jarvis] showing sidecar window for first-run visibility ($($previousCount + 1)/$AutoSidecarWindowRuns)"
-    }
+    # Auto-showing the sidecar log window on the first runs was removed. The sidecar
+    # runs inside that console window, so if the user closed it the sidecar would die.
+    # Dependency problems are now caught at install time (see install.ps1) instead of
+    # being surfaced through a fragile, closable log window. The window can still be
+    # opened deliberately for debugging with 'jarvis --sidecar-window'.
+    return
 }
 
 function Initialize-JarvisPairId {
